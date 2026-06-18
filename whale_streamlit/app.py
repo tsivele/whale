@@ -126,6 +126,8 @@ def hiker_get_video_url(ig_url):
     r = requests.get(HIKER_API, params={"url": ig_url}, headers={"x-access-key": HIKER_KEY}, timeout=30)
     if r.status_code == 404:
         raise RuntimeError("HikerAPI: το post δεν βρέθηκε (deleted/private)")
+    if r.status_code == 401:
+        raise RuntimeError(f"HikerAPI 401: λάθος ή ληγμένο key. Response: {r.text[:200]}")
     r.raise_for_status()
     data = r.json()
 
@@ -148,6 +150,11 @@ def apify_get_video_url(ig_url):
         json={"url": ig_url, "proxyConfiguration": {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]}},
         timeout=180,
     )
+    if r.status_code == 401:
+        raise RuntimeError(
+            f"Apify 401: λάθος key ή το actor χρειάζεται rental ($11.99/μήνα). "
+            f"Response: {r.text[:300]}"
+        )
     r.raise_for_status()
     items = r.json()
     if not items:
