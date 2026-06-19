@@ -242,23 +242,63 @@ def download_video_url(url):
 # FFMPEG HELPERS
 # ──────────────────────────────────────────────────────────
 def get_duration(path):
-    out = subprocess.run(
-        ["ffprobe", "-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", path],
-        capture_output=True, text=True,
-    )
     try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=10,
+        )
         return float(out.stdout.strip())
     except Exception:
-        return 10.0
+        try:
+            import av
+            with av.open(path) as container:
+                return float(container.duration / av.time_base) if container.duration else 10.0
+        except Exception:
+            return 10.0
 
 
 def extract_frame(video_path, timestamp):
     out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg").name
-    subprocess.run(
-        ["ffmpeg", "-y", "-ss", str(timestamp), "-i", video_path, "-frames:v", "1", "-q:v", "2", out_path],
-        capture_output=True,
-    )
-    return out_path
+
+    # Try ffmpeg first
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-ss", str(timestamp), "-i", video_path,
+             "-frames:v", "1", "-q:v", "2", out_path],
+            capture_output=True, timeout=30,
+        )
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            return out_path
+    except Exception:
+        pass
+
+    # Fallback: PyAV
+    try:
+        import av
+        with av.open(video_path) as container:
+            stream = container.streams.video[0]
+            container.seek(int(timestamp * av.time_base * stream.time_base**-1))
+            for frame in container.decode(video=0):
+                img = frame.to_image()
+                img.save(out_path, quality=85)
+                return out_path
+    except Exception:
+        pass
+
+    # Last resort: return first frame with PIL/OpenCV
+    try:
+        import cv2
+        cap = cv2.VideoCapture(video_path)
+        cap.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000)
+        ret, frame = cap.read()
+        cap.release()
+        if ret:
+            cv2.imwrite(out_path, frame)
+            return out_path
+    except Exception:
+        pass
+
+    raise RuntimeError("Δεν μπόρεσα να εξάγω frame — ffmpeg/av/cv2 δεν είναι διαθέσιμα")
 
 
 def strip_metadata(in_path):
