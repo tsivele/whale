@@ -160,44 +160,29 @@ def hiker_get_video_url(ig_url):
 
 
 def apify_get_video_url(ig_url):
-    # Start async run
+    # apify/instagram-reel-scraper uses "username" field (accepts URLs too)
     r = requests.post(
-        f"{APIFY_BASE}/acts/{APIFY_ACTOR}/runs",
-        params={"token": APIFY_KEY},
+        f"{APIFY_BASE}/acts/{APIFY_ACTOR}/run-sync-get-dataset-items",
+        params={"token": APIFY_KEY, "timeout": 120},
         json={
-            "urls": [ig_url],
+            "username": [ig_url],
             "resultsLimit": 1,
-            "proxy": {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]},
         },
-        timeout=30,
+        timeout=180,
     )
+    if r.status_code == 400:
+        raise RuntimeError(f"Apify 400: {r.text[:300]}")
     if r.status_code == 403:
-        raise RuntimeError("Apify 403: ο actor χρειάζεται rental ή ο λογαριασμός δεν έχει πρόσβαση.")
+        raise RuntimeError("Apify 403: ο actor δεν είναι προσβάσιμος με τον τρέχοντα λογαριασμό.")
     if r.status_code == 401:
         raise RuntimeError("Apify 401: λάθος API token.")
     r.raise_for_status()
 
-    run_id = r.json()["data"]["id"]
-    dataset_id = r.json()["data"]["defaultDatasetId"]
-
-    # Poll for completion (max 3 minutes)
-    for i in range(60):
-        time.sleep(3)
-        st_r = requests.get(f"{APIFY_BASE}/actor-runs/{run_id}", params={"token": APIFY_KEY}, timeout=10)
-        status = st_r.json()["data"]["status"]
-        if status == "SUCCEEDED":
-            break
-        if status in ("FAILED", "ABORTED", "TIMED-OUT"):
-            raise RuntimeError(f"Apify run {status}")
-
-    # Get results
-    items_r = requests.get(f"{APIFY_BASE}/datasets/{dataset_id}/items", params={"token": APIFY_KEY}, timeout=15)
-    items = items_r.json()
+    items = r.json()
     if not items:
-        raise RuntimeError("Apify: κενό αποτέλεσμα (το reel μπορεί να είναι private)")
+        raise RuntimeError("Apify: κενό αποτέλεσμα (private reel;)")
     item = items[0]
 
-    # apify/instagram-reel-scraper returns 'videoUrl' directly
     video_url = (
         item.get("videoUrl")
         or item.get("video_url")
