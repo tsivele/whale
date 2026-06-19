@@ -9,8 +9,9 @@ import base64
 st.set_page_config(page_title="Whale Pipeline", page_icon="🐋", layout="centered")
 
 WS_API = "https://api.wavespeed.ai/api/v3"
-HIKER_API = "https://api.hikerapi.com/v2/media/info/by/url"
-APIFY_SYNC = "https://api.apify.com/v2/acts/scrapepilot~instagram-reels-video-downloader----mp4-likes-captions/run-sync-get-dataset-items"
+HIKER_API  = "https://api.hikerapi.com/v2/media/info/by/url"
+APIFY_BASE = "https://api.apify.com/v2"
+APIFY_ACTOR = "apify~instagram-reel-scraper"   # Official, free with credits, no rental needed
 
 GRAIN_PROMPT = (
     "Add subtle 1% natural film grain texture across all frames uniformly. "
@@ -123,47 +124,89 @@ def ws_poll(pred_id, status_box):
 # INSTAGRAM DOWNLOAD — HikerAPI πρώτα, Apify backup
 # ──────────────────────────────────────────────────────────
 def hiker_get_video_url(ig_url):
-    r = requests.get(HIKER_API, params={"url": ig_url}, headers={"x-access-key": HIKER_KEY}, timeout=30)
-    if r.status_code == 404:
-        raise RuntimeError("HikerAPI: το post δεν βρέθηκε (deleted/private)")
-    if r.status_code == 401:
-        raise RuntimeError(f"HikerAPI 401: λάθος ή ληγμένο key. Response: {r.text[:200]}")
-    r.raise_for_status()
-    data = r.json()
-
-    candidates = [
-        data.get("video_url"),
-        (data.get("video_versions") or [{}])[0].get("url"),
-        (data.get("media", {}).get("video_versions") or [{}])[0].get("url"),
-        (data.get("items", [{}])[0].get("video_versions") or [{}])[0].get("url") if data.get("items") else None,
-    ]
-    for c in candidates:
-        if c:
-            return c
-    raise RuntimeError(f"HikerAPI: δεν βρέθηκε video (μπορεί να είναι photo post). Keys: {list(data.keys())}")
+    # Try header first (documented method), then query param fallback
+    for attempt, kwargs in [
+        ("header", {"headers": {"x-access-key": HIKER_KEY, "accept": "application/json"}}),
+        ("param",  {"headers": {"accept": "application/json"}, "params": {"url": ig_url, "access_key": HIKER_KEY}}),
+    ]:
+        try:
+            r = requests.get(
+                HIKER_API,
+                params={"url": ig_url} if attempt == "header" else None,
+                timeout=30,
+                **kwargs
+            )
+            if r.status_code == 401:
+                continue  # try next method
+            if r.status_code == 404:
+                raise RuntimeError("HikerAPI: post δεν βρέθηκε (deleted/private)")
+            r.raise_for_status()
+            data = r.json()
+            candidates = [
+                data.get("video_url"),
+                (data.get("video_versions") or [{}])[0].get("url"),
+                (data.get("media", {}).get("video_versions") or [{}])[0].get("url"),
+                ((data.get("items") or [{}])[0].get("video_versions") or [{}])[0].get("url"),
+            ]
+            for c in candidates:
+                if c:
+                    return c
+            raise RuntimeError(f"HikerAPI: no video URL. Fields: {list(data.keys())}")
+        except RuntimeError:
+            raise
+        except Exception as e:
+            continue
+    raise RuntimeError("HikerAPI 401: ο access key είναι λάθος. Επιβεβαίωσε το key στο hikerapi.com dashboard.")
 
 
 def apify_get_video_url(ig_url):
+    # Start async run
     r = requests.post(
-        APIFY_SYNC,
+        f"{APIFY_BASE}/acts/{APIFY_ACTOR}/runs",
         params={"token": APIFY_KEY},
-        json={"url": ig_url, "proxyConfiguration": {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]}},
-        timeout=180,
+        json={
+            "urls": [ig_url],
+            "resultsLimit": 1,
+            "proxy": {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]},
+        },
+        timeout=30,
     )
+    if r.status_code == 403:
+        raise RuntimeError("Apify 403: ο actor χρειάζεται rental ή ο λογαριασμός δεν έχει πρόσβαση.")
     if r.status_code == 401:
-        raise RuntimeError(
-            f"Apify 401: λάθος key ή το actor χρειάζεται rental ($11.99/μήνα). "
-            f"Response: {r.text[:300]}"
-        )
+        raise RuntimeError("Apify 401: λάθος API token.")
     r.raise_for_status()
-    items = r.json()
+
+    run_id = r.json()["data"]["id"]
+    dataset_id = r.json()["data"]["defaultDatasetId"]
+
+    # Poll for completion (max 3 minutes)
+    for i in range(60):
+        time.sleep(3)
+        st_r = requests.get(f"{APIFY_BASE}/actor-runs/{run_id}", params={"token": APIFY_KEY}, timeout=10)
+        status = st_r.json()["data"]["status"]
+        if status == "SUCCEEDED":
+            break
+        if status in ("FAILED", "ABORTED", "TIMED-OUT"):
+            raise RuntimeError(f"Apify run {status}")
+
+    # Get results
+    items_r = requests.get(f"{APIFY_BASE}/datasets/{dataset_id}/items", params={"token": APIFY_KEY}, timeout=15)
+    items = items_r.json()
     if not items:
-        raise RuntimeError("Apify: κενό αποτέλεσμα")
+        raise RuntimeError("Apify: κενό αποτέλεσμα (το reel μπορεί να είναι private)")
     item = items[0]
-    v = item.get("download_url") or (item.get("formats") or [{}])[0].get("url")
-    if not v:
-        raise RuntimeError(f"Apify: δεν βρέθηκε video. Keys: {list(item.keys())}")
-    return v
+
+    # apify/instagram-reel-scraper returns 'videoUrl' directly
+    video_url = (
+        item.get("videoUrl")
+        or item.get("video_url")
+        or (item.get("videoPlaybackQualityToUrlMap") or {}).get("HD")
+        or (item.get("videoPlaybackQualityToUrlMap") or {}).get("SD")
+    )
+    if not video_url:
+        raise RuntimeError(f"Apify: δεν βρέθηκε videoUrl. Fields: {list(item.keys())}")
+    return video_url
 
 
 def download_video_url(url):
