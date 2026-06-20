@@ -62,13 +62,16 @@ with st.sidebar:
     st.markdown("**API Keys** — βάλε μία φορά, κρατάνε αυτόματα")
     
     WS_KEY     = st.text_input("Wavespeed API Key", type="password",
-                                value=st.session_state.get("_wk",""),
+                                                                    value=st.secrets.get("WAVESPEED_KEY", st.session_state.get("_wk","")),
+                                                                   
                                 placeholder="wsk_live_...")
     HIKER_KEY  = st.text_input("HikerAPI Access Key",  type="password",
-                                value=st.session_state.get("_hk",""),
+                                                                    value=st.secrets.get("HIKER_KEY", st.session_state.get("_hk","")),
+                                                                   
                                 placeholder="zw9us00t8...")
     APIFY_KEY  = st.text_input("Apify API Key (backup)", type="password",
-                                value=st.session_state.get("_ak",""),
+                                                                    value=st.secrets.get("APIFY_KEY", st.session_state.get("_ak","")),
+                                                                   
                                 placeholder="apify_api_...")
     
     if WS_KEY:    st.session_state["_wk"] = WS_KEY
