@@ -477,14 +477,16 @@ elif st.session_state.step == 3:
         if st.button("🎭 Εκτέλεση Face Swap", type="primary"):
             status = st.empty()
             try:
-                creator_b64 = to_b64(st.session_state["creator_bytes"])
+creator_b64 = to_b64(st.session_state["creator_bytes"])
                 pred_id = ws_submit(
                     "wavespeed-ai/qwen-image-2.0-pro/edit",
                     {
                         "images": [creator_b64, st.session_state.frame_b64],
-                        "prompt": st.session_state.get("face_swap_prompt",                             "Place the person from image 1 in the scene of image 2, "
+                        "prompt": st.session_state.get("face_swap_prompt",                             
+                            "Place the person from image 1 in the scene of image 2, "
                             "same pose and framing. Photorealistic, vertical 9:16, 4K, "
                             "warm cinematic color grading. No text, no watermarks."
+                        ),
                         "seed": -1,
                     },
                 )
@@ -538,7 +540,8 @@ elif st.session_state.step == 4:
         if st.button("🎬 Δημιούργησε Video", type="primary", disabled=not can_generate):
             status = st.empty()
             try:
-                prompt = st.session_state.get("video_prompt", (                    "Cinematic ambient video. Slow smooth camera push-in. "
+                prompt = st.session_state.get("video_prompt", (                    
+                    "Cinematic ambient video. Slow smooth camera push-in. "
                     "Subtle ambient motion, gentle light rays, depth-of-field bokeh. "
                     "Vertical 9:16. No text, no overlays."
                 ))
@@ -597,7 +600,7 @@ elif st.session_state.step == 5:
         st.write("Auto pipeline: AI watermark removal → film grain → C2PA metadata strip")
         if st.button("🛡 Εκτέλεση Post-Processing", type="primary"):
             status = st.empty()
-            try
+            try:
                 current_url = st.session_state.gen_url
 
                 status.info("Αφαιρώ AI watermarks...")
@@ -645,3 +648,4 @@ elif st.session_state.step == 5:
                 st.session_state[k] = defaults[k]
             st.session_state.step = 1
             st.rerun()
+            
