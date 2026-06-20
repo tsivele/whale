@@ -435,24 +435,24 @@ elif st.session_state.step == 2:
         st.image(st.session_state.frame_b64, width=200)
         st.divider()
         st.markdown("**Prompts** (default αν αφεθεί κενό)")
-                col_p1, col_p2 = st.columns(2)
-                with col_p1:
-                                fs_prompt = st.text_area(
-                                                    "Face Swap prompt",
-                                                    value=st.session_state.get("face_swap_prompt", "Use Image A as the complete identity reference and Image B as the base/body reference. Replace the person in Image B entirely with the girl from Image A while preserving the exact pose, body position, clothing, framing, camera angle, lighting, background, and scene composition from Image B. The final image must look as if the girl from Image A was originally photographed in the scene of Image B. Match the facial identity from Image A with maximum accuracy, including: * exact face shape * skin tone and texture * hairstyle and hair color * hair length and hairline * eyes, eyebrows, nose, lips, and jawline * makeup style and facial details * expression consistency when possible Do not retain any facial or hair features from Image B. Only use Image B for the body, clothing, pose, environment, and composition. Ensure: * seamless and photorealistic blending * natural lighting adaptation * accurate perspective and head angle alignment * realistic shadows and skin integration * proportional anatomy * ultra-detailed facial realism * no distortions, warping, or uncanny features The output should appear completely natural and indistinguishable from a real photograph. Keep the first hair color and Face Visible and Larger breast no captions no text no font and Bigger breast."),
-                                                    height=80, key="fs_p"
-                                )
-                                st.session_state["face_swap_prompt"] = fs_prompt
-                            with col_p2:
-                                            vid_prompt = st.text_area(
-                                                                "Video generation prompt",
-                                                                value=st.session_state.get("video_prompt", "Cinematic ambient video. Slow smooth camera push-in. Subtle ambient motion, gentle light rays, depth-of-field bokeh. Vertical 9:16. No text, no overlays."),
-                                                                height=80, key="vid_p"
-                                            )
-                                            st.session_state["video_prompt"] = vid_prompt
-        if st.button("Επόμενο: Face Swap →", type="primary"):
-            st.session_state.step = 3
-            st.rerun()
+col_p1, col_p2 = st.columns(2)
+with col_p1:
+fs_prompt = st.text_area(
+"Face Swap prompt",
+ value=st.session_state.get("face_swap_prompt", "Use Image A as the complete identity reference and Image B as the base/body reference. Replace the person in Image B entirely with the girl from Image A while preserving the exact pose, body position, clothing, framing, camera angle, lighting, background, and scene composition from Image B. The final image must look as if the girl from Image A was originally photographed in the scene of Image B. Match the facial identity from Image A with maximum accuracy, including: * exact face shape * skin tone and texture * hairstyle and hair color * hair length and hairline * eyes, eyebrows, nose, lips, and jawline * makeup style and facial details * expression consistency when possible Do not retain any facial or hair features from Image B. Only use Image B for the body, clothing, pose, environment, and composition. Ensure: * seamless and photorealistic blending * natural lighting adaptation * accurate perspective and head angle alignment * realistic shadows and skin integration * proportional anatomy * ultra-detailed facial realism * no distortions, warping, or uncanny features The output should appear completely natural and indistinguishable from a real photograph. Keep the first hair color and Face Visible and Larger breast no captions no text no font and Bigger breast."),
+ height=80, key="fs_p"
+)
+  st.session_state["face_swap_prompt"] = fs_prompt
+  with col_p2:
+   vid_prompt = st.text_area(
+    "Video generation prompt",
+    value=st.session_state.get("video_prompt", "Cinematic ambient video. Slow smooth camera push-in. Subtle ambient motion, gentle light rays, depth-of-field bokeh. Vertical 9:16. No text, no overlays."),
+ height=80, key="vid_p"
+ )
+st.session_state["video_prompt"] = vid_prompt
+if st.button("Επόμενο: Face Swap →", type="primary"):
+  st.session_state.step = 3
+   st.rerun()
 
     if st.button("← Πίσω"):
         st.session_state.step = 1
