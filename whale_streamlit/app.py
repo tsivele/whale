@@ -433,6 +433,23 @@ elif st.session_state.step == 2:
     if st.session_state.frame_b64:
         st.success("✓ Frame επιλέχθηκε")
         st.image(st.session_state.frame_b64, width=200)
+                st.divider()
+                st.markdown("**Prompts** (default αν αφεθεί κενό)")
+                col_p1, col_p2 = st.columns(2)
+                with col_p1:
+                                fs_prompt = st.text_area(
+                                                    "Face Swap prompt",
+                                                    value=st.session_state.get("face_swap_prompt", "Place the person from image 1 in the scene of image 2, same pose and framing. Photorealistic, vertical 9:16, 4K, warm cinematic color grading. No text, no watermarks."),
+                                                    height=80, key="fs_p"
+                                )
+                                st.session_state["face_swap_prompt"] = fs_prompt
+                            with col_p2:
+                                            vid_prompt = st.text_area(
+                                                                "Video generation prompt",
+                                                                value=st.session_state.get("video_prompt", "Cinematic ambient video. Slow smooth camera push-in. Subtle ambient motion, gentle light rays, depth-of-field bokeh. Vertical 9:16. No text, no overlays."),
+                                                                height=80, key="vid_p"
+                                            )
+                                            st.session_state["video_prompt"] = vid_prompt
         if st.button("Επόμενο: Face Swap →", type="primary"):
             st.session_state.step = 3
             st.rerun()
@@ -465,11 +482,10 @@ elif st.session_state.step == 3:
                     "wavespeed-ai/qwen-image-2.0-pro/edit",
                     {
                         "images": [creator_b64, st.session_state.frame_b64],
-                        "prompt": (
-                            "Place the person from image 1 in the scene of image 2, "
+                        "prompt": st.session_state.get("face_swap_prompt",                             "Place the person from image 1 in the scene of image 2, "
                             "same pose and framing. Photorealistic, vertical 9:16, 4K, "
                             "warm cinematic color grading. No text, no watermarks."
-                        ),
+                        )),
                         "seed": -1,
                     },
                 )
@@ -523,11 +539,10 @@ elif st.session_state.step == 4:
         if st.button("🎬 Δημιούργησε Video", type="primary", disabled=not can_generate):
             status = st.empty()
             try:
-                prompt = (
-                    "Cinematic ambient video. Slow smooth camera push-in. "
+                prompt = st.session_state.get("video_prompt", (                    "Cinematic ambient video. Slow smooth camera push-in. "
                     "Subtle ambient motion, gentle light rays, depth-of-field bokeh. "
                     "Vertical 9:16. No text, no overlays."
-                )
+                ))
                 if model == "seedance":
                     pred_id = ws_submit(
                         "bytedance/seedance-2.0/image-to-video",
@@ -583,7 +598,7 @@ elif st.session_state.step == 5:
         st.write("Auto pipeline: AI watermark removal → film grain → C2PA metadata strip")
         if st.button("🛡 Εκτέλεση Post-Processing", type="primary"):
             status = st.empty()
-            try:
+            try
                 current_url = st.session_state.gen_url
 
                 status.info("Αφαιρώ AI watermarks...")
