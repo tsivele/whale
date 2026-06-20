@@ -485,7 +485,6 @@ elif st.session_state.step == 3:
                         "prompt": st.session_state.get("face_swap_prompt",                             "Place the person from image 1 in the scene of image 2, "
                             "same pose and framing. Photorealistic, vertical 9:16, 4K, "
                             "warm cinematic color grading. No text, no watermarks."
-)),
                         "seed": -1,
                     },
                 )
