@@ -434,7 +434,7 @@ elif st.session_state.step == 2:
         st.success("✓ Frame επιλέχθηκε")
         st.image(st.session_state.frame_b64, width=200)
         st.divider()
-                st.markdown("**Prompts** (default αν αφεθεί κενό)")
+        st.markdown("**Prompts** (default αν αφεθεί κενό)")
                 col_p1, col_p2 = st.columns(2)
                 with col_p1:
                                 fs_prompt = st.text_area(
