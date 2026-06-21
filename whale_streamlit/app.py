@@ -557,10 +557,16 @@ elif st.session_state.step == 4:
                          "duration": 5, "resolution": "1080p", "seed": -1},
                     )
                 else:  # kling
+                    with open(st.session_state.video_path, "rb") as f:
+                        video_b64 = to_b64(f.read(), mime="video/mp4")
                     pred_id = ws_submit(
-                        "kwaivgi/kling-v3.0-pro/image-to-video",
-                        {"image": st.session_state.swapped_url,
-                         "prompt": prompt, "duration": 5, "mode": "standard", "seed": -1},
+                        "kwaivgi/kling-v3.0-pro/motion-control",
+                        {
+                            "image": st.session_state.swapped_url,
+                            "video": video_b64,
+                            "character_orientation": "video",
+                            "prompt": prompt,
+                        },
                     )
                 result = ws_poll(pred_id, status)
                 st.session_state.gen_url = result
