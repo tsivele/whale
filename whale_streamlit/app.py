@@ -25,9 +25,9 @@ GRAIN_PROMPT = (
 )
 
 MODELS = {
+    "Kling v3 Pro (image-to-video)": "kling",
     "Seedance 2.0 (γρήγορο)": "seedance",
     "WAN 2.7 (υψηλή ποιότητα)": "wan",
-    "Kling v3 Pro (motion control)": "kling",
 }
 
 # ──────────────────────────────────────────────────────────
@@ -42,7 +42,7 @@ defaults = {
     "swapped_url": None,
     "gen_url": None,
     "final_path": None,
-    "model": "Seedance 2.0 (γρήγορο)",
+    "model": "Kling v3 Pro (image-to-video)",
     "ig_url": "",
     "motion_video_path": None,
 }
@@ -534,17 +534,8 @@ elif st.session_state.step == 4:
     st.session_state.model = model_label
     model = MODELS[model_label]
 
-    if model == "kling":
-        motion_file = st.file_uploader("Motion reference video (για Kling)", type=["mp4", "mov"])
-        if motion_file:
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-            tmp.write(motion_file.read())
-            tmp.close()
-            st.session_state.motion_video_path = tmp.name
-            st.video(tmp.name)
-
     if not st.session_state.gen_url:
-        can_generate = model != "kling" or st.session_state.motion_video_path
+        can_generate = True
         if st.button("🎬 Δημιούργησε Video", type="primary", disabled=not can_generate):
             status = st.empty()
             try:
@@ -566,12 +557,10 @@ elif st.session_state.step == 4:
                          "duration": 5, "resolution": "1080p", "seed": -1},
                     )
                 else:  # kling
-                    with open(st.session_state.motion_video_path, "rb") as f:
-                        motion_b64 = to_b64(f.read(), mime="video/mp4")
                     pred_id = ws_submit(
-                        "kwaivgi/kling-v3.0-pro/motion-control",
-                        {"image": st.session_state.swapped_url, "motion_video": motion_b64,
-                         "prompt": prompt, "duration": "5", "mode": "pro", "seed": -1},
+                        "kwaivgi/kling-v2.1/image-to-video",
+                        {"image": st.session_state.swapped_url,
+                         "prompt": prompt, "duration": 5, "mode": "standard", "seed": -1},
                     )
                 result = ws_poll(pred_id, status)
                 st.session_state.gen_url = result
