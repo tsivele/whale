@@ -25,7 +25,7 @@ GRAIN_PROMPT = (
 )
 
 MODELS = {
-    "Kling v3 Pro (image-to-video)": "kling",
+    "Kling v3 Pro (motion control)": "kling",
     "Seedance 2.0 (γρήγορο)": "seedance",
     "WAN 2.7 (υψηλή ποιότητα)": "wan",
 }
@@ -42,7 +42,7 @@ defaults = {
     "swapped_url": None,
     "gen_url": None,
     "final_path": None,
-    "model": "Kling v3 Pro (image-to-video)",
+    "model": "Kling v3 Pro (motion control)",
     "ig_url": "",
     "motion_video_path": None,
 }
