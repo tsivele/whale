@@ -558,7 +558,7 @@ elif st.session_state.step == 4:
                     )
                 else:  # kling
                     pred_id = ws_submit(
-                        "kwaivgi/kling-v2.1/image-to-video",
+                        "kwaivgi/kling-v3.0-pro/image-to-video",
                         {"image": st.session_state.swapped_url,
                          "prompt": prompt, "duration": 5, "mode": "standard", "seed": -1},
                     )
