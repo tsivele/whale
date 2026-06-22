@@ -14,6 +14,28 @@ _CREATOR_BYTES_DEFAULT = _b64.b64decode("/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAUDBAQ
 
 st.set_page_config(page_title="Whale Pipeline", page_icon="🐋", layout="centered")
 
+# dark theme
+st.markdown("""
+<style>
+html,body,[data-testid="stAppViewContainer"]{background:#0B0B0B!important;color:#F0F0F0!important;}
+[data-testid="stSidebar"],section[data-testid="stSidebar"]{display:none!important;}
+[data-testid="stSidebarCollapsedControl"]{display:none!important;}
+.block-container{max-width:660px!important;margin:0 auto!important;padding:2rem 1.5rem 4rem!important;}
+h1,h2,h3,h4,p,label,.stMarkdown{color:#F0F0F0!important;}
+.stButton>button[kind="primary"]{background:linear-gradient(135deg,#7c3aed 0%,#a855f7 100%)!important;color:#fff!important;border:none!important;border-radius:10px!important;font-weight:600!important;}
+.stButton>button:not([kind="primary"]){background:#1a1a1a!important;color:#ccc!important;border:1px solid #333!important;border-radius:10px!important;}
+.stTextInput input,.stTextArea textarea{background:#141414!important;color:#F0F0F0!important;border:1px solid #2a2a2a!important;border-radius:8px!important;}
+.stTextInput input:focus,.stTextArea textarea:focus{border-color:#7c3aed!important;box-shadow:0 0 0 2px rgba(124,58,237,.25)!important;}
+div[data-baseweb="select"]>div{background:#141414!important;border-color:#2a2a2a!important;border-radius:8px!important;color:#F0F0F0!important;}
+.stSuccess{background:#0d2218!important;border-left:3px solid #22c55e!important;color:#86efac!important;border-radius:8px!important;}
+.stError{background:#1f0a0a!important;border-left:3px solid #ef4444!important;color:#fca5a5!important;border-radius:8px!important;}
+.stInfo{background:#0e0e24!important;border-left:3px solid #7c3aed!important;color:#c4b5fd!important;border-radius:8px!important;}
+hr{border-color:#222!important;}
+.stProgress>div>div{background:#7c3aed!important;}
+::-webkit-scrollbar{width:5px;}::-webkit-scrollbar-track{background:#111;}::-webkit-scrollbar-thumb{background:#333;border-radius:3px;}
+</style>
+""", unsafe_allow_html=True)
+
 WS_API = "https://api.wavespeed.ai/api/v3"
 HIKER_API  = "https://api.hikerapi.com/v2/media/info/by/url"
 APIFY_BASE = "https://api.apify.com/v2"
@@ -590,50 +612,7 @@ elif st.session_state.step == 4:
     if st.button("← Πίσω"):
         st.session_state.step = 3
         st.rerun()
-
-
-# ──────────────────────────────────────────────────────────
-# STEP 5 — POST-PROCESSING & DONE
-# ──────────────────────────────────────────────────────────
-elif st.session_state.step == 5:
-    st.subheader("Βήμα 5 — Post-Processing")
-    st.video(st.session_state.gen_url)
-
-    if not st.session_state.final_path:
-        st.write("Auto pipeline: AI watermark removal → film grain → C2PA metadata strip")
-        if st.button("🛡 Εκτέλεση Post-Processing", type="primary"):
-            status = st.empty()
-            try:
-                current_url = st.session_state.gen_url
-
-                status.info("Αφαιρώ AI watermarks...")
-                try:
-                    wid = ws_submit("wavespeed-ai/video-watermark-remover", {"video": current_url})
-                    cleaned = ws_poll(wid, status)
-                    if cleaned:
-                        current_url = cleaned
-                except Exception as e:
-                    st.warning(f"Watermark removal skipped: {e}")
-
-                status.info("Film grain pass...")
-                try:
-                    gid = ws_submit(
-                        "bytedance/seedance-2.0/video-edit",
-                        {"video": current_url, "prompt": GRAIN_PROMPT, "seed": -1},
-                    )
-                    grained = ws_poll(gid, status)
-                    if grained:
-                        current_url = grained
-                except Exception as e:
-                    st.warning(f"Grain pass skipped: {e}")
-
-                status.info("Κατεβάζω για C2PA scrub...")
-                local_path = download_video_url(current_url)
-
-                status.info("Αφαιρώ metadata (C2PA scrub)...")
-                final_path = strip_metadata(local_path)
-
-                st.session_state.final_path = final_path
+session_state.final_path = final_path
                 status.empty()
                 st.rerun()
             except Exception as e:
