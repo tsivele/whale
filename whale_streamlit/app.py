@@ -408,14 +408,34 @@ def apify_search(hashtag: str) -> "list[dict]":
 # API HELPERS — Video Download + Frame Extraction
 # ─────────────────────────────────────────────────────────────
 def download_video(url: str) -> str:
-    """Download mp4 to temp file, return path"""
+    """yt-dlp first (TikTok/IG page URLs) then direct CDN request"""
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-    r   = requests.get(url, stream=True, timeout=60, headers={"User-Agent": "Mozilla/5.0"})
-    r.raise_for_status()
-    for chunk in r.iter_content(8192):
-        tmp.write(chunk)
     tmp.close()
-    return tmp.name
+    out = tmp.name
+    try:
+        r = subprocess.run([
+            "yt-dlp","--no-warnings","--no-playlist",
+            "-f","bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "--merge-output-format","mp4","--no-part","-o", out, url,
+        ], capture_output=True, text=True, timeout=180)
+        if r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 50_000:
+            return out
+    except Exception:
+        pass
+    try:
+        resp = requests.get(url, stream=True, timeout=60,
+            headers={"User-Agent":"Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)"})
+        resp.raise_for_status()
+        if "html" in resp.headers.get("content-type",""):
+            raise ValueError("Got HTML not video")
+        with open(out,"wb") as f:
+            for chunk in resp.iter_content(65536):
+                f.write(chunk)
+        if os.path.exists(out) and os.path.getsize(out) > 50_000:
+            return out
+    except Exception:
+        pass
+    raise RuntimeError(f"Download failed: {url[:80]}")
 
 def get_video_info(path: str) -> "tuple[float, int, int]":
     """Returns (duration_s, width, height) via ffprobe"""
@@ -444,26 +464,34 @@ def get_video_info(path: str) -> "tuple[float, int, int]":
         return 60.0, 720, 1280
 
 def extract_frame(path: str, timestamp: float) -> bytes | None:
-    """Extract JPEG frame via FFmpeg — reliable on Streamlit Cloud"""
+    """Extract JPEG to temp file via FFmpeg — works on Streamlit Cloud"""
     try:
-        ts = max(0.0, timestamp)
+        ts  = max(0.0, timestamp)
+        jpg = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+        jpg.close()
         r = subprocess.run(
             ["ffmpeg", "-y", "-ss", f"{ts:.3f}", "-i", str(path),
-             "-frames:v", "1", "-q:v", "2",
-             "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"],
-            capture_output=True, timeout=20)
-        if r.returncode == 0 and len(r.stdout) > 500:
-            return r.stdout
+             "-frames:v", "1", "-q:v", "2", "-vf", "scale=720:-2",
+             jpg.name],
+            capture_output=True, timeout=30)
+        if r.returncode == 0 and os.path.exists(jpg.name) and os.path.getsize(jpg.name) > 100:
+            with open(jpg.name, "rb") as f2: data = f2.read()
+            os.unlink(jpg.name)
+            return data
+        if os.path.exists(jpg.name): os.unlink(jpg.name)
     except Exception:
         pass
     try:
+        jpg2 = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+        jpg2.close()
         r2 = subprocess.run(
-            ["ffmpeg", "-y", "-i", str(path),
-             "-vframes", "1", "-q:v", "2",
-             "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"],
-            capture_output=True, timeout=20)
-        if r2.returncode == 0 and len(r2.stdout) > 500:
-            return r2.stdout
+            ["ffmpeg", "-y", "-i", str(path), "-vframes", "1", "-q:v", "2", jpg2.name],
+            capture_output=True, timeout=30)
+        if r2.returncode == 0 and os.path.exists(jpg2.name) and os.path.getsize(jpg2.name) > 100:
+            with open(jpg2.name, "rb") as f3: data = f3.read()
+            os.unlink(jpg2.name)
+            return data
+        if os.path.exists(jpg2.name): os.unlink(jpg2.name)
     except Exception:
         pass
     return None
@@ -777,10 +805,19 @@ def render_frame_selection():
     dur  = st.session_state.video_duration
 
     if not path or not os.path.exists(path):
-        st.error("Video not found. Please go back to Step 1.")
+        st.error("❌ Video not found — please go back and try again.")
         if st.button("← Back to Discovery"):
             st.session_state.step = 1; st.rerun()
         return
+    try:
+        fsize = os.path.getsize(path)
+        if fsize < 10_000:
+            st.error(f"⚠️ Video file too small ({fsize} bytes) — download failed. Try another URL.")
+            if st.button("← Back to Discovery"):
+                st.session_state.step = 1; st.rerun()
+            return
+    except Exception:
+        pass
 
     st.markdown(f"""
     <div style="margin-bottom:20px">
