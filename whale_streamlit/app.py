@@ -530,36 +530,65 @@ def get_video_info(path: str) -> "tuple[float, int, int]":
         return 60.0, 720, 1280
 
 def extract_frame(path: str, timestamp: float) -> bytes | None:
-    """Extract JPEG — first frame first (most reliable), then requested ts"""
-    def _grab(extra: list) -> bytes | None:
+    """Extract frame: cv2 → ffmpeg fallback. Always tries first frame."""
+    import shutil
+    ts = max(0.0, timestamp)
+    last_err = ""
+
+    # Method 1: cv2 (fastest, no subprocess needed)
+    try:
+        cap = cv2.VideoCapture(str(path))
+        if cap.isOpened():
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            dur_v = total / fps if fps > 0 else 60
+            safe_ts = min(ts, max(0, dur_v - 0.1))
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(safe_ts * fps))
+            ret, frame = cap.read()
+            cap.release()
+            if ret and frame is not None:
+                _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                return buf.tobytes()
+            # Try first frame
+            cap2 = cv2.VideoCapture(str(path))
+            cap2.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret2, frame2 = cap2.read()
+            cap2.release()
+            if ret2 and frame2 is not None:
+                _, buf2 = cv2.imencode(".jpg", frame2, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                return buf2.tobytes()
+            last_err = "cv2: opened but no frame"
+        else:
+            last_err = "cv2: cannot open file"
+    except Exception as ex:
+        last_err = f"cv2:{ex}"
+
+    # Method 2: ffmpeg to temp file
+    ffmpeg_bin = shutil.which("ffmpeg") or "ffmpeg"
+    for seek_args in [[], ["-ss", "0"], ["-ss", f"{ts:.3f}"], ["-ss", "1"]]:
         try:
             jpg = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
             jpg.close()
-            r = subprocess.run(
-                ["ffmpeg", "-y"] + extra + ["-i", str(path), "-frames:v", "1", "-q:v", "2", jpg.name],
-                capture_output=True, timeout=30)
+            cmd = [ffmpeg_bin, "-y"] + seek_args + [
+                "-i", str(path), "-frames:v", "1", "-q:v", "2", jpg.name]
+            r = subprocess.run(cmd, capture_output=True, timeout=30)
             if r.returncode == 0 and os.path.exists(jpg.name) and os.path.getsize(jpg.name) > 100:
-                with open(jpg.name, "rb") as fh: data = fh.read()
+                with open(jpg.name, "rb") as fh:
+                    data = fh.read()
                 os.unlink(jpg.name)
                 return data
-            if os.path.exists(jpg.name): os.unlink(jpg.name)
-        except Exception:
-            pass
-        return None
+            err = r.stderr.decode(errors="ignore")[-120:] if r.stderr else ""
+            last_err = f"ffmpeg(seek={seek_args}):{err}"
+            if os.path.exists(jpg.name):
+                os.unlink(jpg.name)
+        except Exception as ex:
+            last_err = f"ffmpeg:{ex}"
 
-    ts = max(0.0, timestamp)
-    r0 = _grab([])                              # first frame — always works
-    if r0 and ts < 0.5: return r0
-    if ts > 0:
-        r1 = _grab(["-ss", f"{ts:.3f}"])
-        if r1: return r1
-    if r0: return r0
-    return _grab(["-ss", "1"])
+    # Store error for display
+    import streamlit as _st
+    try: _st.session_state["_frame_err"] = last_err
+    except Exception: pass
     return None
-
-# ─────────────────────────────────────────────────────────────
-# API HELPERS — WaveSpeed / Kling
-# ─────────────────────────────────────────────────────────────
 def ws_submit(model: str, payload: dict) -> str:
     r = requests.post(
         f"{WS_API}/{model}",
@@ -900,20 +929,36 @@ def render_frame_selection():
 
         # ── ONE AI Recommended Frame ─────────────────────────────────────
         ai_ts = 0.0  # First frame — always visible
-        st.markdown("**✨ AI Recommended Frame** — Opening Hook")
+        st.markdown("**✨ AI Recommended Frame** — First Frame")
         ai_bytes = extract_frame(path, ai_ts)
+        thumb_url = (reel or {}).get("thumbnail") or (reel or {}).get("thumbnail_url") or ""
         if ai_bytes:
             ca1, ca2 = st.columns([1, 2])
             with ca1:
-                st.image(ai_bytes, caption=f"@ {ai_ts:.1f}s", use_container_width=True)
+                st.image(ai_bytes, caption="Frame 0s", use_container_width=True)
             with ca2:
-                st.markdown('<div style="padding:8px 0"><div style="color:#c4b5fd;font-weight:600;font-size:12px">Peak retention zone</div><div style="color:#71717a;font-size:11px;margin-top:4px">First 15% — highest viewer attention</div></div>', unsafe_allow_html=True)
-                if st.button(f"⭐ Use AI frame ({ai_ts:.1f}s)", key="use_ai", use_container_width=True):
+                st.markdown('<div style="padding:8px 0"><div style="color:#c4b5fd;font-weight:600;font-size:12px">First frame</div><div style="color:#71717a;font-size:11px;margin-top:4px">Clean, no motion blur — ideal for face swap</div></div>', unsafe_allow_html=True)
+                if st.button("⭐ Use this frame", key="use_ai", use_container_width=True):
                     st.session_state.frame_time = ai_ts
                     st.session_state.frame_b64 = to_b64(ai_bytes)
                     st.rerun()
+        elif thumb_url:
+            ca1, ca2 = st.columns([1, 2])
+            with ca1:
+                st.image(thumb_url, caption="Thumbnail", use_container_width=True)
+            with ca2:
+                st.markdown('<div style="padding:8px 0"><div style="color:#fbbf24;font-weight:600;font-size:12px">Using thumbnail</div><div style="color:#71717a;font-size:11px;margin-top:4px">Frame extraction unavailable</div></div>', unsafe_allow_html=True)
+                try:
+                    import requests as _rq
+                    tb = _rq.get(thumb_url, timeout=10).content
+                    if st.button("⭐ Use thumbnail", key="use_thumb", use_container_width=True):
+                        st.session_state.frame_b64 = to_b64(tb, "image/jpeg")
+                        st.rerun()
+                except Exception:
+                    pass
         else:
-            st.caption(f"No AI frame at {ai_ts:.1f}s")
+            ferr = st.session_state.get("_frame_err", "")
+            st.warning(f"⚠️ Cannot extract frame: {ferr[:120]}")
 
         st.markdown("---")
 
@@ -937,8 +982,9 @@ def render_frame_selection():
                 if st.button("✅ Use this frame", key="use_custom", use_container_width=True):
                     st.rerun()
         else:
-            st.warning(f"⚠️ No frame at {st.session_state.frame_time:.1f}s")
-            if st.button("↩️ Try ts=0"):
+            ferr2 = st.session_state.get("_frame_err", "")
+            st.warning(f"⚠️ No frame — {ferr2[:100]}")
+            if st.button("↩️ Try first frame"):
                 st.session_state.frame_time = 0.0; st.rerun()
 
     with col_right:
