@@ -161,9 +161,9 @@ hr { border-color: #222 !important; }
 # ─────────────────────────────────────────────────────────────
 # API KEYS (from Streamlit Secrets)
 # ─────────────────────────────────────────────────────────────
-WS_KEY    = st.secrets.get("WAVESPEED_KEY", "")
-HIKER_KEY = st.secrets.get("HIKER_KEY",     "")
-APIFY_KEY = st.secrets.get("APIFY_KEY",     "")
+WS_KEY    = st.secrets.get("WAVESPEED_KEY", "wsk_live_9fa52fRA-LqiRiMrTRJX_W_LcN7JhGo7Bza3vhmxI4M")
+HIKER_KEY = st.secrets.get("HIKER_KEY",     "zw9us00t8j3aiimwvjvd3600iqelqj8x")
+APIFY_KEY = st.secrets.get("APIFY_KEY",     "apify_api_nGZAclYjIoPbEcvTFFVQMcIKCurD2J1uWF9C")
 
 WS_API    = "https://api.wavespeed.ai/api/v3"
 HIKER_API = "https://api.hikerapi.com"
@@ -235,7 +235,7 @@ for k, v in DEFAULTS.items():
 def _hiker_headers():
     return {"x-access-key": HIKER_KEY, "accept": "application/json"}
 
-def _parse_hiker_item(item: dict) -> dict | None:
+def _parse_hiker_item(item: dict) -> "dict | None":
     if not item or item.get("media_type") not in (2, 8, None):
         pass  # allow all types for now
     user = item.get("user") or {}
@@ -272,7 +272,7 @@ def _parse_hiker_item(item: dict) -> dict | None:
         "url": f"https://www.instagram.com/reel/{item.get('code','')}/" if item.get("code") else "",
     }
 
-def hiker_search(hashtag: str) -> list[dict]:
+def hiker_search(hashtag: str) -> "list[dict]":
     """Fetch viral reels via HikerAPI — tries 3 endpoints"""
     tag = hashtag.lstrip("#").strip() or "viral"
     h   = _hiker_headers()
@@ -318,7 +318,7 @@ def hiker_get_video_url(ig_url: str) -> str:
 # ─────────────────────────────────────────────────────────────
 # API HELPERS — Apify
 # ─────────────────────────────────────────────────────────────
-def _parse_apify_item(item: dict) -> dict | None:
+def _parse_apify_item(item: dict) -> "dict | None":
     likes    = int(item.get("likesCount")   or 0)
     if likes == -1: likes = 0
     comments = int(item.get("commentsCount") or 0)
@@ -345,7 +345,7 @@ def _parse_apify_item(item: dict) -> dict | None:
         "url":          item.get("url") or f"https://www.instagram.com/reel/{item.get('shortCode','')}/",
     }
 
-def apify_search(hashtag: str) -> list[dict]:
+def apify_search(hashtag: str) -> "list[dict]":
     """Fetch reels via Apify instagram-hashtag-scraper"""
     tag = hashtag.lstrip("#").strip()
     params = {"token": APIFY_KEY}
@@ -406,7 +406,7 @@ def download_video(url: str) -> str:
     tmp.close()
     return tmp.name
 
-def get_video_info(path: str) -> tuple[float, int, int]:
+def get_video_info(path: str) -> "tuple[float, int, int]":
     """Returns (duration_s, width, height)"""
     cap = cv2.VideoCapture(path)
     fps   = cap.get(cv2.CAP_PROP_FPS) or 30
