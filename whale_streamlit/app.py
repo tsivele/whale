@@ -418,28 +418,55 @@ def download_video(url: str) -> str:
     return tmp.name
 
 def get_video_info(path: str) -> "tuple[float, int, int]":
-    """Returns (duration_s, width, height)"""
-    cap = cv2.VideoCapture(path)
-    fps   = cap.get(cv2.CAP_PROP_FPS) or 30
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    w     = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h     = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    cap.release()
-    return total / fps, w, h
+    """Returns (duration_s, width, height) via ffprobe"""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height,duration",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=15)
+        if r.returncode == 0 and r.stdout.strip():
+            parts = r.stdout.strip().split(",")
+            w   = int(parts[0]) if len(parts) > 0 and parts[0].strip().isdigit() else 720
+            h   = int(parts[1]) if len(parts) > 1 and parts[1].strip().isdigit() else 1280
+            dur = float(parts[2]) if len(parts) > 2 else 60.0
+            return dur, w, h
+    except Exception:
+        pass
+    try:
+        r2 = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True, text=True, timeout=10)
+        dur = float(r2.stdout.strip()) if r2.stdout.strip() else 60.0
+        return dur, 720, 1280
+    except Exception:
+        return 60.0, 720, 1280
 
 def extract_frame(path: str, timestamp: float) -> bytes | None:
-    """Extract JPEG frame at timestamp, return bytes"""
-    cap = cv2.VideoCapture(path)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    dur = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) / fps
-    ts  = max(0.0, min(timestamp, dur - 0.1))
-    cap.set(cv2.CAP_PROP_POS_FRAMES, int(ts * fps))
-    ret, frame = cap.read()
-    cap.release()
-    if not ret:
-        return None
-    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
-    return buf.tobytes()
+    """Extract JPEG frame via FFmpeg — reliable on Streamlit Cloud"""
+    try:
+        ts = max(0.0, timestamp)
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-ss", f"{ts:.3f}", "-i", str(path),
+             "-frames:v", "1", "-q:v", "2",
+             "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"],
+            capture_output=True, timeout=20)
+        if r.returncode == 0 and len(r.stdout) > 500:
+            return r.stdout
+    except Exception:
+        pass
+    try:
+        r2 = subprocess.run(
+            ["ffmpeg", "-y", "-i", str(path),
+             "-vframes", "1", "-q:v", "2",
+             "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"],
+            capture_output=True, timeout=20)
+        if r2.returncode == 0 and len(r2.stdout) > 500:
+            return r2.stdout
+    except Exception:
+        pass
+    return None
 
 # ─────────────────────────────────────────────────────────────
 # API HELPERS — WaveSpeed / Kling
