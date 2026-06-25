@@ -407,35 +407,87 @@ def apify_search(hashtag: str) -> "list[dict]":
 # ─────────────────────────────────────────────────────────────
 # API HELPERS — Video Download + Frame Extraction
 # ─────────────────────────────────────────────────────────────
+def _try_save(url: str, out: str) -> bool:
+    """Download url to file, return True if > 50KB"""
+    try:
+        r = requests.get(url, stream=True, timeout=90,
+            headers={"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15"})
+        r.raise_for_status()
+        if "html" in r.headers.get("content-type", ""):
+            return False
+        with open(out, "wb") as f:
+            for chunk in r.iter_content(65536):
+                f.write(chunk)
+        return os.path.exists(out) and os.path.getsize(out) > 50_000
+    except Exception:
+        return False
+
 def download_video(url: str) -> str:
-    """yt-dlp first (TikTok/IG page URLs) then direct CDN request"""
+    """4-layer download: direct CDN → yt-dlp → Cobalt → Apify"""
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     tmp.close()
     out = tmp.name
+    errors = []
+
+    # Layer 1: Direct CDN (pre-resolved HikerAPI/Apify video URLs)
+    if any(x in url for x in [".mp4", "cdn", "akamai", "fbcdn", "cdninstagram", "scontent", "tiktokcdn"]):
+        if _try_save(url, out):
+            return out
+        errors.append("cdn: small file")
+
+    # Layer 2: yt-dlp
     try:
         r = subprocess.run([
-            "yt-dlp","--no-warnings","--no-playlist",
-            "-f","bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-            "--merge-output-format","mp4","--no-part","-o", out, url,
-        ], capture_output=True, text=True, timeout=180)
+            "yt-dlp", "--no-warnings", "--no-playlist",
+            "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "--merge-output-format", "mp4", "--no-part", "-o", out, url,
+        ], capture_output=True, text=True, timeout=120)
         if r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 50_000:
             return out
-    except Exception:
-        pass
+        errors.append(f"yt-dlp:rc={r.returncode}")
+    except Exception as e:
+        errors.append(f"yt-dlp:{e}")
+
+    # Layer 3: Cobalt API (free, bypasses TikTok/IG)
     try:
-        resp = requests.get(url, stream=True, timeout=60,
-            headers={"User-Agent":"Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)"})
-        resp.raise_for_status()
-        if "html" in resp.headers.get("content-type",""):
-            raise ValueError("Got HTML not video")
-        with open(out,"wb") as f:
-            for chunk in resp.iter_content(65536):
-                f.write(chunk)
-        if os.path.exists(out) and os.path.getsize(out) > 50_000:
+        cr = requests.post("https://api.cobalt.tools/",
+            json={"url": url, "filenameStyle": "basic", "videoQuality": "720"},
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            timeout=20)
+        cd = cr.json()
+        cobalt_url = cd.get("url") or ((cd.get("picker") or [{}])[0].get("url") if cd.get("picker") else None)
+        if cobalt_url and _try_save(cobalt_url, out):
             return out
-    except Exception:
-        pass
-    raise RuntimeError(f"Download failed: {url[:80]}")
+        errors.append(f"cobalt:{cd.get('status','?')}")
+    except Exception as e:
+        errors.append(f"cobalt:{e}")
+
+    # Layer 4: Apify sync (residential proxy, most reliable)
+    try:
+        is_tt = "tiktok.com" in url.lower()
+        actor = "clockworks~tiktok-scraper" if is_tt else "apify~instagram-reel-scraper"
+        inp   = ({"postURLs": [url], "resultsType": "posts", "resultsLimit": 1}
+                 if is_tt else {"directUrls": [url], "resultsLimit": 1})
+        ar = requests.post(
+            f"https://api.apify.com/v2/acts/{actor}/run-sync-get-dataset-items",
+            params={"token": APIFY_KEY, "timeout": 60},
+            json=inp, timeout=90)
+        items = ar.json() if ar.ok else []
+        for item in (items if isinstance(items, list) else []):
+            vurl = (item.get("videoUrl") or item.get("video_url") or
+                    (item.get("video") or {}).get("downloadAddr") or
+                    item.get("webVideoUrl") or item.get("downloadUrl"))
+            if vurl and _try_save(vurl, out):
+                return out
+        errors.append(f"apify:{len(items) if isinstance(items,list) else 0} items")
+    except Exception as e:
+        errors.append(f"apify:{e}")
+
+    # Layer 5: plain GET
+    if _try_save(url, out):
+        return out
+
+    raise RuntimeError(" | ".join(errors))
 
 def get_video_info(path: str) -> "tuple[float, int, int]":
     """Returns (duration_s, width, height) via ffprobe"""
