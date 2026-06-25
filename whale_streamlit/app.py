@@ -155,6 +155,15 @@ hr { border-color: #222 !important; }
 ::-webkit-scrollbar { width: 5px; }
 ::-webkit-scrollbar-track { background: #111; }
 ::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
+/* Hide Streamlit & GitHub toolbars */
+[data-testid="stToolbar"],[data-testid="stDecoration"],
+[data-testid="stStatusWidget"],.stDeployButton,
+.viewerBadge_container__r5tak,.viewerBadge_link__qRIco,
+header[data-testid="stHeader"], .stApp > header,
+#MainMenu, footer, .stAppToolbar,
+iframe[title="streamlit_footer"] { display: none !important; }
+.stApp { overflow: hidden !important; }
+.main .block-container { padding-top: 1rem !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -221,6 +230,8 @@ DEFAULTS = {
     "pipeline_runs":     0,
     "niches_explored":   [],
     "total_reels":       0,
+    "batch_queue":       [],
+    "batch_idx":         0,
     "creator_bytes":     None,
     "face_swap_prompt":  "Place the person from image 1 in the scene of image 2, same pose and framing. Photorealistic, vertical 9:16, 4K, warm cinematic color grading. No text, no watermarks.",
     "video_prompt":      "Cinematic ambient video. Slow smooth camera push-in. Subtle ambient motion, depth-of-field bokeh. Vertical 9:16. No text.",
@@ -545,6 +556,34 @@ def render_stats():
 # STEP 1 — DISCOVERY FEED
 # ─────────────────────────────────────────────────────────────
 def render_discovery():
+    # ── URL Batch Input ────────────────────────────────────────────
+    with st.expander("🔗 Paste URLs directly (batch download)", expanded=False):
+        url_text = st.text_area(
+            "URLs",
+            placeholder="Paste one TikTok or Instagram URL per line:\nhttps://www.tiktok.com/@creator/video/...\nhttps://www.instagram.com/reel/...",
+            height=120,
+            label_visibility="collapsed",
+            key="batch_url_input",
+        )
+        if st.button("⬇️ Download & Start Pipeline", type="primary", key="batch_go"):
+            urls = [u.strip() for u in url_text.splitlines() if u.strip().startswith("http")]
+            if not urls:
+                st.warning("⚠️ Paste at least one URL above.")
+            else:
+                st.session_state.batch_queue = urls
+                st.session_state.batch_idx   = 0
+                _process_batch_url(urls[0])
+
+    # Process next in batch if queued
+    if st.session_state.get("batch_queue") and st.session_state.get("batch_idx", 0) > 0:
+        idx  = st.session_state.batch_idx
+        q2   = st.session_state.batch_queue
+        remaining = len(q2) - idx
+        if remaining > 0:
+            st.info(f"📋 Queue: {remaining} URL(s) remaining. Processing {q2[idx][:60]}…")
+            if st.button("▶️ Process Next URL", key="next_url"):
+                _process_batch_url(q2[idx])
+    st.markdown("---")
     # Search controls
     sc1, sc2, sc3, sc4 = st.columns([3, 1.5, 1.5, 1])
     with sc1:
@@ -652,6 +691,20 @@ def render_discovery():
                 btn_key = f"dl_{reel['id']}_{ci}_{row_start}"
                 if st.button("⬇️ Download & Start Pipeline", key=btn_key, use_container_width=True):
                     _start_pipeline(reel)
+
+def _process_batch_url(url: str):
+    """Download a raw URL and advance to Step 2 (used for batch paste)."""
+    # Build a minimal reel-like dict from the URL
+    fake_reel = {
+        "id": url[-12:], "code": "", "title": url[:60],
+        "author": "Direct URL", "avatar": "🔗",
+        "likes": 0, "comments": 0, "views": 0,
+        "engagement": 0.0, "views_fmt": "—", "likes_fmt": "—",
+        "thumbnail": "", "video_url": url,
+        "platform": "TikTok" if "tiktok" in url.lower() else "Instagram",
+        "url": url,
+    }
+    _start_pipeline(fake_reel)
 
 def _start_pipeline(reel: dict):
     """Download reel video and advance to Step 2"""
