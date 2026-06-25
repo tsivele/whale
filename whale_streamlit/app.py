@@ -324,7 +324,9 @@ def hiker_get_video_url(ig_url: str) -> str:
         timeout=15,
     )
     d = r.json()
-    return d.get("video_url") or d.get("download_url") or ""
+    media = d.get("media_or_ad") or d
+    return (media.get("video_url") or media.get("download_url") or
+            ((media.get("video_versions") or [{}])[0]).get("url") or "")
 
 # ─────────────────────────────────────────────────────────────
 # API HELPERS — Apify
@@ -439,11 +441,14 @@ def download_video(url: str) -> str:
             timeout=20)
         if hk.ok:
             hd = hk.json()
-            vurl = (hd.get("video_url") or hd.get("download_url") or
-                    ((hd.get("video_versions") or [{}])[0]).get("url"))
+            # HikerAPI wraps media inside 'media_or_ad' key
+            media = hd.get("media_or_ad") or hd
+            vurl = (media.get("video_url") or media.get("download_url") or
+                    ((media.get("video_versions") or [{}])[0]).get("url") or
+                    media.get("clips_metadata", {}).get("original_sound_info", {}).get("progressive_download_url"))
             if vurl and _try_save(vurl, out):
                 return out
-            errors.append(f"hiker:got={list(hd.keys())[:5]}")
+            errors.append(f"hiker:keys={list(media.keys())[:6]}")
         else:
             errors.append(f"hiker:{hk.status_code}")
     except Exception as e:
