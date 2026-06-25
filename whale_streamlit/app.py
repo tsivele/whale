@@ -547,6 +547,7 @@ def extract_frame(path: str, timestamp: float) -> bytes | None:
         if os.path.exists(jpg.name): os.unlink(jpg.name)
     except Exception:
         pass
+    # Fallback: try ts=0 (first frame, always works)
     try:
         jpg2 = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
         jpg2.close()
@@ -558,6 +559,20 @@ def extract_frame(path: str, timestamp: float) -> bytes | None:
             os.unlink(jpg2.name)
             return data
         if os.path.exists(jpg2.name): os.unlink(jpg2.name)
+    except Exception:
+        pass
+    # Fallback 2: try ts=1
+    try:
+        jpg3 = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+        jpg3.close()
+        r3 = subprocess.run(
+            ["ffmpeg", "-y", "-ss", "1", "-i", str(path), "-vframes", "1", "-q:v", "2", jpg3.name],
+            capture_output=True, timeout=30)
+        if r3.returncode == 0 and os.path.exists(jpg3.name) and os.path.getsize(jpg3.name) > 100:
+            with open(jpg3.name, "rb") as f4: data = f4.read()
+            os.unlink(jpg3.name)
+            return data
+        if os.path.exists(jpg3.name): os.unlink(jpg3.name)
     except Exception:
         pass
     return None
@@ -903,81 +918,75 @@ def render_frame_selection():
 
         st.markdown("<div style='height:8px'/>", unsafe_allow_html=True)
 
-        # ── AI Recommended Frames ──
-        st.markdown("**✨ AI Recommended Frames**", help="Frames with highest audience retention based on video analysis")
-        rec_times = [
-            max(0.1, dur * 0.12),   # ~12% — opening hook
-            max(0.1, dur * 0.52),   # ~52% — key moment
-        ]
-        rec_labels = ["Opening Hook", "Key Moment"]
-        rec_reasons = [
-            "Peak viewer attention — high retention area",
-            "Engagement spike — viewers most invested here",
-        ]
-
-        rc1, rc2 = st.columns(2)
-        for ci, (t, label, reason) in enumerate(zip(rec_times, rec_labels, rec_reasons)):
-            col = rc1 if ci == 0 else rc2
-            with col:
-                frame_bytes = extract_frame(path, t)
-                if frame_bytes:
-                    st.image(frame_bytes, caption=f"⭐ {label} ({t:.1f}s)", use_container_width=True)
-                else:
-                    st.markdown(f"*Frame at {t:.1f}s*")
-                st.markdown(f'<div style="font-size:10px;color:#71717a">{reason}</div>', unsafe_allow_html=True)
-                if st.button(f"Use this frame ({t:.1f}s)", key=f"rec_{ci}", use_container_width=True):
-                    st.session_state.frame_time = t
+        # ── ONE AI Recommended Frame ─────────────────────────────────────
+        ai_ts = max(0.1, dur * 0.12)
+        st.markdown("**✨ AI Recommended Frame** — Opening Hook")
+        ai_bytes = extract_frame(path, ai_ts)
+        if ai_bytes:
+            ca1, ca2 = st.columns([1, 2])
+            with ca1:
+                st.image(ai_bytes, caption=f"@ {ai_ts:.1f}s", use_container_width=True)
+            with ca2:
+                st.markdown('<div style="padding:8px 0"><div style="color:#c4b5fd;font-weight:600;font-size:12px">Peak retention zone</div><div style="color:#71717a;font-size:11px;margin-top:4px">First 15% — highest viewer attention</div></div>', unsafe_allow_html=True)
+                if st.button(f"⭐ Use AI frame ({ai_ts:.1f}s)", key="use_ai", use_container_width=True):
+                    st.session_state.frame_time = ai_ts
+                    st.session_state.frame_b64 = to_b64(ai_bytes)
                     st.rerun()
+        else:
+            st.caption(f"No AI frame at {ai_ts:.1f}s")
 
-    with col_right:
-        st.markdown("**🎛️ Custom Frame Selector**")
+        st.markdown("---")
 
-        # Scrubber slider
-        frame_time = st.slider(
-            "Slide to select frame",
-            min_value=0.0,
-            max_value=max(0.1, dur - 0.1),
-            value=float(st.session_state.frame_time),
-            step=0.5,
-            format="%.1f s",
-            label_visibility="collapsed",
-        )
-        if abs(frame_time - st.session_state.frame_time) > 0.1:
+        # ── Custom Frame Scrubber ────────────────────────────────────────
+        st.markdown("**🎛️ Custom Frame**")
+        frame_time = st.slider("", min_value=0.0, max_value=max(0.1, dur - 0.1),
+            value=float(st.session_state.frame_time), step=0.5, format="%.1f s",
+            label_visibility="collapsed")
+        if abs(frame_time - st.session_state.frame_time) > 0.09:
             st.session_state.frame_time = frame_time
             st.rerun()
 
-        # Selected frame preview
-        st.markdown("**Selected Frame Preview**")
-        frame_bytes = extract_frame(path, st.session_state.frame_time)
-        if frame_bytes:
-            st.image(frame_bytes, caption=f"Frame @ {st.session_state.frame_time:.1f}s", use_container_width=True)
-            st.session_state.frame_b64 = to_b64(frame_bytes)
+        fb = extract_frame(path, st.session_state.frame_time)
+        if fb:
+            cb1, cb2 = st.columns([1, 2])
+            with cb1:
+                st.image(fb, caption=f"@ {st.session_state.frame_time:.1f}s", use_container_width=True)
+                st.session_state.frame_b64 = to_b64(fb)
+            with cb2:
+                st.markdown('<div style="padding:8px 0"><div style="color:#f4f4f5;font-weight:600;font-size:12px">Custom selection</div><div style="color:#71717a;font-size:11px;margin-top:4px">Slide to pick your moment</div></div>', unsafe_allow_html=True)
+                if st.button("✅ Use this frame", key="use_custom", use_container_width=True):
+                    st.rerun()
         else:
-            st.warning("Could not extract frame at this position")
+            st.warning(f"⚠️ No frame at {st.session_state.frame_time:.1f}s")
+            if st.button("↩️ Try ts=0"):
+                st.session_state.frame_time = 0.0; st.rerun()
 
-        st.markdown("<div style='height:8px'/>", unsafe_allow_html=True)
+    with col_right:
+        # ── Reference Photo (persisted) ──────────────────────────────────
+        st.markdown("**👤 Reference Photo**")
+        # Load from disk if not in session
+        _ref = "/tmp/whale_ref_face.jpg"
+        if not st.session_state.creator_bytes and os.path.exists(_ref):
+            with open(_ref, "rb") as _f: st.session_state.creator_bytes = _f.read()
 
-        # Creator photo upload
-        st.markdown("**👤 Your Creator Photo**")
-        uploaded = st.file_uploader("Upload your photo (face for swap)", type=["jpg","jpeg","png"],
-                                    label_visibility="collapsed")
+        uploaded = st.file_uploader("Upload face photo", type=["jpg","jpeg","png"],
+                                    label_visibility="collapsed", key="face_upload")
         if uploaded:
-            st.session_state.creator_bytes = uploaded.read()
-            st.image(st.session_state.creator_bytes, caption="Creator photo loaded ✓", use_container_width=True)
-        elif st.session_state.creator_bytes:
-            st.image(st.session_state.creator_bytes, caption="Creator photo ✓", use_container_width=True)
+            data = uploaded.read()
+            st.session_state.creator_bytes = data
+            with open(_ref, "wb") as _f: _f.write(data)
 
-        st.markdown("<div style='height:12px'/>", unsafe_allow_html=True)
+        if st.session_state.creator_bytes:
+            st.image(st.session_state.creator_bytes, caption="✓ Reference set", width=160)
+        else:
+            st.info("⬆️ Upload your reference photo once — it will be remembered")
 
-        # Generate button
+        st.markdown("<div style='height:14px'/>", unsafe_allow_html=True)
         can_gen = bool(st.session_state.frame_b64 and st.session_state.creator_bytes)
-        if st.button("✨ Generate Image →", type="primary", use_container_width=True, disabled=not can_gen):
-            st.session_state.step = 3
-            st.rerun()
-
+        if st.button("✨ Generate Faceswap →", type="primary", use_container_width=True, disabled=not can_gen):
+            st.session_state.step = 3; st.rerun()
         if not can_gen:
-            st.caption("⚠️ Upload your photo to enable generation")
-
+            st.caption("⚠️ Select a frame + upload photo")
         st.markdown("<div style='height:8px'/>", unsafe_allow_html=True)
         if st.button("← Back to Discovery", use_container_width=True):
             st.session_state.step = 1; st.rerun()
@@ -1001,10 +1010,10 @@ def render_review():
     </div>
     """, unsafe_allow_html=True)
 
-    col_img, col_info = st.columns([1, 1.2])
+    col_img, col_info = st.columns([1, 1.5])
 
     with col_img:
-        st.image(st.session_state.swapped_url, caption="AI Generated Image ✨", use_container_width=True)
+        st.image(st.session_state.swapped_url, caption="✨ AI Faceswap", width=260)
 
     with col_info:
         st.markdown("""
