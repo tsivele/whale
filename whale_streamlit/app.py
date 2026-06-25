@@ -530,51 +530,31 @@ def get_video_info(path: str) -> "tuple[float, int, int]":
         return 60.0, 720, 1280
 
 def extract_frame(path: str, timestamp: float) -> bytes | None:
-    """Extract JPEG to temp file via FFmpeg — works on Streamlit Cloud"""
-    try:
-        ts  = max(0.0, timestamp)
-        jpg = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-        jpg.close()
-        r = subprocess.run(
-            ["ffmpeg", "-y", "-ss", f"{ts:.3f}", "-i", str(path),
-             "-frames:v", "1", "-q:v", "2", "-vf", "scale=720:-2",
-             jpg.name],
-            capture_output=True, timeout=30)
-        if r.returncode == 0 and os.path.exists(jpg.name) and os.path.getsize(jpg.name) > 100:
-            with open(jpg.name, "rb") as f2: data = f2.read()
-            os.unlink(jpg.name)
-            return data
-        if os.path.exists(jpg.name): os.unlink(jpg.name)
-    except Exception:
-        pass
-    # Fallback: try ts=0 (first frame, always works)
-    try:
-        jpg2 = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-        jpg2.close()
-        r2 = subprocess.run(
-            ["ffmpeg", "-y", "-i", str(path), "-vframes", "1", "-q:v", "2", jpg2.name],
-            capture_output=True, timeout=30)
-        if r2.returncode == 0 and os.path.exists(jpg2.name) and os.path.getsize(jpg2.name) > 100:
-            with open(jpg2.name, "rb") as f3: data = f3.read()
-            os.unlink(jpg2.name)
-            return data
-        if os.path.exists(jpg2.name): os.unlink(jpg2.name)
-    except Exception:
-        pass
-    # Fallback 2: try ts=1
-    try:
-        jpg3 = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-        jpg3.close()
-        r3 = subprocess.run(
-            ["ffmpeg", "-y", "-ss", "1", "-i", str(path), "-vframes", "1", "-q:v", "2", jpg3.name],
-            capture_output=True, timeout=30)
-        if r3.returncode == 0 and os.path.exists(jpg3.name) and os.path.getsize(jpg3.name) > 100:
-            with open(jpg3.name, "rb") as f4: data = f4.read()
-            os.unlink(jpg3.name)
-            return data
-        if os.path.exists(jpg3.name): os.unlink(jpg3.name)
-    except Exception:
-        pass
+    """Extract JPEG — first frame first (most reliable), then requested ts"""
+    def _grab(extra: list) -> bytes | None:
+        try:
+            jpg = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+            jpg.close()
+            r = subprocess.run(
+                ["ffmpeg", "-y"] + extra + ["-i", str(path), "-frames:v", "1", "-q:v", "2", jpg.name],
+                capture_output=True, timeout=30)
+            if r.returncode == 0 and os.path.exists(jpg.name) and os.path.getsize(jpg.name) > 100:
+                with open(jpg.name, "rb") as fh: data = fh.read()
+                os.unlink(jpg.name)
+                return data
+            if os.path.exists(jpg.name): os.unlink(jpg.name)
+        except Exception:
+            pass
+        return None
+
+    ts = max(0.0, timestamp)
+    r0 = _grab([])                              # first frame — always works
+    if r0 and ts < 0.5: return r0
+    if ts > 0:
+        r1 = _grab(["-ss", f"{ts:.3f}"])
+        if r1: return r1
+    if r0: return r0
+    return _grab(["-ss", "1"])
     return None
 
 # ─────────────────────────────────────────────────────────────
@@ -919,7 +899,7 @@ def render_frame_selection():
         st.markdown("<div style='height:8px'/>", unsafe_allow_html=True)
 
         # ── ONE AI Recommended Frame ─────────────────────────────────────
-        ai_ts = max(0.1, dur * 0.12)
+        ai_ts = 0.0  # First frame — always visible
         st.markdown("**✨ AI Recommended Frame** — Opening Hook")
         ai_bytes = extract_frame(path, ai_ts)
         if ai_bytes:
@@ -1010,10 +990,10 @@ def render_review():
     </div>
     """, unsafe_allow_html=True)
 
-    col_img, col_info = st.columns([1, 1.5])
+    col_img, col_info = st.columns([1, 2])
 
     with col_img:
-        st.image(st.session_state.swapped_url, caption="✨ AI Faceswap", width=260)
+        st.image(st.session_state.swapped_url, caption="✨ AI Faceswap", width=200)
 
     with col_info:
         st.markdown("""
