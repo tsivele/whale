@@ -8,7 +8,7 @@ Step 4 · Final Video — Kling v3.0-pro motion-control video
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 import streamlit as st
-import requests, json, time, os, tempfile, base64, math, re
+import requests, json, time, os, tempfile, base64, math, re, subprocess
 import cv2, numpy as np
 from datetime import datetime
 
@@ -451,14 +451,18 @@ def download_video(url: str) -> str:
     # Layer 3: Cobalt API (free, bypasses TikTok/IG)
     try:
         cr = requests.post("https://api.cobalt.tools/",
-            json={"url": url, "filenameStyle": "basic", "videoQuality": "720"},
-            headers={"Accept": "application/json", "Content-Type": "application/json"},
-            timeout=20)
-        cd = cr.json()
-        cobalt_url = cd.get("url") or ((cd.get("picker") or [{}])[0].get("url") if cd.get("picker") else None)
-        if cobalt_url and _try_save(cobalt_url, out):
-            return out
-        errors.append(f"cobalt:{cd.get('status','?')}")
+            json={"url": url, "videoQuality": "720", "filenameStyle": "basic"},
+            headers={"Accept": "application/json", "Content-Type": "application/json",
+                     "User-Agent": "Mozilla/5.0"},
+            timeout=25)
+        if cr.status_code == 200:
+            cd = cr.json()
+            cobalt_url = cd.get("url")
+            if not cobalt_url and isinstance(cd.get("picker"), list):
+                cobalt_url = cd["picker"][0].get("url")
+            if cobalt_url and _try_save(cobalt_url, out):
+                return out
+        errors.append(f"cobalt:{cr.status_code}")
     except Exception as e:
         errors.append(f"cobalt:{e}")
 
@@ -468,18 +472,33 @@ def download_video(url: str) -> str:
         actor = "clockworks~tiktok-scraper" if is_tt else "apify~instagram-reel-scraper"
         inp   = ({"postURLs": [url], "resultsType": "posts", "resultsLimit": 1}
                  if is_tt else {"directUrls": [url], "resultsLimit": 1})
-        ar = requests.post(
-            f"https://api.apify.com/v2/acts/{actor}/run-sync-get-dataset-items",
-            params={"token": APIFY_KEY, "timeout": 60},
-            json=inp, timeout=90)
-        items = ar.json() if ar.ok else []
-        for item in (items if isinstance(items, list) else []):
-            vurl = (item.get("videoUrl") or item.get("video_url") or
-                    (item.get("video") or {}).get("downloadAddr") or
-                    item.get("webVideoUrl") or item.get("downloadUrl"))
-            if vurl and _try_save(vurl, out):
-                return out
-        errors.append(f"apify:{len(items) if isinstance(items,list) else 0} items")
+        # Run actor and wait for result
+        run_r = requests.post(
+            f"https://api.apify.com/v2/acts/{actor}/runs",
+            params={"token": APIFY_KEY},
+            json=inp, timeout=30)
+        run_id = (run_r.json().get("data") or {}).get("id") if run_r.ok else None
+        if run_id:
+            for _ in range(30):
+                time.sleep(3)
+                rs = requests.get(
+                    f"https://api.apify.com/v2/actor-runs/{run_id}",
+                    params={"token": APIFY_KEY}, timeout=15).json()
+                status = (rs.get("data") or {}).get("status", "")
+                if status == "SUCCEEDED": break
+                if status in ("FAILED","ABORTED","TIMED-OUT"): break
+            ds_id = (rs.get("data") or {}).get("defaultDatasetId")
+            if ds_id:
+                items = requests.get(
+                    f"https://api.apify.com/v2/datasets/{ds_id}/items",
+                    params={"token": APIFY_KEY}, timeout=15).json()
+                for item in (items if isinstance(items, list) else []):
+                    vurl = (item.get("videoUrl") or item.get("video_url") or
+                            (item.get("video") or {}).get("downloadAddr") or
+                            item.get("webVideoUrl") or item.get("downloadUrl"))
+                    if vurl and _try_save(vurl, out):
+                        return out
+        errors.append(f"apify:run={run_id}")
     except Exception as e:
         errors.append(f"apify:{e}")
 
