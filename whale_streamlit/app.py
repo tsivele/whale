@@ -232,6 +232,7 @@ DEFAULTS = {
     "total_reels":       0,
     "batch_queue":       [],
     "batch_idx":         0,
+    "batch_reels":       [],
     "creator_bytes":     None,
     "face_swap_prompt":  "Use Image A as the complete identity reference and Image B as the base/body reference. Replace the person in Image B entirely with the girl from Image A while preserving the exact pose, body position, clothing, framing, camera angle, lighting, background, and scene composition from Image B. The final image must look as if the girl from Image A was originally photographed in the scene of Image B. Match the facial identity from Image A with maximum accuracy, including: * exact face shape * skin tone and texture * hairstyle and hair color * hair length and hairline * eyes, eyebrows, nose, lips, and jawline * makeup style and facial details * expression consistency when possible Do not retain any facial or hair features from Image B. Only use Image B for the body, clothing, pose, environment, and composition. Ensure: * seamless and photorealistic blending * natural lighting adaptation * accurate perspective and head angle alignment * realistic shadows and skin integration * proportional anatomy * ultra-detailed facial realism * no distortions, warping, or uncanny features The output should appear completely natural and indistinguishable from a real photograph. Keep the first hair color and Face Visible and Larger breast no captions no text no font and Bigger breast.NO TATTOOS",
     "video_prompt":      "Animate the character from the reference image using the exact motion from the driving video. The character identity must remain exactly as shown in the reference image throughout every single frame — never drift toward or blend with any person from the driving video. Lip-sync is the top priority: replicate every mouth shape, jaw movement, and lip position frame-by-frame to match the original audio and speech timing with perfect accuracy. Transfer all body movements precisely: shoulder shifts, head tilts, arm gestures, hand positions, and torso motion must mirror the driving video exactly. If the person in the driving video is holding any object — a phone, microphone, drink, prop, or anything else — the character must also be holding that same object in the same hand position throughout. Maintain consistent character appearance, clothing, and all visible features in every frame.",
@@ -834,8 +835,8 @@ def render_discovery():
 
                 # Download button (native Streamlit)
                 btn_key = f"dl_{reel['id']}_{ci}_{row_start}"
-                if st.button("⬇️ Download & Start Pipeline", key=btn_key, use_container_width=True):
-                    _start_pipeline(reel)
+                if st.button("➕ Add to Batch", key=f"dl_{reel['id']}_{ci}_{row_start}", use_container_width=True):
+                    _add_to_batch(reel)
 
 def _process_batch_url(url: str):
     """Download a raw URL and advance to Step 2 (used for batch paste)."""
@@ -850,6 +851,64 @@ def _process_batch_url(url: str):
         "url": url,
     }
     _start_pipeline(fake_reel)
+
+def _make_batch_reel(reel: dict, url: str = "") -> dict:
+    return {
+        "idx": len(st.session_state.batch_reels),
+        "url": url or reel.get("url","") or reel.get("video_url",""),
+        "reel": reel, "video_path": None, "duration": 60.0,
+        "frame_b64": None, "frame_time": 0.0, "custom_prompt": "",
+        "swapped_url": None, "final_url": None, "status": "queued", "error": None,
+        "thumbnail": reel.get("thumbnail",""), "author": reel.get("author","Unknown"),
+        "approved": False,
+    }
+
+def _add_to_batch(reel: dict):
+    br = _make_batch_reel(reel)
+    if br["url"] not in {r["url"] for r in st.session_state.batch_reels}:
+        st.session_state.batch_reels.append(br)
+    st.rerun()
+
+def _render_batch_input():
+    n = len(st.session_state.batch_reels)
+    lbl = f"U0001f4cb Batch Queue ({n} reel{'s' if n!=1 else ''})" if n > 0 else "U0001f4cb Batch Queue"
+    with st.expander(lbl, expanded=(n > 0)):
+        col_a, col_b = st.columns([3, 1])
+        with col_a:
+            pasted = st.text_area("Paste URLs (one per line)",
+                placeholder="https://www.instagram.com/reel/...\nhttps://www.tiktok.com/...",
+                height=80, label_visibility="collapsed", key="batch_url_paste")
+        with col_b:
+            if st.button("\u2795 Add URLs", use_container_width=True):
+                urls = [u.strip() for u in pasted.splitlines() if u.strip().startswith("http")]
+                existing = {r["url"] for r in st.session_state.batch_reels}
+                for u in urls:
+                    if u not in existing:
+                        fake = {"url": u, "video_url": u, "author": u[:30],
+                                "title": u[:60], "id": u[-12:], "code": "",
+                                "thumbnail": "", "platform": "TikTok" if "tiktok" in u else "Instagram",
+                                "views": 0, "likes": 0, "comments": 0, "engagement": 0}
+                        st.session_state.batch_reels.append(_make_batch_reel(fake, u))
+                if urls: st.rerun()
+        if n > 0:
+            st.markdown(f"**{n} reel{'s' if n!=1 else ''} queued:**")
+            for i, br in enumerate(st.session_state.batch_reels):
+                c1, c2 = st.columns([5, 1])
+                with c1:
+                    icons = {"queued":"\u23f3","downloading":"\u2b07\ufe0f","ready":"\u2705",
+                             "faceswapping":"\U0001f3ad","reviewing":"\U0001f441\ufe0f",
+                             "done":"\U0001f389","error":"\u274c"}
+                    st.markdown(f"{icons.get(br['status'],'\u23f3')} `{br['author']}` \u2014 {br['url'][:50]}")
+                with c2:
+                    if st.button("\u2715", key=f"rm_{i}", use_container_width=True):
+                        st.session_state.batch_reels.pop(i); st.rerun()
+            c1, c2 = st.columns([3, 1])
+            with c1:
+                if st.button("\U0001f680 Process All Reels", type="primary", use_container_width=True):
+                    st.session_state.step = 2; st.rerun()
+            with c2:
+                if st.button("\U0001f5d1\ufe0f Clear", use_container_width=True):
+                    st.session_state.batch_reels = []; st.rerun()
 
 def _start_pipeline(reel: dict):
     """Download reel video and advance to Step 2"""
@@ -890,129 +949,154 @@ def _start_pipeline(reel: dict):
 # STEP 2 — FRAME SELECTION
 # ─────────────────────────────────────────────────────────────
 def render_frame_selection():
-    reel = st.session_state.selected_reel
-    path = st.session_state.video_path
-    dur  = st.session_state.video_duration
-
-    # Load reference silently — no UI
     _ref = "/tmp/whale_ref_face.jpg"
     if not st.session_state.creator_bytes and os.path.exists(_ref):
-        with open(_ref, "rb") as _f:
-            st.session_state.creator_bytes = _f.read()
-
-    if not path or not os.path.exists(path):
-        st.error("❌ Video not found.")
-        if st.button("← Back to Discovery"):
-            st.session_state.step = 1; st.rerun()
-        return
-    try:
-        if os.path.getsize(path) < 10_000:
-            st.error("⚠️ Video too small — download failed.")
-            if st.button("← Back to Discovery"):
-                st.session_state.step = 1; st.rerun()
-            return
-    except Exception:
-        pass
-
-    # Upload reference if not yet saved (first time only, no image shown)
+        with open(_ref,"rb") as _f: st.session_state.creator_bytes = _f.read()
     if not st.session_state.creator_bytes:
-        st.markdown("**👤 Reference Photo** — Upload once, saved automatically")
+        st.markdown("**\U0001f464 Reference Photo** \u2014 Upload once, saved for all reels")
         _up = st.file_uploader("Upload face", type=["jpg","jpeg","png"],
                                label_visibility="collapsed", key="face_upload")
         if _up:
-            _d = _up.read()
-            st.session_state.creator_bytes = _d
-            with open(_ref, "wb") as _f: _f.write(_d)
+            _d = _up.read(); st.session_state.creator_bytes = _d
+            with open(_ref,"wb") as _f: _f.write(_d)
             st.rerun()
         st.stop()
 
-    # ── AI Recommended Frame — First Frame ───────────────────────────────────────────────────────────────
-    st.markdown("**✨ AI Recommended Frame — First Frame**")
-    ai_bytes = extract_frame(path, 0.0)
+    batch = st.session_state.batch_reels
+    if not batch:
+        st.warning("No reels in batch. Add reels in Step 1.")
+        if st.button("\u2190 Back"): st.session_state.step=1; st.rerun()
+        return
 
-    if ai_bytes:
-        c1, c2 = st.columns([1, 2])
-        with c1:
-            st.image(ai_bytes, width=200)
-        with c2:
-            st.markdown(
-                '<div style="color:#c4b5fd;font-weight:600;font-size:13px;padding-top:8px">'
-                'First frame — clean, no motion blur</div>'
-                '<div style="color:#71717a;font-size:11px;margin-top:4px">'
-                'Ideal for face swap</div>',
-                unsafe_allow_html=True)
-            if st.button("⭐ Use this frame", key="use_ai", use_container_width=True):
-                st.session_state.frame_b64 = to_b64(ai_bytes)
-                st.session_state.frame_time = 0.0
-                st.rerun()
-    else:
-        _fe = st.session_state.get("_frame_err", "")
-        st.warning(f"⚠️ Cannot extract frame: {_fe[:120]}")
+    needs_dl = [br for br in batch if br["status"]=="queued"]
+    if needs_dl:
+        prog = st.progress(0); ph = st.empty()
+        total = len(batch)
+        done_n = sum(1 for b in batch if b["status"] not in ("queued","downloading"))
+        for br in needs_dl:
+            br["status"] = "downloading"
+            ph.info(f"\u2b07\ufe0f Downloading {done_n+1}/{total}: {br['author']}")
+            try:
+                p = download_video(br["url"])
+                dur,_,_ = get_video_info(p)
+                br["video_path"]=p; br["duration"]=dur; br["status"]="ready"
+            except Exception as e:
+                br["status"]="error"; br["error"]=str(e)[:120]
+            done_n+=1; prog.progress(done_n/total)
+        prog.empty(); ph.empty(); st.rerun()
 
-    # ── Custom Frame accordion ───────────────────────────────────────────────────────────────────────────────────────
-    st.markdown("<div style='height:4px'/>", unsafe_allow_html=True)
-    with st.expander("🎛️ Choose a different frame", expanded=False):
-        _cft = st.slider("", min_value=0.0, max_value=max(0.1, dur - 0.1),
-            value=float(st.session_state.frame_time), step=0.5, format="%.1f s",
-            label_visibility="collapsed")
-        if abs(_cft - st.session_state.frame_time) > 0.09:
-            st.session_state.frame_time = _cft
-            st.rerun()
-        _cfb = extract_frame(path, st.session_state.frame_time)
-        if _cfb:
-            st.image(_cfb, width=180, caption=f"@ {st.session_state.frame_time:.1f}s")
-            st.session_state.frame_b64 = to_b64(_cfb)
-            if st.button("✅ Use this frame", key="use_custom", use_container_width=True):
-                st.rerun()
-        else:
-            st.warning("⚠️ No frame here")
-            if st.button("↩️ Try first frame"):
-                st.session_state.frame_time = 0.0; st.rerun()
+    st.markdown(f"**\U0001f39e Select Frames \u2014 {len(batch)} reel(s)**")
+    all_framed = all(br.get("frame_b64") for br in batch if br["status"]!="error")
 
-    st.markdown("<div style='height:12px'/>", unsafe_allow_html=True)
+    for br in batch:
+        idx = br["idx"]
+        with st.container():
+            st.markdown(f"**#{idx+1} \u00b7 {br['author']}**")
+            if br["status"]=="error":
+                st.error(f"\u274c {br['error']}"); st.markdown("---"); continue
+            path = br.get("video_path")
+            if not path or not os.path.exists(str(path)):
+                st.warning("Video not ready"); st.markdown("---"); continue
+            ai = extract_frame(path, 0.0)
+            c1,c2 = st.columns([1,3])
+            with c1:
+                if ai: st.image(ai, width=130, caption="First frame")
+                else:  st.caption("\u26a0\ufe0f No frame")
+            with c2:
+                if ai and not br.get("frame_b64"):
+                    br["frame_b64"]=to_b64(ai); br["frame_time"]=0.0
+                if br.get("frame_b64"):
+                    st.markdown('<div style="color:#34d399;font-size:12px;font-weight:600">\u2705 Frame selected</div>', unsafe_allow_html=True)
+                with st.expander("\U0001f3fb Choose different frame", expanded=False):
+                    dur = br.get("duration",60.0)
+                    ft = st.slider("", 0.0, max(0.1,dur-0.1), float(br.get("frame_time",0.0)),
+                                   0.5, format="%.1f s", label_visibility="collapsed", key=f"sl_{idx}")
+                    if abs(ft-br.get("frame_time",0.0))>0.09:
+                        br["frame_time"]=ft; st.rerun()
+                    cfb = extract_frame(path, ft)
+                    if cfb:
+                        st.image(cfb, width=120, caption=f"@ {ft:.1f}s")
+                        if st.button("\u2705 Use", key=f"ucf_{idx}", use_container_width=True):
+                            br["frame_b64"]=to_b64(cfb); br["frame_time"]=ft; st.rerun()
+            st.markdown("---")
 
-    # ── Actions ───────────────────────────────────────────────────────────────────────────────────────────────────────────────
-    can_gen = bool(st.session_state.frame_b64 and st.session_state.creator_bytes)
-    if st.button("✨ Generate Faceswap →", type="primary",
-                 use_container_width=True, disabled=not can_gen):
-        st.session_state.step = 3; st.rerun()
-    if not can_gen:
-        st.caption("⚠️ Select a frame first")
+    if st.button("\u2728 Generate All Faceswaps \u2192", type="primary",
+                 use_container_width=True, disabled=not all_framed):
+        st.session_state.step=3; st.rerun()
+    if not all_framed: st.caption("\u26a0\ufe0f All reels need a frame selected")
     st.markdown("<div style='height:6px'/>", unsafe_allow_html=True)
-    if st.button("← Back to Discovery", use_container_width=True):
-        st.session_state.step = 1; st.rerun()
+    if st.button("\u2190 Back to Discovery", use_container_width=True):
+        st.session_state.step=1; st.rerun()
 
 def render_review():
-    if not st.session_state.swapped_url:
-        _generate_image()
+    batch = st.session_state.batch_reels
+    needs_swap = [br for br in batch
+                  if br.get("frame_b64") and not br.get("swapped_url")
+                  and br["status"] not in ("error","faceswapping","done")]
+    if needs_swap:
+        prog = st.progress(0); ph = st.empty()
+        total_app = len([b for b in batch if b.get("frame_b64")])
+        done_n = sum(1 for b in batch if b.get("swapped_url"))
+        for br in needs_swap:
+            br["status"]="faceswapping"
+            ph.info(f"\U0001f3ad Faceswapping {done_n+1}/{total_app}: {br['author']}")
+            try:
+                base_p = st.session_state.face_swap_prompt
+                extra  = br.get("custom_prompt","").strip()
+                full_p = (base_p+" "+extra).strip() if extra else base_p
+                pid = ws_submit(QWEN_MODEL, {
+                    "images": [to_b64(st.session_state.creator_bytes), br["frame_b64"]],
+                    "prompt": full_p, "seed": -1})
+                res = ws_poll(pid, timeout=240)
+                br["swapped_url"]=res; br["status"]="reviewing"
+            except Exception as e:
+                br["status"]="error"; br["error"]=str(e)[:120]
+            done_n+=1; prog.progress(done_n/total_app)
+        prog.empty(); ph.empty(); st.rerun()
 
-    if not st.session_state.swapped_url:
-        return  # generation failed / still running
+    st.markdown(f"**\U0001f5bc\ufe0f Review Faceswaps \u2014 {len(batch)} reel(s)**")
+    for br in batch:
+        idx = br["idx"]
+        st.markdown(f"**#{idx+1} \u00b7 {br['author']}**")
+        if br["status"]=="error":
+            st.error(f"\u274c {br['error']}"); st.markdown("---"); continue
+        if not br.get("swapped_url"):
+            st.info("\u23f3 Generating faceswap..."); st.markdown("---"); continue
+        c1,c2 = st.columns([1,1.6])
+        with c1:
+            st.image(br["swapped_url"], width=200, caption="\u2728 Faceswap")
+        with c2:
+            _cp = st.text_input("\u270f\ufe0f Custom addition (optional)",
+                value=br.get("custom_prompt",""),
+                placeholder="e.g. make hair blonde\u2026",
+                key=f"cp_{idx}")
+            br["custom_prompt"]=_cp
+            ca,cb = st.columns(2)
+            with ca:
+                if st.button("\U0001f504 Regen", key=f"rg_{idx}", use_container_width=True):
+                    br["swapped_url"]=None; br["status"]="ready"; st.rerun()
+            with cb:
+                approved = br.get("approved",False)
+                if st.button("\u2705 Approved" if approved else "\u2610 Approve",
+                             key=f"ap_{idx}", use_container_width=True,
+                             type="secondary" if approved else "primary"):
+                    br["approved"]=not approved; st.rerun()
+        st.markdown("---")
 
-    col_img, col_ctrl = st.columns([1, 1.4])
-
-    with col_img:
-        st.image(st.session_state.swapped_url, caption="✨ AI Faceswap", width=220)
-
-    with col_ctrl:
-        st.markdown('<div style="font-size:16px;font-weight:700;color:#f4f4f5;margin-bottom:14px">🖼️ Review Result</div>', unsafe_allow_html=True)
-
-        _custom = st.text_input(
-            "✏️ Add custom instruction (optional)",
-            placeholder="e.g. make hair blonde, add smile…",
-            key="custom_prompt_add",
-        )
-        st.session_state["_custom_prompt_add"] = _custom.strip()
-
-        st.markdown("<div style='height:12px'/>", unsafe_allow_html=True)
-        if st.button("✅ Approve — Generate Video →", type="primary", use_container_width=True):
-            st.session_state.step = 4; st.rerun()
-        st.markdown("<div style='height:6px'/>", unsafe_allow_html=True)
-        if st.button("🔄 Regenerate Image", use_container_width=True):
-            st.session_state.swapped_url = None; st.rerun()
-        if st.button("← Back to Frames", use_container_width=True):
-            st.session_state.swapped_url = None; st.session_state.step = 2; st.rerun()
-
+    c1,c2 = st.columns(2)
+    with c1:
+        if st.button("\u2705 Approve All", use_container_width=True):
+            for br in batch:
+                if br.get("swapped_url"): br["approved"]=True
+            st.rerun()
+    with c2:
+        any_ok = any(br.get("approved") for br in batch)
+        if st.button("\U0001f3ac Generate Videos \u2192", type="primary",
+                     use_container_width=True, disabled=not any_ok):
+            st.session_state.step=4; st.rerun()
+    st.markdown("<div style='height:6px'/>", unsafe_allow_html=True)
+    if st.button("\u2190 Back to Frames", use_container_width=True):
+        st.session_state.step=2; st.rerun()
 
 def _generate_image():
     st.info("🎨 Generating image with AI face swap…")
@@ -1047,112 +1131,55 @@ def _generate_image():
 # STEP 4 — FINAL VIDEO
 # ─────────────────────────────────────────────────────────────
 def render_final():
-    if not st.session_state.final_video_url:
-        _generate_video()
+    batch = st.session_state.batch_reels
+    to_gen = [br for br in batch
+              if br.get("approved") and not br.get("final_url")
+              and br["status"] not in ("error",)]
+    if to_gen:
+        prog=st.progress(0); ph=st.empty()
+        total_g=len(to_gen); done_n=0
+        for br in to_gen:
+            ph.info(f"\U0001f3ac Generating {done_n+1}/{total_g}: {br['author']}")
+            try:
+                with open(br["video_path"],"rb") as vf:
+                    vb64 = to_b64(vf.read(),"video/mp4")
+                pid = ws_submit(KLING_MODEL, {
+                    "image": br["swapped_url"], "video": vb64,
+                    "character_orientation": "video",
+                    "prompt": st.session_state.video_prompt})
+                res = ws_poll(pid, timeout=360)
+                br["final_url"]=res; br["status"]="done"
+                st.session_state.pipeline_runs+=1
+            except Exception as e:
+                br["status"]="error"; br["error"]=str(e)[:120]
+            done_n+=1; prog.progress(done_n/total_g)
+        prog.empty(); ph.empty(); st.rerun()
 
-    if not st.session_state.final_video_url:
-        return
-
-    # Increment pipeline runs counter
-    if not st.session_state.get("_counted_run"):
-        st.session_state.pipeline_runs += 1
-        st.session_state["_counted_run"] = True
-
-    st.markdown("""
-    <div style="margin-bottom:20px">
-      <div style="font-size:18px;font-weight:700;color:#34d399">✅ Your Video is Ready!</div>
-      <div style="font-size:12px;color:#52525b;margin-top:4px">
-        Kling v3.0 motion-control pipeline completed
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    col_vid, col_info = st.columns([1, 1.2])
-
-    with col_vid:
-        st.video(st.session_state.final_video_url)
-
-    with col_info:
-        reel = st.session_state.selected_reel or {}
-        st.markdown("""<div class="whale-card" style="padding:20px">
-          <div style="font-size:13px;font-weight:700;color:#34d399;margin-bottom:14px">✅ Pipeline Complete</div>
-        """, unsafe_allow_html=True)
-
-        summary = [
-            ("Source Reel",    reel.get("author", "—")),
-            ("Frame Used",     f"{st.session_state.frame_time:.1f}s"),
-            ("Image Model",    "QWEN-Image-2.0-Pro"),
-            ("Video Model",    "Kling v3.0-Pro Motion"),
-            ("Pipeline Runs",  str(st.session_state.pipeline_runs)),
-        ]
-        for k, v in summary:
-            st.markdown(f"""
-            <div style="display:flex;justify-content:space-between;padding:6px 0;
-                        border-bottom:1px solid #1e1e1e;font-size:12px">
-              <span style="color:#71717a">{k}</span>
-              <span style="color:#34d399;font-weight:600">{v}</span>
-            </div>
-            """, unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        st.markdown("<div style='height:16px'/>", unsafe_allow_html=True)
-
-        # Download button
-        try:
-            vid_bytes = requests.get(st.session_state.final_video_url, timeout=30).content
-            st.download_button(
-                "⬇️ Download Final Video",
-                data=vid_bytes,
-                file_name="twhales_final.mp4",
-                mime="video/mp4",
-                use_container_width=True,
-                type="primary",
-            )
-        except Exception:
-            st.link_button("⬇️ Open Video", st.session_state.final_video_url)
-
-        if st.button("🔄 Start New Pipeline", use_container_width=True):
-            # Reset pipeline state but keep reels
-            for k in ["selected_reel","video_path","video_duration","frame_time",
-                      "frame_b64","swapped_url","final_video_url","_counted_run"]:
-                st.session_state[k] = DEFAULTS.get(k)
-            st.session_state.step = 1
-            st.rerun()
-
-def _generate_video():
-    st.info("🎬 Generating video with Kling v3.0-pro motion-control…")
-    ph = st.empty()
-    try:
-        path        = st.session_state.video_path
-        swapped_url = st.session_state.swapped_url
-
-        if not path or not swapped_url:
-            st.error("Missing video or image. Please go back.")
-            return
-
-        with open(path, "rb") as f:
-            video_b64 = to_b64(f.read(), mime="video/mp4")
-
-        pred_id = ws_submit(
-            "kwaivgi/kling-v3.0-pro/motion-control",
-            {
-                "image":                swapped_url,
-                "video":                video_b64,
-                "character_orientation": "video",
-                "prompt":               st.session_state.video_prompt,
-            },
-        )
-        result = ws_poll(pred_id, status_ph=ph, timeout=360)
-        ph.empty()
-        if result:
-            st.session_state.final_video_url = result
-            st.session_state["_counted_run"] = False
-            st.rerun()
-        else:
-            st.error("Video generation returned empty result.")
-    except Exception as e:
-        ph.empty()
-        st.error(f"Video generation failed: {e}")
+    st.markdown("**\U0001f389 Final Videos**")
+    done_reels = [br for br in batch if br.get("final_url")]
+    for br in done_reels:
+        st.markdown(f"**#{br['idx']+1} \u00b7 {br['author']}**")
+        c1,c2=st.columns([2,1])
+        with c1: st.video(br["final_url"])
+        with c2:
+            try:
+                import requests as _rq
+                _vb=_rq.get(br["final_url"],timeout=30).content
+                st.download_button("\u2b07\ufe0f Download MP4", data=_vb,
+                    file_name=f"twhales_{br['idx']+1}.mp4", mime="video/mp4",
+                    use_container_width=True, key=f"dl_{br['idx']}")
+            except Exception:
+                st.markdown(f"[\u2b07\ufe0f Download]({br['final_url']})")
+        st.markdown("---")
+    for br in batch:
+        if br["status"]=="error" and br.get("approved"):
+            st.error(f"\u274c #{br['idx']+1}: {br['error']}")
+    if done_reels:
+        if st.button("\U0001f504 Start New Batch", type="primary", use_container_width=True):
+            st.session_state.batch_reels=[]; st.session_state.step=1; st.rerun()
+    else:
+        if st.button("\u2190 Back to Review", use_container_width=True):
+            st.session_state.step=3; st.rerun()
 
 # ─────────────────────────────────────────────────────────────
 # MAIN
