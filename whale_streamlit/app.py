@@ -702,34 +702,8 @@ def render_stats():
 # STEP 1 — DISCOVERY FEED
 # ─────────────────────────────────────────────────────────────
 def render_discovery():
-    # ── URL Batch Input ────────────────────────────────────────────
-    with st.expander("🔗 Paste URLs directly (batch download)", expanded=False):
-        url_text = st.text_area(
-            "URLs",
-            placeholder="Paste one TikTok or Instagram URL per line:\nhttps://www.tiktok.com/@creator/video/...\nhttps://www.instagram.com/reel/...",
-            height=120,
-            label_visibility="collapsed",
-            key="batch_url_input",
-        )
-        if st.button("⬇️ Download & Start Pipeline", type="primary", key="batch_go"):
-            urls = [u.strip() for u in url_text.splitlines() if u.strip().startswith("http")]
-            if not urls:
-                st.warning("⚠️ Paste at least one URL above.")
-            else:
-                st.session_state.batch_queue = urls
-                st.session_state.batch_idx   = 0
-                _process_batch_url(urls[0])
-
-    # Process next in batch if queued
-    if st.session_state.get("batch_queue") and st.session_state.get("batch_idx", 0) > 0:
-        idx  = st.session_state.batch_idx
-        q2   = st.session_state.batch_queue
-        remaining = len(q2) - idx
-        if remaining > 0:
-            st.info(f"📋 Queue: {remaining} URL(s) remaining. Processing {q2[idx][:60]}…")
-            if st.button("▶️ Process Next URL", key="next_url"):
-                _process_batch_url(q2[idx])
-    st.markdown("---")
+    _render_batch_input()
+    st.markdown("<div style='height:4px'/>", unsafe_allow_html=True)
     # Search controls
     sc1, sc2, sc3, sc4 = st.columns([3, 1.5, 1.5, 1])
     with sc1:
@@ -871,44 +845,52 @@ def _add_to_batch(reel: dict):
 
 def _render_batch_input():
     n = len(st.session_state.batch_reels)
-    lbl = f"U0001f4cb Batch Queue ({n} reel{'s' if n!=1 else ''})" if n > 0 else "U0001f4cb Batch Queue"
-    with st.expander(lbl, expanded=(n > 0)):
-        col_a, col_b = st.columns([3, 1])
-        with col_a:
-            pasted = st.text_area("Paste URLs (one per line)",
-                placeholder="https://www.instagram.com/reel/...\nhttps://www.tiktok.com/...",
-                height=80, label_visibility="collapsed", key="batch_url_paste")
-        with col_b:
-            if st.button("\u2795 Add URLs", use_container_width=True):
+    lbl = f"\U0001f4cb Batch Queue ({n} reel{'s' if n!=1 else ''})" if n > 0 else "\U0001f4cb Paste URLs"
+    with st.expander(lbl, expanded=True):
+        pasted = st.text_area("URLs", height=90, label_visibility="collapsed", key="batch_url_paste",
+            placeholder="Paste Instagram or TikTok URLs, one per line")
+        c1, c2, c3 = st.columns([2, 1, 1])
+        with c1:
+            if st.button("\U0001f680 Add & Process All", type="primary", use_container_width=True):
                 urls = [u.strip() for u in pasted.splitlines() if u.strip().startswith("http")]
                 existing = {r["url"] for r in st.session_state.batch_reels}
                 for u in urls:
                     if u not in existing:
-                        fake = {"url": u, "video_url": u, "author": u[:30],
-                                "title": u[:60], "id": u[-12:], "code": "",
-                                "thumbnail": "", "platform": "TikTok" if "tiktok" in u else "Instagram",
-                                "views": 0, "likes": 0, "comments": 0, "engagement": 0}
+                        fake = {"url":u,"video_url":u,"author":u[:40],"title":u[:60],"id":u[-12:],
+                                "code":"","thumbnail":"","views":0,"likes":0,"comments":0,"engagement":0,
+                                "platform":"TikTok" if "tiktok" in u.lower() else "Instagram"}
+                        st.session_state.batch_reels.append(_make_batch_reel(fake, u))
+                if not st.session_state.batch_reels:
+                    st.warning("\u26a0 Paste at least one URL first.")
+                else:
+                    st.session_state.step = 2; st.rerun()
+        with c2:
+            if st.button("\u2795 Add only", use_container_width=True):
+                urls = [u.strip() for u in pasted.splitlines() if u.strip().startswith("http")]
+                existing = {r["url"] for r in st.session_state.batch_reels}
+                for u in urls:
+                    if u not in existing:
+                        fake = {"url":u,"video_url":u,"author":u[:40],"title":u[:60],"id":u[-12:],
+                                "code":"","thumbnail":"","views":0,"likes":0,"comments":0,"engagement":0,
+                                "platform":"TikTok" if "tiktok" in u.lower() else "Instagram"}
                         st.session_state.batch_reels.append(_make_batch_reel(fake, u))
                 if urls: st.rerun()
+        with c3:
+            if n > 0 and st.button("\U0001f5d1\ufe0f Clear", use_container_width=True):
+                st.session_state.batch_reels = []; st.rerun()
         if n > 0:
             st.markdown(f"**{n} reel{'s' if n!=1 else ''} queued:**")
             for i, br in enumerate(st.session_state.batch_reels):
-                c1, c2 = st.columns([5, 1])
-                with c1:
-                    icons = {"queued":"\u23f3","downloading":"\u2b07\ufe0f","ready":"\u2705",
-                             "faceswapping":"\U0001f3ad","reviewing":"\U0001f441\ufe0f",
-                             "done":"\U0001f389","error":"\u274c"}
-                    st.markdown(f"{icons.get(br['status'],'\u23f3')} `{br['author']}` \u2014 {br['url'][:50]}")
+                icons={"queued":"\u23f3","downloading":"\u2b07\ufe0f","ready":"\u2705",
+                       "faceswapping":"\U0001f3ad","reviewing":"\U0001f441\ufe0f","done":"\U0001f389","error":"\u274c"}
+                c1,c2=st.columns([5,1])
+                with c1: st.markdown(f"{icons.get(br['status'],'\u23f3')} `{br['author']}` \u2014 {br['url'][:60]}")
                 with c2:
-                    if st.button("\u2715", key=f"rm_{i}", use_container_width=True):
+                    if st.button("\u2715",key=f"rm_{i}",use_container_width=True):
                         st.session_state.batch_reels.pop(i); st.rerun()
-            c1, c2 = st.columns([3, 1])
-            with c1:
-                if st.button("\U0001f680 Process All Reels", type="primary", use_container_width=True):
-                    st.session_state.step = 2; st.rerun()
-            with c2:
-                if st.button("\U0001f5d1\ufe0f Clear", use_container_width=True):
-                    st.session_state.batch_reels = []; st.rerun()
+            if st.button("\U0001f680 Process All Now", type="primary", use_container_width=True):
+                st.session_state.step=2; st.rerun()
+
 
 def _start_pipeline(reel: dict):
     """Download reel video and advance to Step 2"""
