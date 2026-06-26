@@ -894,129 +894,94 @@ def render_frame_selection():
     path = st.session_state.video_path
     dur  = st.session_state.video_duration
 
+    # Load reference silently — no UI
+    _ref = "/tmp/whale_ref_face.jpg"
+    if not st.session_state.creator_bytes and os.path.exists(_ref):
+        with open(_ref, "rb") as _f:
+            st.session_state.creator_bytes = _f.read()
+
     if not path or not os.path.exists(path):
-        st.error("❌ Video not found — please go back and try again.")
+        st.error("❌ Video not found.")
         if st.button("← Back to Discovery"):
             st.session_state.step = 1; st.rerun()
         return
     try:
-        fsize = os.path.getsize(path)
-        if fsize < 10_000:
-            st.error(f"⚠️ Video file too small ({fsize} bytes) — download failed. Try another URL.")
+        if os.path.getsize(path) < 10_000:
+            st.error("⚠️ Video too small — download failed.")
             if st.button("← Back to Discovery"):
                 st.session_state.step = 1; st.rerun()
             return
     except Exception:
         pass
 
-    st.markdown(f"""
-    <div style="margin-bottom:20px">
-      <div style="font-size:18px;font-weight:700;color:#f4f4f5">🎞️ Select Your Frame</div>
-      <div style="font-size:12px;color:#52525b;margin-top:4px">
-        Source: <span style="color:#c4b5fd">{reel['author'] if reel else '?'}</span> ·
-        Duration: {dur:.1f}s · Choose the perfect moment for your content
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
+    # Upload reference if not yet saved (first time only, no image shown)
+    if not st.session_state.creator_bytes:
+        st.markdown("**👤 Reference Photo** — Upload once, saved automatically")
+        _up = st.file_uploader("Upload face", type=["jpg","jpeg","png"],
+                               label_visibility="collapsed", key="face_upload")
+        if _up:
+            _d = _up.read()
+            st.session_state.creator_bytes = _d
+            with open(_ref, "wb") as _f: _f.write(_d)
+            st.rerun()
+        st.stop()
 
-    col_left, col_right = st.columns([2, 1])
+    # ── AI Recommended Frame — First Frame ───────────────────────────────────────────────────────────────
+    st.markdown("**✨ AI Recommended Frame — First Frame**")
+    ai_bytes = extract_frame(path, 0.0)
 
-    with col_left:
-        # Video preview
-        st.video(path)
-
-        st.markdown("<div style='height:8px'/>", unsafe_allow_html=True)
-
-        # ── ONE AI Recommended Frame ─────────────────────────────────────
-        ai_ts = 0.0  # First frame — always visible
-        st.markdown("**✨ AI Recommended Frame** — First Frame")
-        ai_bytes = extract_frame(path, ai_ts)
-        thumb_url = (reel or {}).get("thumbnail") or (reel or {}).get("thumbnail_url") or ""
-        if ai_bytes:
-            ca1, ca2 = st.columns([1, 2])
-            with ca1:
-                st.image(ai_bytes, caption="Frame 0s", use_container_width=True)
-            with ca2:
-                st.markdown('<div style="padding:8px 0"><div style="color:#c4b5fd;font-weight:600;font-size:12px">First frame</div><div style="color:#71717a;font-size:11px;margin-top:4px">Clean, no motion blur — ideal for face swap</div></div>', unsafe_allow_html=True)
-                if st.button("⭐ Use this frame", key="use_ai", use_container_width=True):
-                    st.session_state.frame_time = ai_ts
-                    st.session_state.frame_b64 = to_b64(ai_bytes)
-                    st.rerun()
-        elif thumb_url:
-            ca1, ca2 = st.columns([1, 2])
-            with ca1:
-                st.image(thumb_url, caption="Thumbnail", use_container_width=True)
-            with ca2:
-                st.markdown('<div style="padding:8px 0"><div style="color:#fbbf24;font-weight:600;font-size:12px">Using thumbnail</div><div style="color:#71717a;font-size:11px;margin-top:4px">Frame extraction unavailable</div></div>', unsafe_allow_html=True)
-                try:
-                    import requests as _rq
-                    tb = _rq.get(thumb_url, timeout=10).content
-                    if st.button("⭐ Use thumbnail", key="use_thumb", use_container_width=True):
-                        st.session_state.frame_b64 = to_b64(tb, "image/jpeg")
-                        st.rerun()
-                except Exception:
-                    pass
-        else:
-            ferr = st.session_state.get("_frame_err", "")
-            st.warning(f"⚠️ Cannot extract frame: {ferr[:120]}")
-
-        st.markdown("<div style='height:6px'/>", unsafe_allow_html=True)
-
-        with st.expander("🎛️ Choose a different frame", expanded=False):
-            _cft = st.slider("Scrub to select frame", min_value=0.0,
-                max_value=max(0.1, dur - 0.1),
-                value=float(st.session_state.frame_time), step=0.5, format="%.1f s")
-            if abs(_cft - st.session_state.frame_time) > 0.09:
-                st.session_state.frame_time = _cft
+    if ai_bytes:
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            st.image(ai_bytes, width=200)
+        with c2:
+            st.markdown(
+                '<div style="color:#c4b5fd;font-weight:600;font-size:13px;padding-top:8px">'
+                'First frame — clean, no motion blur</div>'
+                '<div style="color:#71717a;font-size:11px;margin-top:4px">'
+                'Ideal for face swap</div>',
+                unsafe_allow_html=True)
+            if st.button("⭐ Use this frame", key="use_ai", use_container_width=True):
+                st.session_state.frame_b64 = to_b64(ai_bytes)
+                st.session_state.frame_time = 0.0
                 st.rerun()
-            _cfb = extract_frame(path, st.session_state.frame_time)
-            if _cfb:
-                st.image(_cfb, caption=f"Frame @ {st.session_state.frame_time:.1f}s", width=180)
-                st.session_state.frame_b64 = to_b64(_cfb)
-                if st.button("✅ Use this frame", key="use_custom", use_container_width=True):
-                    st.rerun()
-            else:
-                _fe = st.session_state.get("_frame_err", "unknown")
-                st.warning(f"⚠️ No frame — {_fe[:80]}")
-                if st.button("↩️ Try first frame"):
-                    st.session_state.frame_time = 0.0; st.rerun()
-    with col_right:
-        # ── Reference Photo (persisted) ──────────────────────────────────
-        st.markdown("**👤 Reference Photo**")
-        # Load from disk if not in session
-        _ref = "/tmp/whale_ref_face.jpg"
-        if not st.session_state.creator_bytes and os.path.exists(_ref):
-            with open(_ref, "rb") as _f: st.session_state.creator_bytes = _f.read()
+    else:
+        _fe = st.session_state.get("_frame_err", "")
+        st.warning(f"⚠️ Cannot extract frame: {_fe[:120]}")
 
-        uploaded = st.file_uploader("Upload face photo", type=["jpg","jpeg","png"],
-                                    label_visibility="collapsed", key="face_upload")
-        if uploaded:
-            data = uploaded.read()
-            st.session_state.creator_bytes = data
-            with open(_ref, "wb") as _f: _f.write(data)
-
-        if st.session_state.creator_bytes:
-            st.markdown('<div style="color:#34d399;font-size:11px;font-weight:600;margin-bottom:8px">✓ Reference photo ready</div>', unsafe_allow_html=True)
-            if st.button("🔄 Change photo", use_container_width=True, key="change_ref"):
-                st.session_state.creator_bytes = None
-                if os.path.exists(_ref): os.unlink(_ref)
+    # ── Custom Frame accordion ───────────────────────────────────────────────────────────────────────────────────────
+    st.markdown("<div style='height:4px'/>", unsafe_allow_html=True)
+    with st.expander("🎛️ Choose a different frame", expanded=False):
+        _cft = st.slider("", min_value=0.0, max_value=max(0.1, dur - 0.1),
+            value=float(st.session_state.frame_time), step=0.5, format="%.1f s",
+            label_visibility="collapsed")
+        if abs(_cft - st.session_state.frame_time) > 0.09:
+            st.session_state.frame_time = _cft
+            st.rerun()
+        _cfb = extract_frame(path, st.session_state.frame_time)
+        if _cfb:
+            st.image(_cfb, width=180, caption=f"@ {st.session_state.frame_time:.1f}s")
+            st.session_state.frame_b64 = to_b64(_cfb)
+            if st.button("✅ Use this frame", key="use_custom", use_container_width=True):
                 st.rerun()
         else:
-            st.info("⬆️ Upload your reference photo once — it will be saved")
+            st.warning("⚠️ No frame here")
+            if st.button("↩️ Try first frame"):
+                st.session_state.frame_time = 0.0; st.rerun()
 
-        st.markdown("<div style='height:14px'/>", unsafe_allow_html=True)
-        can_gen = bool(st.session_state.frame_b64 and st.session_state.creator_bytes)
-        if st.button("✨ Generate Faceswap →", type="primary", use_container_width=True, disabled=not can_gen):
-            st.session_state.step = 3; st.rerun()
-        if not can_gen:
-            st.caption("⚠️ Select a frame + upload photo")
-        st.markdown("<div style='height:8px'/>", unsafe_allow_html=True)
-        if st.button("← Back to Discovery", use_container_width=True):
-            st.session_state.step = 1; st.rerun()
+    st.markdown("<div style='height:12px'/>", unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────────────────────
-# STEP 3 — REVIEW GENERATED IMAGE
-# ─────────────────────────────────────────────────────────────
+    # ── Actions ───────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    can_gen = bool(st.session_state.frame_b64 and st.session_state.creator_bytes)
+    if st.button("✨ Generate Faceswap →", type="primary",
+                 use_container_width=True, disabled=not can_gen):
+        st.session_state.step = 3; st.rerun()
+    if not can_gen:
+        st.caption("⚠️ Select a frame first")
+    st.markdown("<div style='height:6px'/>", unsafe_allow_html=True)
+    if st.button("← Back to Discovery", use_container_width=True):
+        st.session_state.step = 1; st.rerun()
+
 def render_review():
     if not st.session_state.swapped_url:
         _generate_image()
