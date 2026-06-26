@@ -1,6 +1,5 @@
 """
-T-WHALES 🐋 — Viral Discovery Pipeline
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Fix: Step 2 URL paste fallback when batch empty━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Step 1 · Discovery   — HikerAPI + Apify viral reel search
 Step 2 · Frames      — AI-recommended frames + custom scrubber
 Step 3 · Review      — WaveSpeed face-swap image generation
@@ -946,8 +945,26 @@ def render_frame_selection():
 
     batch = st.session_state.batch_reels
     if not batch:
-        st.warning("No reels in batch. Add reels in Step 1.")
-        if st.button("\u2190 Back"): st.session_state.step=1; st.rerun()
+        st.markdown("**\U0001f4cb Paste your URLs here to start**")
+        _urls_direct = st.text_area("URLs (one per line)",
+            placeholder="https://www.instagram.com/reel/...\nhttps://www.tiktok.com/...",
+            height=120, key="direct_url_input")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("\U0001f680 Start Pipeline", type="primary", use_container_width=True):
+                urls = [u.strip() for u in _urls_direct.splitlines() if u.strip().startswith("http")]
+                for u in urls:
+                    fake = {"url":u,"video_url":u,"author":u[:40],"title":u[:60],"id":u[-12:],
+                            "code":"","thumbnail":"","views":0,"likes":0,"comments":0,"engagement":0,
+                            "platform":"TikTok" if "tiktok" in u.lower() else "Instagram"}
+                    st.session_state.batch_reels.append(_make_batch_reel(fake, u))
+                if st.session_state.batch_reels:
+                    st.rerun()
+                else:
+                    st.warning("\u26a0\ufe0f Paste at least one valid URL")
+        with c2:
+            if st.button("\u2190 Back to Discovery", use_container_width=True):
+                st.session_state.step=1; st.rerun()
         return
 
     needs_dl = [br for br in batch if br["status"]=="queued"]
