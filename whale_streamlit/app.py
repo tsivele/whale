@@ -235,6 +235,7 @@ DEFAULTS = {
     "batch_queue":       [],
     "batch_idx":         0,
     "batch_reels":       [],
+    "ready_videos":       [],
     "creator_bytes":     None,
     "face_swap_prompt":  "Use Image A as the complete identity reference and Image B as the base/body reference. Replace the person in Image B entirely with the girl from Image A while preserving the exact pose, body position, clothing, framing, camera angle, lighting, background, and scene composition from Image B. The final image must look as if the girl from Image A was originally photographed in the scene of Image B. Match the facial identity from Image A with maximum accuracy, including: * exact face shape * skin tone and texture * hairstyle and hair color * hair length and hairline * eyes, eyebrows, nose, lips, and jawline * makeup style and facial details * expression consistency when possible Do not retain any facial or hair features from Image B. Only use Image B for the body, clothing, pose, environment, and composition. Ensure: * seamless and photorealistic blending * natural lighting adaptation * accurate perspective and head angle alignment * realistic shadows and skin integration * proportional anatomy * ultra-detailed facial realism * no distortions, warping, or uncanny features The output should appear completely natural and indistinguishable from a real photograph. Keep the first hair color and Face Visible and Larger breast no captions no text no font and Bigger breast.NO TATTOOS",
     "video_prompt":      "Animate the character from the reference image using the exact motion from the driving video. The character identity must remain exactly as shown in the reference image throughout every single frame — never drift toward or blend with any person from the driving video. Lip-sync is the top priority: replicate every mouth shape, jaw movement, and lip position frame-by-frame to match the original audio and speech timing with perfect accuracy. Transfer all body movements precisely: shoulder shifts, head tilts, arm gestures, hand positions, and torso motion must mirror the driving video exactly. If the person in the driving video is holding any object — a phone, microphone, drink, prop, or anything else — the character must also be holding that same object in the same hand position throughout. Maintain consistent character appearance, clothing, and all visible features in every frame.",
@@ -1132,24 +1133,6 @@ def _generate_image():
 # ─────────────────────────────────────────────────────────────
 # STEP 4 — FINAL VIDEO
 # ─────────────────────────────────────────────────────────────
-def _scrub_video(input_path: str, idx: int) -> str:
-    """Run FFmpeg scrub & clean on a video file. Returns output path or raises."""
-    output_path = f"/tmp/twhales_scrubbed_{idx}.mp4"
-    cmd = [
-        "ffmpeg", "-y", "-i", input_path,
-        "-vf", "noise=c0s=12:c0f=t",
-        "-map_metadata", "-1",
-        "-bitexact",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-        "-c:a", "copy",
-        output_path
-    ]
-    result = subprocess.run(cmd, capture_output=True, timeout=300)
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.decode(errors="ignore")[-600:])
-    return output_path
-
-
 def _scrub_video(input_path, idx):
     """FFmpeg Scrub & Clean: film grain + strip metadata + remove C2PA."""
     import shutil
@@ -1181,15 +1164,17 @@ def render_final():
         for br in to_gen:
             ph.info(f"\U0001f3ac Generating {done_n+1}/{total_g}: {br['author']}")
             try:
-                with open(br["video_path"],"rb") as vf:
-                    vb64 = to_b64(vf.read(),"video/mp4")
+                # Bug 1 fix: video = source URL (not base64). One request per reel.
                 pid = ws_submit(KLING_MODEL, {
-                    "image": br["swapped_url"], "video": vb64,
-                    "character_orientation": "video",
-                    "prompt": st.session_state.video_prompt})
+                    "image":  br.get("swapped_url", ""),
+                    "video":  br["url"],
+                    "prompt": st.session_state.video_prompt,
+                })
                 res = ws_poll(pid, timeout=360)
-                br["final_url"]=res; br["status"]="done"
-                st.session_state.pipeline_runs+=1
+                br["final_url"] = res; br["status"] = "done"
+                if res and res not in st.session_state.get("ready_videos", []):
+                    st.session_state.setdefault("ready_videos", []).append(res)
+                st.session_state.pipeline_runs += 1
             except Exception as e:
                 br["status"]="error"; br["error"]=str(e)[:120]
             done_n+=1; prog.progress(done_n/total_g)
@@ -1253,40 +1238,48 @@ def render_final():
                 "\u0395\u03be\u03b1\u03c3\u03c6\u03b1\u03bb\u03af\u03b6\u03b5\u03b9 \u03cc\u03c4\u03b9 \u03c4\u03bf \u03c5\u03bb\u03b9\u03ba\u03cc \u03b5\u03af\u03bd\u03b1\u03b9 '\u03c6\u03c1\u03ad\u03c3\u03ba\u03bf' \u03ba\u03b1\u03b9 \u03c0\u03b5\u03c1\u03bd\u03ac \u03b1\u03c0\u03c1\u03cc\u03c3\u03ba\u03bf\u03c0\u03c4\u03b1 \u03c4\u03b1 \u03c6\u03af\u03bb\u03c4\u03c1\u03b1 \u03c0\u03c1\u03bf\u03c3\u03c4\u03b1\u03c3\u03af\u03b1\u03c2."
             )
 
+        # Bug 2 fix: download each video individually, loop scrub per file
+        import requests as _rqs
         for br in done_reels:
-            if not br.get("local_final_path"):
+            if not br.get("local_final_path") and br.get("final_url"):
                 try:
-                    import requests as _rq2
-                    _r2 = _rq2.get(br["final_url"], timeout=60)
-                    _lp = f"/tmp/twhales_final_{br['idx']}.mp4"
-                    with open(_lp, "wb") as _f2: _f2.write(_r2.content)
+                    _rv = _rqs.get(br["final_url"], timeout=60)
+                    _lp = "/tmp/twhales_final_" + str(br["idx"]) + ".mp4"
+                    with open(_lp, "wb") as _fh: _fh.write(_rv.content)
                     br["local_final_path"] = _lp
                 except Exception:
                     br["local_final_path"] = None
 
-        all_scrubbed = all(br.get("scrubbed_path") for br in done_reels)
-        can_scrub = any(br.get("local_final_path") and not br.get("scrubbed_path") for br in done_reels)
+        all_scrubbed = all(br.get("scrubbed_path") for br in done_reels) if done_reels else False
+        can_scrub = any(
+            br.get("local_final_path") and os.path.exists(br.get("local_final_path", ""))
+            and not br.get("scrubbed_path") for br in done_reels)
 
         if not all_scrubbed:
-            if st.button("\U0001f9fc Run Scrub & Clean \U0001f40b", type="primary", use_container_width=True, disabled=not can_scrub):
-                with st.spinner("\U0001f9fc Scrubbing & Cleaning all videos..."):
+            if st.button("\U0001f9fc Run Scrub & Clean \U0001f40b", type="primary",
+                         use_container_width=True, disabled=not can_scrub):
+                with st.spinner("\U0001f9fc Scrubbing & Cleaning..."):
                     for br in done_reels:
                         _lp2 = br.get("local_final_path")
-                        if _lp2 and os.path.exists(_lp2) and not br.get("scrubbed_path"):
-                            try:
-                                br["scrubbed_path"] = _scrub_video(_lp2, br["idx"])
-                            except Exception as _se:
-                                st.error(f"\u274c FFmpeg error #{br['idx']+1}: {_se}")
+                        if not _lp2 or not os.path.exists(_lp2) or br.get("scrubbed_path"):
+                            continue
+                        try:
+                            br["scrubbed_path"] = _scrub_video(_lp2, br["idx"])
+                        except Exception as _se:
+                            st.error("\u274c FFmpeg #" + str(br["idx"]+1) + ": " + str(_se)[:200])
                 st.rerun()
         else:
             st.success("\u2705 \u03a4\u03bf \u03b2\u03af\u03bd\u03c4\u03b5\u03bf \u03b5\u03af\u03bd\u03b1\u03b9 \u03ba\u03b1\u03b8\u03b1\u03c1\u03cc \u03ba\u03b1\u03b9 \u03ad\u03c4\u03bf\u03b9\u03bc\u03bf!")
 
         st.markdown("<div style='height:10px'/>", unsafe_allow_html=True)
         if st.button("\U0001f504 Start New Batch", type="primary", use_container_width=True):
-            st.session_state.batch_reels = []; st.session_state.step = 1; st.rerun()
+            st.session_state.batch_reels  = []
+            st.session_state.get("ready_videos", []).clear() if "ready_videos" in st.session_state else None
+            st.session_state.step = 1; st.rerun()
     else:
         if st.button("\u2190 Back to Review", use_container_width=True):
             st.session_state.step = 3; st.rerun()
+
 
 # ─────────────────────────────────────────────────────────────
 # MAIN
