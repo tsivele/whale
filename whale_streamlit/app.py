@@ -960,33 +960,26 @@ def render_frame_selection():
             ferr = st.session_state.get("_frame_err", "")
             st.warning(f"⚠️ Cannot extract frame: {ferr[:120]}")
 
-        st.markdown("---")
+        st.markdown("<div style='height:6px'/>", unsafe_allow_html=True)
 
-        # ── Custom Frame Scrubber ────────────────────────────────────────
-        st.markdown("**🎛️ Custom Frame**")
-        frame_time = st.slider("", min_value=0.0, max_value=max(0.1, dur - 0.1),
-            value=float(st.session_state.frame_time), step=0.5, format="%.1f s",
-            label_visibility="collapsed")
-        if abs(frame_time - st.session_state.frame_time) > 0.09:
-            st.session_state.frame_time = frame_time
-            st.rerun()
-
-        fb = extract_frame(path, st.session_state.frame_time)
-        if fb:
-            cb1, cb2 = st.columns([1, 2])
-            with cb1:
-                st.image(fb, caption=f"@ {st.session_state.frame_time:.1f}s", use_container_width=True)
-                st.session_state.frame_b64 = to_b64(fb)
-            with cb2:
-                st.markdown('<div style="padding:8px 0"><div style="color:#f4f4f5;font-weight:600;font-size:12px">Custom selection</div><div style="color:#71717a;font-size:11px;margin-top:4px">Slide to pick your moment</div></div>', unsafe_allow_html=True)
+        with st.expander("🎛️ Choose a different frame", expanded=False):
+            _cft = st.slider("Scrub to select frame", min_value=0.0,
+                max_value=max(0.1, dur - 0.1),
+                value=float(st.session_state.frame_time), step=0.5, format="%.1f s")
+            if abs(_cft - st.session_state.frame_time) > 0.09:
+                st.session_state.frame_time = _cft
+                st.rerun()
+            _cfb = extract_frame(path, st.session_state.frame_time)
+            if _cfb:
+                st.image(_cfb, caption=f"Frame @ {st.session_state.frame_time:.1f}s", width=180)
+                st.session_state.frame_b64 = to_b64(_cfb)
                 if st.button("✅ Use this frame", key="use_custom", use_container_width=True):
                     st.rerun()
-        else:
-            ferr2 = st.session_state.get("_frame_err", "")
-            st.warning(f"⚠️ No frame — {ferr2[:100]}")
-            if st.button("↩️ Try first frame"):
-                st.session_state.frame_time = 0.0; st.rerun()
-
+            else:
+                _fe = st.session_state.get("_frame_err", "unknown")
+                st.warning(f"⚠️ No frame — {_fe[:80]}")
+                if st.button("↩️ Try first frame"):
+                    st.session_state.frame_time = 0.0; st.rerun()
     with col_right:
         # ── Reference Photo (persisted) ──────────────────────────────────
         st.markdown("**👤 Reference Photo**")
@@ -1003,9 +996,13 @@ def render_frame_selection():
             with open(_ref, "wb") as _f: _f.write(data)
 
         if st.session_state.creator_bytes:
-            st.image(st.session_state.creator_bytes, caption="✓ Reference set", width=160)
+            st.markdown('<div style="color:#34d399;font-size:11px;font-weight:600;margin-bottom:8px">✓ Reference photo ready</div>', unsafe_allow_html=True)
+            if st.button("🔄 Change photo", use_container_width=True, key="change_ref"):
+                st.session_state.creator_bytes = None
+                if os.path.exists(_ref): os.unlink(_ref)
+                st.rerun()
         else:
-            st.info("⬆️ Upload your reference photo once — it will be remembered")
+            st.info("⬆️ Upload your reference photo once — it will be saved")
 
         st.markdown("<div style='height:14px'/>", unsafe_allow_html=True)
         can_gen = bool(st.session_state.frame_b64 and st.session_state.creator_bytes)
@@ -1027,60 +1024,30 @@ def render_review():
     if not st.session_state.swapped_url:
         return  # generation failed / still running
 
-    st.markdown("""
-    <div style="margin-bottom:20px">
-      <div style="font-size:18px;font-weight:700;color:#f4f4f5">🖼️ Review Generated Image</div>
-      <div style="font-size:12px;color:#52525b;margin-top:4px">
-        AI face-swap complete — approve to generate your video
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    col_img, col_info = st.columns([1, 2])
+    col_img, col_ctrl = st.columns([1, 1.4])
 
     with col_img:
-        st.image(st.session_state.swapped_url, caption="✨ AI Faceswap", width=200)
+        st.image(st.session_state.swapped_url, caption="✨ AI Faceswap", width=220)
 
-    with col_info:
-        st.markdown("""
-        <div class="whale-card" style="padding:20px">
-          <div style="font-size:13px;font-weight:700;color:#f4f4f5;margin-bottom:14px">Generation Details</div>
-        """, unsafe_allow_html=True)
+    with col_ctrl:
+        st.markdown('<div style="font-size:16px;font-weight:700;color:#f4f4f5;margin-bottom:14px">🖼️ Review Result</div>', unsafe_allow_html=True)
 
-        details = [
-            ("Model",       "QWEN-Image-2.0-Pro"),
-            ("Type",        "Face Swap / Inpainting"),
-            ("Resolution",  "High Quality"),
-            ("Status",      "✅ Ready"),
-        ]
-        for k, v in details:
-            st.markdown(f"""
-            <div style="display:flex;justify-content:space-between;padding:6px 0;
-                        border-bottom:1px solid #1e1e1e;font-size:12px">
-              <span style="color:#71717a">{k}</span>
-              <span style="color:#f4f4f5;font-weight:600">{v}</span>
-            </div>
-            """, unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
+        _custom = st.text_input(
+            "✏️ Add custom instruction (optional)",
+            placeholder="e.g. make hair blonde, add smile…",
+            key="custom_prompt_add",
+        )
+        st.session_state["_custom_prompt_add"] = _custom.strip()
 
-        # Prompt editor
-        with st.expander("✏️ Edit Prompts"):
-            st.session_state.face_swap_prompt = st.text_area(
-                "Face Swap Prompt", st.session_state.face_swap_prompt, height=80)
-            st.session_state.video_prompt = st.text_area(
-                "Video Generation Prompt", st.session_state.video_prompt, height=80)
-
-        st.markdown("<div style='height:16px'/>", unsafe_allow_html=True)
-
-        if st.button("✅ Εγκρίνω — Generate Video →", type="primary", use_container_width=True):
+        st.markdown("<div style='height:12px'/>", unsafe_allow_html=True)
+        if st.button("✅ Approve — Generate Video →", type="primary", use_container_width=True):
             st.session_state.step = 4; st.rerun()
-
-        if st.button("🔄 Ξανά — Regenerate Image", use_container_width=True):
+        st.markdown("<div style='height:6px'/>", unsafe_allow_html=True)
+        if st.button("🔄 Regenerate Image", use_container_width=True):
             st.session_state.swapped_url = None; st.rerun()
+        if st.button("← Back to Frames", use_container_width=True):
+            st.session_state.swapped_url = None; st.session_state.step = 2; st.rerun()
 
-        if st.button("← Back to Frame Selection", use_container_width=True):
-            st.session_state.swapped_url = None
-            st.session_state.step = 2; st.rerun()
 
 def _generate_image():
     st.info("🎨 Generating image with AI face swap…")
@@ -1097,7 +1064,7 @@ def _generate_image():
             "wavespeed-ai/qwen-image-2.0-pro/edit",
             {
                 "images": [creator_b64, frame_b64],
-                "prompt": st.session_state.face_swap_prompt,
+                "prompt": (st.session_state.face_swap_prompt + " " + st.session_state.get("_custom_prompt_add","")).strip(),
                 "seed": -1,
             },
         )
