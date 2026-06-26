@@ -177,6 +177,9 @@ WS_API    = "https://api.wavespeed.ai/api/v3"
 HIKER_API = "https://api.hikerapi.com"
 APIFY_API = "https://api.apify.com/v2"
 
+QWEN_MODEL  = "wavespeed-ai/qwen-image-2.0-pro/edit"
+KLING_MODEL = "kwaivgi/kling-v3.0-pro/motion-control"
+
 # ─────────────────────────────────────────────────────────────
 # UTILITIES
 # ─────────────────────────────────────────────────────────────
