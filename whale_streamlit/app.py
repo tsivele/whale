@@ -236,6 +236,7 @@ DEFAULTS = {
     "batch_idx":         0,
     "batch_reels":       [],
     "ready_videos":       [],
+    "scrubbed_videos":    [],
     "creator_bytes":     None,
     "face_swap_prompt":  "Use Image A as the complete identity reference and Image B as the base/body reference. Replace the person in Image B entirely with the girl from Image A while preserving the exact pose, body position, clothing, framing, camera angle, lighting, background, and scene composition from Image B. The final image must look as if the girl from Image A was originally photographed in the scene of Image B. Match the facial identity from Image A with maximum accuracy, including: * exact face shape * skin tone and texture * hairstyle and hair color * hair length and hairline * eyes, eyebrows, nose, lips, and jawline * makeup style and facial details * expression consistency when possible Do not retain any facial or hair features from Image B. Only use Image B for the body, clothing, pose, environment, and composition. Ensure: * seamless and photorealistic blending * natural lighting adaptation * accurate perspective and head angle alignment * realistic shadows and skin integration * proportional anatomy * ultra-detailed facial realism * no distortions, warping, or uncanny features The output should appear completely natural and indistinguishable from a real photograph. Keep the first hair color and Face Visible and Larger breast no captions no text no font and Bigger breast.NO TATTOOS",
     "video_prompt":      "Animate the character from the reference image using the exact motion from the driving video. The character identity must remain exactly as shown in the reference image throughout every single frame — never drift toward or blend with any person from the driving video. Lip-sync is the top priority: replicate every mouth shape, jaw movement, and lip position frame-by-frame to match the original audio and speech timing with perfect accuracy. Transfer all body movements precisely: shoulder shifts, head tilts, arm gestures, hand positions, and torso motion must mirror the driving video exactly. If the person in the driving video is holding any object — a phone, microphone, drink, prop, or anything else — the character must also be holding that same object in the same hand position throughout. Maintain consistent character appearance, clothing, and all visible features in every frame.",
@@ -1154,129 +1155,171 @@ def _scrub_video(input_path, idx):
 
 
 def render_final():
-    batch = st.session_state.batch_reels
-    to_gen = [br for br in batch
-              if br.get("approved") and not br.get("final_url")
-              and br["status"] not in ("error",)]
-    if to_gen:
-        prog=st.progress(0); ph=st.empty()
-        total_g=len(to_gen); done_n=0
-        for br in to_gen:
-            ph.info(f"\U0001f3ac Generating {done_n+1}/{total_g}: {br['author']}")
-            try:
-                # Bug 1 fix: video = source URL (not base64). One request per reel.
-                pid = ws_submit(KLING_MODEL, {
-                    "image":  br.get("swapped_url", ""),
-                    "video":  br["url"],
-                    "prompt": st.session_state.video_prompt,
-                })
-                res = ws_poll(pid, timeout=360)
-                br["final_url"] = res; br["status"] = "done"
-                if res and res not in st.session_state.get("ready_videos", []):
-                    st.session_state.setdefault("ready_videos", []).append(res)
-                st.session_state.pipeline_runs += 1
-            except Exception as e:
-                br["status"]="error"; br["error"]=str(e)[:120]
-            done_n+=1; prog.progress(done_n/total_g)
-        prog.empty(); ph.empty(); st.rerun()
+    """Step 4: Video Generation + Scrub & Clean.
+    Bug 1 fix: text_area for multiple source URLs, one Kling request per URL.
+    Bug 2 fix: FFmpeg scrub loops through ready_videos individually per file."""
+    batch  = st.session_state.batch_reels
+    ready  = st.session_state.setdefault("ready_videos", [])
+    scrubs = st.session_state.setdefault("scrubbed_videos", [])
+    swapped_img = next(
+        (br.get("swapped_url") for br in batch if br.get("swapped_url")), None)
 
-    st.markdown("**\U0001f389 Final Videos**")
-    done_reels = [br for br in batch if br.get("final_url")]
+    st.markdown("### \U0001f3ac Video Generation")
+    if swapped_img:
+        ci, ct = st.columns([1, 4])
+        with ci: st.image(swapped_img, width=100, caption="\u2728 Faceswap")
+        with ct: st.caption("Paste direct CDN URLs for source videos (one per line).")
+    else:
+        st.info("\u26a0\ufe0f Complete Steps 2 & 3 first to get a faceswap image.")
 
-    for br in done_reels:
-        idx = br["idx"]
-        st.markdown(f"**#{idx+1} \u00b7 {br['author']}**")
-        scrubbed = br.get("scrubbed_path")
-        c1, c2 = st.columns([2, 1])
-        with c1:
-            if scrubbed and os.path.exists(scrubbed):
-                st.video(scrubbed)
+    # BUG 1 FIX: text_area accepts multiple URLs, one per line
+    raw_urls = st.text_area(
+        "\U0001f517 Source video URLs (one per line)",
+        placeholder="https://cdn.example.com/video1.mp4\nhttps://cdn.example.com/video2.mp4",
+        height=110, key="kling_source_urls")
+
+    # Parse + de-duplicate
+    source_urls  = list(dict.fromkeys(
+        u.strip() for u in raw_urls.splitlines() if u.strip().startswith("http")))
+    pending_urls = [u for u in source_urls if u not in ready]
+
+    col_btn, col_st = st.columns([2, 3])
+    with col_btn:
+        if st.button("\U0001f680 Generate Videos", type="primary",
+            use_container_width=True, disabled=not (source_urls and swapped_img)):
+            if pending_urls:
+                prog = st.progress(0); ph = st.empty()
+                for i, url in enumerate(pending_urls):
+                    ph.info(f"\U0001f3ac {i+1}/{len(pending_urls)}: {url[:55]}\u2026")
+                    try:
+                        # BUG 1 FIX: ONE separate POST per URL, no base64
+                        pid = ws_submit(KLING_MODEL, {
+                            "image":  swapped_img,
+                            "video":  url,
+                            "prompt": st.session_state.video_prompt,
+                        })
+                        res = ws_poll(pid, timeout=360)
+                        if res and res not in ready: ready.append(res)
+                        st.session_state.pipeline_runs += 1
+                    except Exception as _e:
+                        st.error(f"\u274c #{i+1}: {str(_e)[:200]}")
+                    prog.progress((i + 1) / len(pending_urls))
+                prog.empty(); ph.empty(); st.rerun()
             else:
-                st.video(br["final_url"])
-        with c2:
-            if scrubbed and os.path.exists(scrubbed):
-                with open(scrubbed, "rb") as _sf:
-                    st.download_button("\u2b07\ufe0f Download Scrubbed", data=_sf.read(),
-                        file_name=f"twhales_clean_{idx+1}.mp4", mime="video/mp4",
-                        use_container_width=True, key=f"dl_s_{idx}")
-                st.success("\u2705 \u039a\u03b1\u03b8\u03b1\u03c1\u03cc & \u03ad\u03c4\u03bf\u03b9\u03bc\u03bf!")
-            else:
-                try:
-                    import requests as _rq
-                    _vb = _rq.get(br["final_url"], timeout=30).content
-                    st.download_button("\u2b07\ufe0f Download MP4", data=_vb,
-                        file_name=f"twhales_{idx+1}.mp4", mime="video/mp4",
-                        use_container_width=True, key=f"dl_{idx}")
-                except Exception:
-                    st.markdown(f"[\u2b07\ufe0f Download]({br['final_url']})")
-        st.markdown("---")
+                st.info("All URLs already processed.")
+    with col_st:
+        if source_urls:
+            st.caption(f"{len(source_urls)} URL(s) | {len(ready)} generated | {len(pending_urls)} pending")
 
+    # Sync from batch_reels (backward compat)
     for br in batch:
-        if br["status"] == "error" and br.get("approved"):
-            st.error(f"\u274c #{br['idx']+1}: {br['error']}")
+        fu = br.get("final_url")
+        if fu and fu not in ready: ready.append(fu)
 
-    if done_reels:
+    if ready:
         st.markdown("---")
+        st.markdown(f"**\U0001f389 Generated Videos ({len(ready)})**")
+        while len(scrubs) < len(ready): scrubs.append(None)
+
+        for i, vu in enumerate(ready):
+            sp = scrubs[i] if i < len(scrubs) and scrubs[i] and os.path.exists(scrubs[i]) else None
+            c1, c2 = st.columns([2, 1])
+            with c1: st.video(sp if sp else vu)
+            with c2:
+                st.markdown(f"**Video #{i+1}**")
+                if sp:
+                    with open(sp, "rb") as _sf:
+                        st.download_button("\u2b07\ufe0f Download Scrubbed",
+                            data=_sf.read(), file_name=f"twhales_clean_{i+1}.mp4",
+                            mime="video/mp4", use_container_width=True, key=f"dl_s_{i}")
+                    st.success("\u2705 \u039a\u03b1\u03b8\u03b1\u03c1\u03cc!")
+                else:
+                    try:
+                        import requests as _rq0
+                        st.download_button("\u2b07\ufe0f Download MP4",
+                            data=_rq0.get(vu, timeout=30).content,
+                            file_name=f"twhales_{i+1}.mp4",
+                            mime="video/mp4", use_container_width=True, key=f"dl_r_{i}")
+                    except Exception: st.markdown(f"[\u2b07\ufe0f Download]({vu})")
+            st.markdown("---")
+
         st.markdown("### \U0001f9fc T-WHALES Digital Scrubbing & Cleaning")
         with st.expander("\u0393\u03b9\u03b1\u03c4\u03af \u03b5\u03af\u03bd\u03b1\u03b9 \u03b1\u03c0\u03b1\u03c1\u03b1\u03af\u03c4\u03b7\u03c4\u03bf \u03b1\u03c5\u03c4\u03cc;"):
             st.markdown(
                 "\u039c\u03b5 \u03c4\u03b9\u03c2 \u03b5\u03bd\u03c4\u03bf\u03bb\u03ad\u03c2 \u03c0\u03bf\u03c5 \u03c7\u03c1\u03b7\u03c3\u03b9\u03bc\u03bf\u03c0\u03bf\u03b9\u03bf\u03cd\u03bc\u03b5 \u03bc\u03ad\u03c3\u03c9 \u03c4\u03bf\u03c5 FFmpeg, "
-                "\u03c0\u03b5\u03c4\u03c5\u03c7\u03b1\u03af\u03bd\u03b5\u03b9\u03c2 \u03ad\u03bd\u03b1\u03bd \u03c0\u03bb\u03ae\u03c1\u03b7 \u00ab\u03c8\u03b7\u03c6\u03b9\u03b1\u03ba\u03cc \u03ba\u03b1\u03b8\u03b1\u03c1\u03b9\u03c3\u03bc\u03cc\u00bb "
-                "\u03c4\u03bf\u03c5 \u03c0\u03b5\u03c1\u03b9\u03b5\u03c7\u03bf\u03bc\u03ad\u03bd\u03bf\u03c5 \u03c3\u03bf\u03c5. \u0397 \u03c7\u03c1\u03ae\u03c3\u03b7 \u03b1\u03c5\u03c4\u03ae\u03c2 \u03c4\u03b7\u03c2 \u03b4\u03b9\u03b1\u03b4\u03b9\u03ba\u03b1\u03c3\u03af\u03b1\u03c2 "
-                "\u03b5\u03af\u03bd\u03b1\u03b9 \u03ba\u03c1\u03af\u03c3\u03b9\u03bc\u03b7 \u03b3\u03b9\u03b1 \u03c4\u03b7 \u03b4\u03b9\u03b1\u03c7\u03b5\u03af\u03c1\u03b9\u03c3\u03b7 \u03c0\u03b5\u03c1\u03b9\u03b5\u03c7\u03bf\u03bc\u03ad\u03bd\u03bf\u03c5 \u03c3\u03c4\u03b1 social media "
-                "\u03ba\u03b1\u03b9 \u03b3\u03b9\u03b1 \u03c4\u03b7\u03bd \u03b1\u03c0\u03bf\u03c6\u03c5\u03b3\u03ae \u03c0\u03b5\u03c1\u03b9\u03bf\u03c1\u03b9\u03c3\u03bc\u03ce\u03bd \u03b1\u03c0\u03cc \u03b1\u03bb\u03b3\u03cc\u03c1\u03b9\u03b8\u03bc\u03bf\u03c5\u03c2 \u03b1\u03bd\u03af\u03c7\u03bd\u03b5\u03c5\u03c3\u03b7\u03c2. "
-                "\u0391\u03bd\u03b1\u03bb\u03c5\u03c4\u03b9\u03ba\u03ac:\n\n"
+                "\u03c0\u03b5\u03c4\u03c5\u03c7\u03b1\u03af\u03bd\u03b5\u03b9\u03c2 \u03ad\u03bd\u03b1\u03bd \u03c0\u03bb\u03ae\u03c1\u03b7 \u00ab\u03c8\u03b7\u03c6\u03b9\u03b1\u03ba\u03cc \u03ba\u03b1\u03b8\u03b1\u03c1\u03b9\u03c3\u03bc\u03cc\u00bb \u03c4\u03bf\u03c5 \u03c0\u03b5\u03c1\u03b9\u03b5\u03c7\u03bf\u03bc\u03ad\u03bd\u03bf\u03c5 \u03c3\u03bf\u03c5. "
+                "\u0397 \u03c7\u03c1\u03ae\u03c3\u03b7 \u03b1\u03c5\u03c4\u03ae\u03c2 \u03c4\u03b7\u03c2 \u03b4\u03b9\u03b1\u03b4\u03b9\u03ba\u03b1\u03c3\u03af\u03b1\u03c2 \u03b5\u03af\u03bd\u03b1\u03b9 \u03ba\u03c1\u03af\u03c3\u03b9\u03bc\u03b7 \u03b3\u03b9\u03b1 \u03c4\u03b7 \u03b4\u03b9\u03b1\u03c7\u03b5\u03af\u03c1\u03b9\u03c3\u03b7 "
+                "\u03c0\u03b5\u03c1\u03b9\u03b5\u03c7\u03bf\u03bc\u03ad\u03bd\u03bf\u03c5 \u03c3\u03c4\u03b1 social media \u03ba\u03b1\u03b9 \u03b3\u03b9\u03b1 \u03c4\u03b7\u03bd \u03b1\u03c0\u03bf\u03c6\u03c5\u03b3\u03ae \u03c0\u03b5\u03c1\u03b9\u03bf\u03c1\u03b9\u03c3\u03bc\u03ce\u03bd \u03b1\u03c0\u03cc "
+                "\u03b1\u03bb\u03b3\u03cc\u03c1\u03b9\u03b8\u03bc\u03bf\u03c5\u03c2 \u03b1\u03bd\u03af\u03c7\u03bd\u03b5\u03c5\u03c3\u03b7\u03c2.\n\n"
+                "\u0391\u03bd\u03b1\u03bb\u03c5\u03c4\u03b9\u03ba\u03ac, \u03b7 \u03c7\u03c1\u03ae\u03c3\u03b7 \u03ba\u03b1\u03b9 \u03c4\u03b1 \u03bf\u03c6\u03ad\u03bb\u03b7 \u03b1\u03c5\u03c4\u03ae\u03c2 \u03c4\u03b7\u03c2 \u03bc\u03b5\u03b8\u03cc\u03b4\u03bf\u03c5 \u03b5\u03af\u03bd\u03b1\u03b9:\n\n"
                 "* **\u0391\u03c0\u03cc\u03ba\u03c1\u03c5\u03c8\u03b7 \u03a8\u03b7\u03c6\u03b9\u03b1\u03ba\u03bf\u03cd \u0391\u03c0\u03bf\u03c4\u03c5\u03c0\u03ce\u03bc\u03b1\u03c4\u03bf\u03c2 (Fingerprint Scrubbing):** "
-                "\u0397 \u03b5\u03bd\u03c4\u03bf\u03bb\u03ae `noise=c0s=12:c0f=t` \u03c0\u03c1\u03bf\u03c3\u03b8\u03ad\u03c4\u03b5\u03b9 \u03b1\u03bd\u03b5\u03c0\u03b1\u03af\u03c3\u03b8\u03b7\u03c4\u03bf \u03b8\u03cc\u03c1\u03c5\u03b2\u03bf. "
+                "\u0397 \u03b5\u03bd\u03c4\u03bf\u03bb\u03ae noise=c0s=12:c0f=t \u03c0\u03c1\u03bf\u03c3\u03b8\u03ad\u03c4\u03b5\u03b9 \u03b1\u03bd\u03b5\u03c0\u03b1\u03af\u03c3\u03b8\u03b7\u03c4\u03bf \u03b8\u03cc\u03c1\u03c5\u03b2\u03bf \u03c3\u03b5 \u03ba\u03ac\u03b8\u03b5 \u03ba\u03b1\u03c1\u03ad. "
                 "\u0391\u03c5\u03c4\u03cc \u03b1\u03bb\u03bb\u03ac\u03b6\u03b5\u03b9 \u03bc\u03b1\u03b8\u03b7\u03bc\u03b1\u03c4\u03b9\u03ba\u03ac \u03c4\u03b1 \u03b4\u03b5\u03b4\u03bf\u03bc\u03ad\u03bd\u03b1 \u03ba\u03ac\u03b8\u03b5 pixel, "
-                "\u03ba\u03b1\u03b8\u03b9\u03c3\u03c4\u03ce\u03bd\u03c4\u03b1\u03c2 \u03b1\u03b4\u03cd\u03bd\u03b1\u03c4\u03bf \u03b3\u03b9\u03b1 \u03c4\u03bf\u03c5\u03c2 \u03b1\u03bb\u03b3\u03cc\u03c1\u03b9\u03b8\u03bc\u03bf\u03c5\u03c2 \u03bd\u03b1 \u03b1\u03bd\u03b1\u03b3\u03bd\u03c9\u03c1\u03af\u03c3\u03bf\u03c5\u03bd \u03c4\u03bf \u03b2\u03af\u03bd\u03c4\u03b5\u03bf \u03c9\u03c2 \u03b1\u03bd\u03c4\u03af\u03b3\u03c1\u03b1\u03c6\u03bf.\n"
+                "\u03ba\u03b1\u03b8\u03b9\u03c3\u03c4\u03ce\u03bd\u03c4\u03b1\u03c2 \u03b1\u03b4\u03cd\u03bd\u03b1\u03c4\u03bf \u03b3\u03b9\u03b1 \u03c4\u03bf\u03c5\u03c2 \u03b1\u03bb\u03b3\u03cc\u03c1\u03b9\u03b8\u03bc\u03bf\u03c5\u03c2 \u03bd\u03b1 \u03b1\u03bd\u03b1\u03b3\u03bd\u03c9\u03c1\u03af\u03c3\u03bf\u03c5\u03bd \u03c4\u03bf \u03b2\u03af\u03bd\u03c4\u03b5\u03bf \u03c9\u03c2 "\u03b1\u03bd\u03c4\u03af\u03b3\u03c1\u03b1\u03c6\u03bf"" 
+                "\u03b5\u03bd\u03cc\u03c2 \u03ac\u03bb\u03bb\u03bf\u03c5.\n"
                 "* **\u03a0\u03bb\u03ae\u03c1\u03b7\u03c2 \u0391\u03c6\u03b1\u03af\u03c1\u03b5\u03c3\u03b7 \u039c\u03b5\u03c4\u03b1\u03b4\u03b5\u03b4\u03bf\u03bc\u03ad\u03bd\u03c9\u03bd (Metadata Removal):** "
-                "\u039c\u03b5 \u03c4\u03bf `-map_metadata -1`, \u03b4\u03b9\u03b1\u03b3\u03c1\u03ac\u03c6\u03bf\u03bd\u03c4\u03b1\u03b9 \u03cc\u03bb\u03b5\u03c2 \u03bf\u03b9 \u03ba\u03c1\u03c5\u03c6\u03ad\u03c2 \u03c0\u03bb\u03b7\u03c1\u03bf\u03c6\u03bf\u03c1\u03af\u03b5\u03c2 (EXIF data, \u03b7\u03bc\u03b5\u03c1\u03bf\u03bc\u03b7\u03bd\u03af\u03b1, \u03ba\u03ac\u03bc\u03b5\u03c1\u03b1, GPS).\n"
-                "* **\u0391\u03c0\u03b5\u03bd\u03b5\u03c1\u03b3\u03bf\u03c0\u03bf\u03af\u03b7\u03c3\u03b7 \u03a8\u03b7\u03c6\u03b9\u03b1\u03ba\u03ce\u03bd \u03a0\u03b9\u03c3\u03c4\u03bf\u03c0\u03bf\u03b9\u03b7\u03c4\u03b9\u03ba\u03ce\u03bd (C2PA):** "
-                "\u0391\u03c6\u03b1\u03b9\u03c1\u03bf\u03cd\u03bd\u03c4\u03b1\u03b9 \u03c4\u03b1 \u03c0\u03c1\u03cc\u03c3\u03b8\u03b5\u03c4\u03b1 \u03b4\u03b5\u03b4\u03bf\u03bc\u03ad\u03bd\u03b1 \u03c0\u03c1\u03bf\u03ad\u03bb\u03b5\u03c5\u03c3\u03b7\u03c2 \u03bc\u03b5 \u03c4\u03bf `-bitexact`.\n"
+                "\u039c\u03b5 \u03c4\u03bf -map_metadata -1, \u03b4\u03b9\u03b1\u03b3\u03c1\u03ac\u03c6\u03bf\u03bd\u03c4\u03b1\u03b9 \u03cc\u03bb\u03b5\u03c2 \u03bf\u03b9 \u03ba\u03c1\u03c5\u03c6\u03ad\u03c2 \u03c0\u03bb\u03b7\u03c1\u03bf\u03c6\u03bf\u03c1\u03af\u03b5\u03c2 (EXIF data). "
+                "\u0391\u03c5\u03c4\u03cc \u03c0\u03b5\u03c1\u03b9\u03bb\u03b1\u03bc\u03b2\u03ac\u03bd\u03b5\u03b9 \u03c4\u03b7\u03bd \u03b7\u03bc\u03b5\u03c1\u03bf\u03bc\u03b7\u03bd\u03af\u03b1 \u03bb\u03ae\u03c8\u03b7\u03c2, \u03c4\u03bf \u03bc\u03bf\u03bd\u03c4\u03ad\u03bb\u03bf \u03c4\u03b7\u03c2 \u03ba\u03ac\u03bc\u03b5\u03c1\u03b1\u03c2, "
+                "\u03c4\u03b9\u03c2 \u03c3\u03c5\u03bd\u03c4\u03b5\u03c4\u03b1\u03b3\u03bc\u03ad\u03bd\u03b5\u03c2 GPS \u03ba\u03b1\u03b9 \u03bf\u03c0\u03bf\u03b9\u03bf\u03b4\u03ae\u03c0\u03bf\u03c4\u03b5 \u03ac\u03bb\u03bb\u03bf \u03c3\u03c4\u03bf\u03b9\u03c7\u03b5\u03af\u03bf "
+                "\u03b8\u03b1 \u03bc\u03c0\u03bf\u03c1\u03bf\u03cd\u03c3\u03b5 \u03bd\u03b1 \u03c3\u03c5\u03bd\u03b4\u03ad\u03c3\u03b5\u03b9 \u03c4\u03bf \u03b1\u03c1\u03c7\u03b5\u03af\u03bf \u03bc\u03b5 \u03c4\u03b7\u03bd \u03b1\u03c1\u03c7\u03b9\u03ba\u03ae \u03c0\u03b7\u03b3\u03ae.\n"
+                "* **\u0391\u03c0\u03b5\u03bd\u03b5\u03c1\u03b3\u03bf\u03c0\u03bf\u03af\u03b7\u03c3\u03b7 \u03a8\u03b7\u03c6\u03b9\u03b1\u03ba\u03ce\u03bd \u03a0\u03b9\u03c3\u03c4\u03bf\u03c0\u03bf\u03b9\u03b7\u03c4\u03b9\u03ba\u03ce\u03bd (C2PA/Content Credentials):** "
+                "\u03a7\u03c1\u03b7\u03c3\u03b9\u03bc\u03bf\u03c0\u03bf\u03b9\u03ce\u03bd\u03c4\u03b1\u03c2 \u03c4\u03bf -bitexact, \u03b1\u03c6\u03b1\u03b9\u03c1\u03bf\u03cd\u03bd\u03c4\u03b1\u03b9 \u03c4\u03b1 \u03c0\u03c1\u03cc\u03c3\u03b8\u03b5\u03c4\u03b1 \u03b4\u03b5\u03b4\u03bf\u03bc\u03ad\u03bd\u03b1 \u03c0\u03bf\u03c5 "
+                "\u03b5\u03bd\u03c3\u03c9\u03bc\u03b1\u03c4\u03ce\u03bd\u03bf\u03c5\u03bd \u03c3\u03c5\u03c3\u03ba\u03b5\u03c5\u03ad\u03c2 \u03b3\u03b9\u03b1 \u03c4\u03b7\u03bd \u03c0\u03b9\u03c3\u03c4\u03bf\u03c0\u03bf\u03af\u03b7\u03c3\u03b7 \u03c4\u03b7\u03c2 \u03c0\u03c1\u03bf\u03ad\u03bb\u03b5\u03c5\u03c3\u03b7\u03c2 \u03c4\u03bf\u03c5 \u03c0\u03b5\u03c1\u03b9\u03b5\u03c7\u03bf\u03bc\u03ad\u03bd\u03bf\u03c5, "
+                "\u03cc\u03c0\u03c9\u03c2 \u03c4\u03bf C2PA. \u039c\u03b5 \u03b1\u03c5\u03c4\u03cc\u03bd \u03c4\u03bf\u03bd \u03c4\u03c1\u03cc\u03c0\u03bf, \u03c4\u03bf \u03b1\u03c1\u03c7\u03b5\u03af\u03bf \u03b5\u03bc\u03c6\u03b1\u03bd\u03af\u03b6\u03b5\u03c4\u03b1\u03b9 \u03c9\u03c2 "\u03bf\u03c5\u03b4\u03ad\u03c4\u03b5\u03c1\u03bf" \u03ba\u03b1\u03b9 \u03c7\u03c9\u03c1\u03af\u03c2 \u03b9\u03c3\u03c4\u03bf\u03c1\u03b9\u03ba\u03cc.\n"
                 "* **\u0392\u03b5\u03bb\u03c4\u03b9\u03c3\u03c4\u03bf\u03c0\u03bf\u03af\u03b7\u03c3\u03b7 \u03b3\u03b9\u03b1 \u03c4\u03bf T-WHALES \U0001f40b:** "
-                "\u0395\u03be\u03b1\u03c3\u03c6\u03b1\u03bb\u03af\u03b6\u03b5\u03b9 \u03cc\u03c4\u03b9 \u03c4\u03bf \u03c5\u03bb\u03b9\u03ba\u03cc \u03b5\u03af\u03bd\u03b1\u03b9 '\u03c6\u03c1\u03ad\u03c3\u03ba\u03bf' \u03ba\u03b1\u03b9 \u03c0\u03b5\u03c1\u03bd\u03ac \u03b1\u03c0\u03c1\u03cc\u03c3\u03ba\u03bf\u03c0\u03c4\u03b1 \u03c4\u03b1 \u03c6\u03af\u03bb\u03c4\u03c1\u03b1 \u03c0\u03c1\u03bf\u03c3\u03c4\u03b1\u03c3\u03af\u03b1\u03c2."
+                "\u0393\u03b9\u03b1 \u03ad\u03bd\u03b1 project \u03cc\u03c0\u03c9\u03c2 \u03c4\u03bf T-WHALES, \u03b1\u03c5\u03c4\u03cc\u03c2 \u03bf \u03ba\u03b1\u03b8\u03b1\u03c1\u03b9\u03c3\u03bc\u03cc\u03c2 \u03b5\u03be\u03b1\u03c3\u03c6\u03b1\u03bb\u03af\u03b6\u03b5\u03b9 "
+                "\u03cc\u03c4\u03b9 \u03c4\u03bf \u03c5\u03bb\u03b9\u03ba\u03cc \u03c0\u03bf\u03c5 \u03b1\u03bd\u03b5\u03b2\u03ac\u03b6\u03b5\u03b9\u03c2 \u03b5\u03af\u03bd\u03b1\u03b9 "\u03c6\u03c1\u03ad\u03c3\u03ba\u03bf" \u03c3\u03c4\u03b1 \u03bc\u03ac\u03c4\u03b9\u03b1 \u03c4\u03c9\u03bd \u03c0\u03bb\u03b1\u03c4\u03c6\u03cc\u03c1\u03bc\u03c9\u03bd, "
+                "\u03b5\u03c0\u03b9\u03c4\u03c1\u03ad\u03c0\u03bf\u03bd\u03c4\u03b1\u03c2 \u03c4\u03b7\u03bd \u03b1\u03c0\u03c1\u03cc\u03c3\u03ba\u03bf\u03c0\u03c4\u03b7 \u03c1\u03bf\u03ae \u03c4\u03bf\u03c5 \u03c0\u03b5\u03c1\u03b9\u03b5\u03c7\u03bf\u03bc\u03ad\u03bd\u03bf\u03c5 \u03c3\u03bf\u03c5 "
+                "\u03c7\u03c9\u03c1\u03af\u03c2 \u03bd\u03b1 \u03b5\u03bd\u03b5\u03c1\u03b3\u03bf\u03c0\u03bf\u03b9\u03bf\u03cd\u03bd\u03c4\u03b1\u03b9 \u03c6\u03af\u03bb\u03c4\u03c1\u03b1 \u03c0\u03c1\u03bf\u03c3\u03c4\u03b1\u03c3\u03af\u03b1\u03c2 "
+                "\u03c0\u03bd\u03b5\u03c5\u03bc\u03b1\u03c4\u03b9\u03ba\u03ce\u03bd \u03b4\u03b9\u03ba\u03b1\u03b9\u03c9\u03bc\u03ac\u03c4\u03c9\u03bd \u03ae \u03b1\u03c5\u03c4\u03cc\u03bc\u03b1\u03c4\u03bf\u03c5 \u03c0\u03b5\u03c1\u03b9\u03bf\u03c1\u03b9\u03c3\u03bc\u03bf\u03cd."
             )
 
-        # Bug 2 fix: download each video individually, loop scrub per file
-        import requests as _rqs
-        for br in done_reels:
-            if not br.get("local_final_path") and br.get("final_url"):
-                try:
-                    _rv = _rqs.get(br["final_url"], timeout=60)
-                    _lp = "/tmp/twhales_final_" + str(br["idx"]) + ".mp4"
-                    with open(_lp, "wb") as _fh: _fh.write(_rv.content)
-                    br["local_final_path"] = _lp
-                except Exception:
-                    br["local_final_path"] = None
+        # BUG 2 FIX: download + FFmpeg for each video individually
+        import requests as _rqs2, shutil as _sh2
+        while len(scrubs) < len(ready): scrubs.append(None)
+        all_done = all(p and os.path.exists(p) for p in scrubs)
 
-        all_scrubbed = all(br.get("scrubbed_path") for br in done_reels) if done_reels else False
-        can_scrub = any(
-            br.get("local_final_path") and os.path.exists(br.get("local_final_path", ""))
-            and not br.get("scrubbed_path") for br in done_reels)
-
-        if not all_scrubbed:
+        if not all_done:
             if st.button("\U0001f9fc Run Scrub & Clean \U0001f40b", type="primary",
-                         use_container_width=True, disabled=not can_scrub):
+                         use_container_width=True):
                 with st.spinner("\U0001f9fc Scrubbing & Cleaning..."):
-                    for br in done_reels:
-                        _lp2 = br.get("local_final_path")
-                        if not _lp2 or not os.path.exists(_lp2) or br.get("scrubbed_path"):
-                            continue
+                    for i, vu in enumerate(ready):
+                        if scrubs[i] and os.path.exists(scrubs[i]): continue
+                        raw = "/tmp/twhales_ready_" + str(i) + ".mp4"
                         try:
-                            br["scrubbed_path"] = _scrub_video(_lp2, br["idx"])
-                        except Exception as _se:
-                            st.error("\u274c FFmpeg #" + str(br["idx"]+1) + ": " + str(_se)[:200])
+                            r2 = _rqs2.get(vu, timeout=90, stream=True); r2.raise_for_status()
+                            with open(raw, "wb") as _fh:
+                                for ch in r2.iter_content(65536): _fh.write(ch)
+                        except Exception as _de:
+                            st.error("\u274c Download #" + str(i+1) + ": " + str(_de)); continue
+                        out = "/tmp/twhales_scrubbed_" + str(i) + ".mp4"
+                        ffb = _sh2.which("ffmpeg") or "ffmpeg"
+                        res2 = subprocess.run(
+                            [ffb, "-y", "-i", raw,
+                             "-vf", "noise=c0s=12:c0f=t",
+                             "-map_metadata", "-1",
+                             "-bitexact",
+                             "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                             "-c:a", "copy", out],
+                            capture_output=True, timeout=300)
+                        if res2.returncode != 0:
+                            st.error("\u274c FFmpeg #" + str(i+1) + ": " +
+                                     res2.stderr.decode(errors="ignore")[-200:])
+                        else:
+                            scrubs[i] = out
                 st.rerun()
         else:
             st.success("\u2705 \u03a4\u03bf \u03b2\u03af\u03bd\u03c4\u03b5\u03bf \u03b5\u03af\u03bd\u03b1\u03b9 \u03ba\u03b1\u03b8\u03b1\u03c1\u03cc \u03ba\u03b1\u03b9 \u03ad\u03c4\u03bf\u03b9\u03bc\u03bf!")
 
         st.markdown("<div style='height:10px'/>", unsafe_allow_html=True)
         if st.button("\U0001f504 Start New Batch", type="primary", use_container_width=True):
-            st.session_state.batch_reels  = []
-            st.session_state.get("ready_videos", []).clear() if "ready_videos" in st.session_state else None
+            st.session_state.batch_reels     = []
+            st.session_state.ready_videos    = []
+            st.session_state.scrubbed_videos = []
             st.session_state.step = 1; st.rerun()
+
     else:
+        st.info("\u23f3 No videos yet. Paste source URLs above and click Generate.")
         if st.button("\u2190 Back to Review", use_container_width=True):
             st.session_state.step = 3; st.rerun()
 
