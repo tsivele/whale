@@ -1040,10 +1040,6 @@ def render_review():
     needs_swap = [br for br in batch
                   if br.get("frame_b64") and not br.get("swapped_url")
                   and br.get("status") not in ("error","faceswapping","done")]
-    # If no reference photo yet, prompt via sidebar (non-blocking)
-    if needs_swap and not st.session_state.creator_bytes:
-        st.info("\U0001f4f8 Upload your **Reference Photo** in the sidebar (\u25c4) to start faceswap.")
-        st.stop()
     if needs_swap:
         prog = st.progress(0); ph = st.empty()
         total_app = len([b for b in batch if b.get("frame_b64")])
