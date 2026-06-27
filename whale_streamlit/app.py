@@ -1022,23 +1022,10 @@ def render_frame_selection():
 def render_review():
     batch = st.session_state.batch_reels
 
-    # Guard: creator_bytes required — load from disk or prompt upload
+    # Load reference photo silently from disk (no popup, no blocking)
     _ref = "/tmp/whale_ref_face.jpg"
     if not st.session_state.creator_bytes and os.path.exists(_ref):
         with open(_ref, "rb") as _f: st.session_state.creator_bytes = _f.read()
-
-    if not st.session_state.creator_bytes:
-        st.markdown("**\U0001f464 Reference Photo Required for Faceswap**")
-        st.caption("Upload your face photo once \u2014 saved automatically.")
-        _up = st.file_uploader("Upload face photo", type=["jpg","jpeg","png"],
-                               label_visibility="collapsed", key="ref_upload_rv")
-        if _up:
-            _d = _up.read(); st.session_state.creator_bytes = _d
-            with open(_ref, "wb") as _f: _f.write(_d)
-            st.rerun()
-        if st.button("\u2190 Back to Frames", use_container_width=True):
-            st.session_state.step = 2; st.rerun()
-        return
 
     # Safety: filter corrupted session state
     st.session_state.batch_reels = [b for b in st.session_state.batch_reels if isinstance(b, dict)]
@@ -1064,6 +1051,8 @@ def render_review():
                 base_p = st.session_state.face_swap_prompt
                 extra  = br.get("custom_prompt","").strip()
                 full_p = (base_p+" "+extra).strip() if extra else base_p
+                if not st.session_state.creator_bytes:
+                    raise RuntimeError("Reference photo not set. Upload via the sidebar.")
                 pid = ws_submit(QWEN_MODEL, {
                     "images": [to_b64(st.session_state.creator_bytes), br["frame_b64"]],
                     "prompt": full_p, "seed": -1})
@@ -1322,6 +1311,28 @@ def render_final():
 # ─────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────
+# ── Reference photo: sidebar (persistent, non-blocking) ──────────────────
+_ref_path = "/tmp/whale_ref_face.jpg"
+if not st.session_state.creator_bytes and os.path.exists(_ref_path):
+    with open(_ref_path, "rb") as _rf: st.session_state.creator_bytes = _rf.read()
+
+with st.sidebar:
+    st.markdown("**\U0001f464 Reference Photo**")
+    if st.session_state.creator_bytes:
+        st.markdown('<div style="color:#34d399;font-size:12px">\u2705 Photo set</div>', unsafe_allow_html=True)
+        if st.button("\U0001f504 Change", key="change_ref_sb", use_container_width=True):
+            st.session_state.creator_bytes = None
+            if os.path.exists(_ref_path): os.unlink(_ref_path)
+            st.rerun()
+    else:
+        _up_sb = st.file_uploader("Upload face photo", type=["jpg","jpeg","png"],
+                                  label_visibility="collapsed", key="ref_upload_sb")
+        if _up_sb:
+            _d_sb = _up_sb.read()
+            st.session_state.creator_bytes = _d_sb
+            with open(_ref_path, "wb") as _f_sb: _f_sb.write(_d_sb)
+            st.rerun()
+
 render_header()
 render_stats()
 
