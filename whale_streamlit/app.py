@@ -943,6 +943,11 @@ def render_frame_selection():
             st.session_state.step = 1; st.rerun()
         return
 
+    # Reset reels stuck with NoneType error (from missing reference photo)
+    for br in batch:
+        if br.get("error","").startswith("a bytes-like object"):
+            br["status"] = "ready"; br["error"] = None; br["swapped_url"] = None
+
     needs_dl = [br for br in batch if br["status"] == "queued"]
     if needs_dl:
         prog = st.progress(0); ph = st.empty()
@@ -1011,6 +1016,30 @@ def render_frame_selection():
 
 def render_review():
     batch = st.session_state.batch_reels
+
+    # Guard: creator_bytes required — load from disk or prompt upload
+    _ref = "/tmp/whale_ref_face.jpg"
+    if not st.session_state.creator_bytes and os.path.exists(_ref):
+        with open(_ref, "rb") as _f: st.session_state.creator_bytes = _f.read()
+
+    if not st.session_state.creator_bytes:
+        st.markdown("**\U0001f464 Reference Photo Required for Faceswap**")
+        st.caption("Upload your face photo once \u2014 saved automatically.")
+        _up = st.file_uploader("Upload face photo", type=["jpg","jpeg","png"],
+                               label_visibility="collapsed", key="ref_upload_rv")
+        if _up:
+            _d = _up.read(); st.session_state.creator_bytes = _d
+            with open(_ref, "wb") as _f: _f.write(_d)
+            st.rerun()
+        if st.button("\u2190 Back to Frames", use_container_width=True):
+            st.session_state.step = 2; st.rerun()
+        return
+
+    # Reset reels that failed with NoneType (missing reference photo)
+    for br in batch:
+        if br.get("error","").startswith("a bytes-like object"):
+            br["status"] = "ready"; br["error"] = None; br["swapped_url"] = None
+
     needs_swap = [br for br in batch
                   if br.get("frame_b64") and not br.get("swapped_url")
                   and br["status"] not in ("error","faceswapping","done")]
