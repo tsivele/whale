@@ -1167,137 +1167,132 @@ def _scrub_video(input_path, idx):
 
 
 def render_final():
-    """Step 4: Video Generation + Scrub & Clean.
-    Bug 1 fix: text_area for multiple source URLs, one Kling request per URL.
-    Bug 2 fix: FFmpeg scrub loops through ready_videos individually per file."""
-    batch  = st.session_state.batch_reels
-    ready  = st.session_state.setdefault("ready_videos", [])
-    scrubs = st.session_state.setdefault("scrubbed_videos", [])
-    swapped_img = next(
-        (br.get("swapped_url") for br in batch if br.get("swapped_url")), None)
+    """
+    Step 4: Generate Kling videos + Scrub & Clean.
+    One separate API call per approved reel (loop).
+    Uses locally downloaded video_path converted to base64.
+    """
+    batch = st.session_state.batch_reels
 
-    st.markdown("### \U0001f3ac Video Generation")
-    if swapped_img:
-        ci, ct = st.columns([1, 4])
-        with ci: st.image(swapped_img, width=100, caption="\u2728 Faceswap")
-        with ct: st.caption("Paste direct CDN URLs for source videos (one per line).")
-    else:
-        st.info("\u26a0\ufe0f Complete Steps 2 & 3 first to get a faceswap image.")
+    # ── Generate videos for approved reels ────────────────────────────────
+    to_gen = [br for br in batch
+              if br.get("approved") and not br.get("final_url")
+              and br.get("status") not in ("error",)]
 
-    # BUG 1 FIX: text_area accepts multiple URLs, one per line
-    raw_urls = st.text_area(
-        "\U0001f517 Source video URLs (one per line)",
-        placeholder="https://cdn.example.com/video1.mp4\nhttps://cdn.example.com/video2.mp4",
-        height=110, key="kling_source_urls")
+    if to_gen:
+        prog = st.progress(0); ph = st.empty()
+        total = len(to_gen); done_n = 0
+        for br in to_gen:
+            ph.info(f"\U0001f3ac Generating {done_n+1}/{total}: {br.get('author','?')}")
+            try:
+                path = br.get("video_path")
+                if not path or not os.path.exists(str(path)):
+                    raise RuntimeError(f"Video file missing: {path}")
+                with open(path, "rb") as vf:
+                    vb64 = to_b64(vf.read(), "video/mp4")
+                # One separate POST per reel
+                pid = ws_submit(KLING_MODEL, {
+                    "image":  br.get("swapped_url", ""),
+                    "video":  vb64,
+                    "prompt": st.session_state.video_prompt,
+                })
+                res = ws_poll(pid, timeout=360)
+                br["final_url"] = res
+                br["status"]    = "done"
+                st.session_state.pipeline_runs += 1
+                _rv = st.session_state.setdefault("ready_videos", [])
+                if res and res not in _rv:
+                    _rv.append(res)
+            except Exception as e:
+                br["status"] = "error"
+                br["error"]  = str(e)[:200]
+                st.error(f"\u274c #{br.get('idx',0)+1}: {str(e)[:200]}")
+            done_n += 1
+            prog.progress(done_n / total)
+        prog.empty(); ph.empty(); st.rerun()
 
-    # Parse + de-duplicate
-    source_urls  = list(dict.fromkeys(
-        u.strip() for u in raw_urls.splitlines() if u.strip().startswith("http")))
-    pending_urls = [u for u in source_urls if u not in ready]
-
-    col_btn, col_st = st.columns([2, 3])
-    with col_btn:
-        if st.button("\U0001f680 Generate Videos", type="primary",
-            use_container_width=True, disabled=not (source_urls and swapped_img)):
-            if pending_urls:
-                prog = st.progress(0); ph = st.empty()
-                for i, url in enumerate(pending_urls):
-                    ph.info(f"\U0001f3ac {i+1}/{len(pending_urls)}: {url[:55]}\u2026")
-                    try:
-                        # BUG 1 FIX: ONE separate POST per URL, no base64
-                        pid = ws_submit(KLING_MODEL, {
-                            "image":  swapped_img,
-                            "video":  url,
-                            "prompt": st.session_state.video_prompt,
-                        })
-                        res = ws_poll(pid, timeout=360)
-                        if res and res not in ready: ready.append(res)
-                        st.session_state.pipeline_runs += 1
-                    except Exception as _e:
-                        st.error(f"\u274c #{i+1}: {str(_e)[:200]}")
-                    prog.progress((i + 1) / len(pending_urls))
-                prog.empty(); ph.empty(); st.rerun()
-            else:
-                st.info("All URLs already processed.")
-    with col_st:
-        if source_urls:
-            st.caption(f"{len(source_urls)} URL(s) | {len(ready)} generated | {len(pending_urls)} pending")
-
-    # Sync from batch_reels (backward compat)
-    for br in batch:
-        fu = br.get("final_url")
-        if fu and fu not in ready: ready.append(fu)
-
-    if ready:
-        st.markdown("---")
-        st.markdown(f"**\U0001f389 Generated Videos ({len(ready)})**")
-        while len(scrubs) < len(ready): scrubs.append(None)
-
-        for i, vu in enumerate(ready):
-            sp = scrubs[i] if i < len(scrubs) and scrubs[i] and os.path.exists(scrubs[i]) else None
-            c1, c2 = st.columns([2, 1])
-            with c1: st.video(sp if sp else vu)
+    # ── Show final videos ──────────────────────────────────────────────────
+    done_reels = [br for br in batch if br.get("final_url")]
+    if done_reels:
+        st.markdown(f"**\U0001f389 Final Videos ({len(done_reels)})**")
+        for br in done_reels:
+            idx      = br["idx"]
+            scrubbed = br.get("scrubbed_path")
+            c1, c2   = st.columns([2, 1])
+            with c1:
+                st.video(scrubbed if scrubbed and os.path.exists(scrubbed) else br["final_url"])
             with c2:
-                st.markdown(f"**Video #{i+1}**")
-                if sp:
-                    with open(sp, "rb") as _sf:
+                st.markdown(f"**#{idx+1} \u00b7 {br['author']}**")
+                if scrubbed and os.path.exists(scrubbed):
+                    with open(scrubbed, "rb") as _sf:
                         st.download_button("\u2b07\ufe0f Download Scrubbed",
-                            data=_sf.read(), file_name=f"twhales_clean_{i+1}.mp4",
-                            mime="video/mp4", use_container_width=True, key=f"dl_s_{i}")
+                            data=_sf.read(), file_name=f"twhales_clean_{idx+1}.mp4",
+                            mime="video/mp4", use_container_width=True, key=f"dl_s_{idx}")
                     st.success("\u2705 \u039a\u03b1\u03b8\u03b1\u03c1\u03cc!")
                 else:
                     try:
-                        import requests as _rq0
+                        import requests as _rq
+                        _vb = _rq.get(br["final_url"], timeout=30).content
                         st.download_button("\u2b07\ufe0f Download MP4",
-                            data=_rq0.get(vu, timeout=30).content,
-                            file_name=f"twhales_{i+1}.mp4",
-                            mime="video/mp4", use_container_width=True, key=f"dl_r_{i}")
-                    except Exception: st.markdown(f"[\u2b07\ufe0f Download]({vu})")
+                            data=_vb, file_name=f"twhales_{idx+1}.mp4",
+                            mime="video/mp4", use_container_width=True, key=f"dl_{idx}")
+                    except Exception:
+                        st.markdown(f"[\u2b07\ufe0f Download]({br['final_url']})")
             st.markdown("---")
 
+        for br in batch:
+            if br.get("status") == "error" and br.get("approved"):
+                st.error(f"\u274c #{br.get('idx',0)+1}: {br.get('error','')}")
+
+        # ── Scrub & Clean ─────────────────────────────────────────────────
+        st.markdown("---")
         st.markdown("### \U0001f9fc T-WHALES Digital Scrubbing & Cleaning")
-        with st.expander("Γιατί είναι απαραίτητο αυτό;"):
-            st.markdown("""Με τις εντολές που χρησιμοποιούμε μέσω του FFmpeg, πετυχαίνεις έναν πλήρη «ψηφιακό καθαρισμό» του περιεχομένου σου. Η χρήση αυτής της διαδικασίας είναι κρίσιμη για τη διαχείριση περιεχομένου στα social media και για την αποφυγή περιορισμών από αλγόριθμους ανίχνευσης.
+        with st.expander("\u0393\u03b9\u03b1\u03c4\u03af \u03b5\u03af\u03bd\u03b1\u03b9 \u03b1\u03c0\u03b1\u03c1\u03b1\u03af\u03c4\u03b7\u03c4\u03bf \u03b1\u03c5\u03c4\u03cc;"):
+            st.markdown("""\u039c\u03b5 \u03c4\u03b9\u03c2 \u03b5\u03bd\u03c4\u03bf\u03bb\u03ad\u03c2 \u03c0\u03bf\u03c5 \u03c7\u03c1\u03b7\u03c3\u03b9\u03bc\u03bf\u03c0\u03bf\u03b9\u03bf\u03cd\u03bc\u03b5 \u03bc\u03ad\u03c3\u03c9 \u03c4\u03bf\u03c5 FFmpeg, \u03c0\u03b5\u03c4\u03c5\u03c7\u03b1\u03af\u03bd\u03b5\u03b9\u03c2 \u03ad\u03bd\u03b1\u03bd \u03c0\u03bb\u03ae\u03c1\u03b7 '\u03c8\u03b7\u03c6\u03b9\u03b1\u03ba\u03cc \u03ba\u03b1\u03b8\u03b1\u03c1\u03b9\u03c3\u03bc\u03cc' \u03c4\u03bf\u03c5 \u03c0\u03b5\u03c1\u03b9\u03b5\u03c7\u03bf\u03bc\u03ad\u03bd\u03bf\u03c5 \u03c3\u03bf\u03c5.
 
-Αναλυτικά, η χρήση και τα οφέλη αυτής της μεθόδου είναι:
+* **Fingerprint Scrubbing:** noise=c0s=12:c0f=t \u03b1\u03bb\u03bb\u03ac\u03b6\u03b5\u03b9 \u03ba\u03ac\u03b8\u03b5 pixel \u03ce\u03c3\u03c4\u03b5 \u03bf\u03b9 \u03b1\u03bb\u03b3\u03cc\u03c1\u03b9\u03b8\u03bc\u03bf\u03b9 \u03bd\u03b1 \u03bc\u03b7\u03bd \u03b1\u03bd\u03b1\u03b3\u03bd\u03c9\u03c1\u03af\u03b6\u03bf\u03c5\u03bd \u03b1\u03bd\u03c4\u03af\u03b3\u03c1\u03b1\u03c6\u03bf.
+* **Metadata Removal:** -map_metadata -1 \u03b4\u03b9\u03b1\u03b3\u03c1\u03ac\u03c6\u03b5\u03b9 EXIF data, GPS, camera.
+* **C2PA Removal:** -bitexact \u03b1\u03c6\u03b1\u03b9\u03c1\u03b5\u03af \u03c8\u03b7\u03c6\u03b9\u03b1\u03ba\u03ad\u03c2 \u03c5\u03c0\u03bf\u03b3\u03c1\u03b1\u03c6\u03ad\u03c2 \u03c0\u03c1\u03bf\u03ad\u03bb\u03b5\u03c5\u03c3\u03b7\u03c2.
+* **T-WHALES \U0001f40b:** \u03a4\u03bf \u03c5\u03bb\u03b9\u03ba\u03cc \u03b5\u03af\u03bd\u03b1\u03b9 '\u03c6\u03c1\u03ad\u03c3\u03ba\u03bf' \u03b3\u03b9\u03b1 \u03c4\u03b9\u03c2 \u03c0\u03bb\u03b1\u03c4\u03c6\u03cc\u03c1\u03bc\u03b5\u03c2.""")
 
-* **Απόκρυψη Ψηφιακού Αποτυπώματος (Fingerprint Scrubbing):** Η εντολή noise=c0s=12:c0f=t προσθέτει ανεπαίσθητο θόρυβο σε κάθε καρέ του βίντεο. Αυτό αλλάζει μαθηματικά τα δεδομένα κάθε pixel, καθιστώντας αδύνατο για τους αλγόριθμους να αναγνωρίσουν το βίντεο ως 'αντίγραφο' ενός άλλου.
-* **Πλήρης Αφαίρεση Μεταδεδομένων (Metadata Removal):** Με το -map_metadata -1, διαγράφονται όλες οι κρυφές πληροφορίες (EXIF data). Αυτό περιλαμβάνει την ημερομηνία λήψης, το μοντέλο της κάμερας, τις συντεταγμένες GPS και οποιοδήποτε άλλο στοιχείο θα μπορούσε να συνδέσει το αρχείο με την αρχική πηγή ή τοποθεσία.
-* **Απενεργοποίηση Ψηφιακών Πιστοποιητικών (C2PA/Content Credentials):** Χρησιμοποιώντας το -bitexact, αφαιρούνται τα πρόσθετα δεδομένα που ενσωματώνουν συσκευές για την πιστοποίηση της προέλευσης του περιεχομένου, όπως το C2PA. Με αυτόν τον τρόπο, το αρχείο εμφανίζεται ως «ουδέτερο» και χωρίς ιστορικό.
-* **Βελτιστοποίηση για το T-WHALES 🐋:** Για ένα project όπως το T-WHALES, αυτός ο καθαρισμός εξασφαλίζει ότι το υλικό που ανεβάζεις είναι 'φρέσκο' στα μάτια των πλατφορμών, επιτρέποντας την απρόσκοπτη ροή του περιεχομένου σου χωρίς να ενεργοποιούνται φίλτρα προστασίας πνευματικών δικαιωμάτων ή αυτόματου περιορισμού.""")
-        # BUG 2 FIX: download + FFmpeg for each video individually
-        import requests as _rqs2, shutil as _sh2
-        while len(scrubs) < len(ready): scrubs.append(None)
-        all_done = all(p and os.path.exists(p) for p in scrubs)
+        # Download + scrub per file
+        import requests as _rqs, shutil as _sh
+        for br in done_reels:
+            if not br.get("local_final_path") and br.get("final_url"):
+                try:
+                    _rv2 = _rqs.get(br["final_url"], timeout=60)
+                    _lp = f"/tmp/twhales_final_{br['idx']}.mp4"
+                    with open(_lp, "wb") as _fh: _fh.write(_rv2.content)
+                    br["local_final_path"] = _lp
+                except Exception: br["local_final_path"] = None
 
-        if not all_done:
+        all_scrubbed = all(br.get("scrubbed_path") and os.path.exists(br.get("scrubbed_path",""))
+                           for br in done_reels)
+        can_scrub = any(br.get("local_final_path") and os.path.exists(br.get("local_final_path",""))
+                        and not br.get("scrubbed_path") for br in done_reels)
+
+        if not all_scrubbed:
             if st.button("\U0001f9fc Run Scrub & Clean \U0001f40b", type="primary",
-                         use_container_width=True):
-                with st.spinner("\U0001f9fc Scrubbing & Cleaning..."):
-                    for i, vu in enumerate(ready):
-                        if scrubs[i] and os.path.exists(scrubs[i]): continue
-                        raw = "/tmp/twhales_ready_" + str(i) + ".mp4"
-                        try:
-                            r2 = _rqs2.get(vu, timeout=90, stream=True); r2.raise_for_status()
-                            with open(raw, "wb") as _fh:
-                                for ch in r2.iter_content(65536): _fh.write(ch)
-                        except Exception as _de:
-                            st.error("\u274c Download #" + str(i+1) + ": " + str(_de)); continue
-                        out = "/tmp/twhales_scrubbed_" + str(i) + ".mp4"
-                        ffb = _sh2.which("ffmpeg") or "ffmpeg"
-                        res2 = subprocess.run(
-                            [ffb, "-y", "-i", raw,
+                         use_container_width=True, disabled=not can_scrub):
+                with st.spinner("\U0001f9fc Scrubbing..."):
+                    for br in done_reels:
+                        _lp2 = br.get("local_final_path")
+                        if not _lp2 or not os.path.exists(_lp2) or br.get("scrubbed_path"):
+                            continue
+                        out = f"/tmp/twhales_scrubbed_{br['idx']}.mp4"
+                        ffb = _sh.which("ffmpeg") or "ffmpeg"
+                        r2 = subprocess.run(
+                            [ffb, "-y", "-i", _lp2,
                              "-vf", "noise=c0s=12:c0f=t",
-                             "-map_metadata", "-1",
-                             "-bitexact",
+                             "-map_metadata", "-1", "-bitexact",
                              "-c:v", "libx264", "-preset", "fast", "-crf", "23",
                              "-c:a", "copy", out],
                             capture_output=True, timeout=300)
-                        if res2.returncode != 0:
-                            st.error("\u274c FFmpeg #" + str(i+1) + ": " +
-                                     res2.stderr.decode(errors="ignore")[-200:])
+                        if r2.returncode == 0:
+                            br["scrubbed_path"] = out
                         else:
-                            scrubs[i] = out
+                            st.error(f"\u274c FFmpeg #{br['idx']+1}: " +
+                                     r2.stderr.decode(errors="ignore")[-200:])
                 st.rerun()
         else:
             st.success("\u2705 \u03a4\u03bf \u03b2\u03af\u03bd\u03c4\u03b5\u03bf \u03b5\u03af\u03bd\u03b1\u03b9 \u03ba\u03b1\u03b8\u03b1\u03c1\u03cc \u03ba\u03b1\u03b9 \u03ad\u03c4\u03bf\u03b9\u03bc\u03bf!")
@@ -1308,9 +1303,8 @@ def render_final():
             st.session_state.ready_videos    = []
             st.session_state.scrubbed_videos = []
             st.session_state.step = 1; st.rerun()
-
     else:
-        st.info("\u23f3 No videos yet. Paste source URLs above and click Generate.")
+        st.info("\u23f3 No videos generated yet. Complete Steps 1-3 first.")
         if st.button("\u2190 Back to Review", use_container_width=True):
             st.session_state.step = 3; st.rerun()
 
