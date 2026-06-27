@@ -935,102 +935,79 @@ def _start_pipeline(reel: dict):
 # STEP 2 — FRAME SELECTION
 # ─────────────────────────────────────────────────────────────
 def render_frame_selection():
-    _ref = "/tmp/whale_ref_face.jpg"
-    if not st.session_state.creator_bytes and os.path.exists(_ref):
-        with open(_ref,"rb") as _f: st.session_state.creator_bytes = _f.read()
-    if not st.session_state.creator_bytes:
-        st.markdown("**\U0001f464 Reference Photo** \u2014 Upload once, saved for all reels")
-        _up = st.file_uploader("Upload face", type=["jpg","jpeg","png"],
-                               label_visibility="collapsed", key="face_upload")
-        if _up:
-            _d = _up.read(); st.session_state.creator_bytes = _d
-            with open(_ref,"wb") as _f: _f.write(_d)
-            st.rerun()
-        st.stop()
-
     batch = st.session_state.batch_reels
+
     if not batch:
-        st.markdown("**\U0001f4cb Paste your URLs here to start**")
-        _urls_direct = st.text_area("URLs (one per line)",
-            placeholder="https://www.instagram.com/reel/...\nhttps://www.tiktok.com/...",
-            height=120, key="direct_url_input")
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("\U0001f680 Start Pipeline", type="primary", use_container_width=True):
-                urls = [u.strip() for u in _urls_direct.splitlines() if u.strip().startswith("http")]
-                for u in urls:
-                    fake = {"url":u,"video_url":u,"author":u[:40],"title":u[:60],"id":u[-12:],
-                            "code":"","thumbnail":"","views":0,"likes":0,"comments":0,"engagement":0,
-                            "platform":"TikTok" if "tiktok" in u.lower() else "Instagram"}
-                    st.session_state.batch_reels.append(_make_batch_reel(fake, u))
-                if st.session_state.batch_reels:
-                    st.rerun()
-                else:
-                    st.warning("\u26a0\ufe0f Paste at least one valid URL")
-        with c2:
-            if st.button("\u2190 Back to Discovery", use_container_width=True):
-                st.session_state.step=1; st.rerun()
+        st.warning("No reels in batch. Go back and add some URLs.")
+        if st.button("\u2190 Back to Discovery"):
+            st.session_state.step = 1; st.rerun()
         return
 
-    needs_dl = [br for br in batch if br["status"]=="queued"]
+    needs_dl = [br for br in batch if br["status"] == "queued"]
     if needs_dl:
         prog = st.progress(0); ph = st.empty()
         total = len(batch)
-        done_n = sum(1 for b in batch if b["status"] not in ("queued","downloading"))
+        done_n = sum(1 for b in batch if b["status"] not in ("queued", "downloading"))
         for br in needs_dl:
             br["status"] = "downloading"
             ph.info(f"\u2b07\ufe0f Downloading {done_n+1}/{total}: {br['author']}")
             try:
                 p = download_video(br["url"])
-                dur,_,_ = get_video_info(p)
-                br["video_path"]=p; br["duration"]=dur; br["status"]="ready"
+                dur, _, _ = get_video_info(p)
+                br["video_path"] = p; br["duration"] = dur; br["status"] = "ready"
             except Exception as e:
-                br["status"]="error"; br["error"]=str(e)[:120]
-            done_n+=1; prog.progress(done_n/total)
+                br["status"] = "error"; br["error"] = str(e)[:120]
+            done_n += 1; prog.progress(done_n / total)
         prog.empty(); ph.empty(); st.rerun()
 
     st.markdown(f"**\U0001f39e Select Frames \u2014 {len(batch)} reel(s)**")
-    all_framed = all(br.get("frame_b64") for br in batch if br["status"]!="error")
+    all_framed = all(br.get("frame_b64") for br in batch if br["status"] != "error")
 
     for br in batch:
         idx = br["idx"]
         with st.container():
             st.markdown(f"**#{idx+1} \u00b7 {br['author']}**")
-            if br["status"]=="error":
+            if br["status"] == "error":
                 st.error(f"\u274c {br['error']}"); st.markdown("---"); continue
             path = br.get("video_path")
             if not path or not os.path.exists(str(path)):
                 st.warning("Video not ready"); st.markdown("---"); continue
             ai = extract_frame(path, 0.0)
-            c1,c2 = st.columns([1,3])
+            c1, c2 = st.columns([1, 3])
             with c1:
-                if ai: st.image(ai, width=130, caption="First frame")
-                else:  st.caption("\u26a0\ufe0f No frame")
+                if ai:
+                    st.image(ai, width=130, caption="First frame")
+                else:
+                    st.caption("\u26a0\ufe0f No frame")
             with c2:
                 if ai and not br.get("frame_b64"):
-                    br["frame_b64"]=to_b64(ai); br["frame_time"]=0.0
+                    br["frame_b64"] = to_b64(ai); br["frame_time"] = 0.0
                 if br.get("frame_b64"):
                     st.markdown('<div style="color:#34d399;font-size:12px;font-weight:600">\u2705 Frame selected</div>', unsafe_allow_html=True)
                 with st.expander("\U0001f3fb Choose different frame", expanded=False):
-                    dur = br.get("duration",60.0)
-                    ft = st.slider("", 0.0, max(0.1,dur-0.1), float(br.get("frame_time",0.0)),
-                                   0.5, format="%.1f s", label_visibility="collapsed", key=f"sl_{idx}")
-                    if abs(ft-br.get("frame_time",0.0))>0.09:
-                        br["frame_time"]=ft; st.rerun()
+                    dur = br.get("duration", 60.0)
+                    ft = st.slider("", 0.0, max(0.1, dur - 0.1),
+                                   float(br.get("frame_time", 0.0)),
+                                   0.5, format="%.1f s",
+                                   label_visibility="collapsed", key=f"sl_{idx}")
+                    if abs(ft - br.get("frame_time", 0.0)) > 0.09:
+                        br["frame_time"] = ft; st.rerun()
                     cfb = extract_frame(path, ft)
                     if cfb:
                         st.image(cfb, width=120, caption=f"@ {ft:.1f}s")
                         if st.button("\u2705 Use", key=f"ucf_{idx}", use_container_width=True):
-                            br["frame_b64"]=to_b64(cfb); br["frame_time"]=ft; st.rerun()
+                            br["frame_b64"] = to_b64(cfb); br["frame_time"] = ft; st.rerun()
             st.markdown("---")
 
     if st.button("\u2728 Generate All Faceswaps \u2192", type="primary",
                  use_container_width=True, disabled=not all_framed):
-        st.session_state.step=3; st.rerun()
-    if not all_framed: st.caption("\u26a0\ufe0f All reels need a frame selected")
+        st.session_state.step = 3; st.rerun()
+    if not all_framed:
+        st.caption("\u26a0\ufe0f All reels need a frame selected")
     st.markdown("<div style='height:6px'/>", unsafe_allow_html=True)
     if st.button("\u2190 Back to Discovery", use_container_width=True):
-        st.session_state.step=1; st.rerun()
+        st.session_state.step = 1; st.rerun()
+
 
 def render_review():
     batch = st.session_state.batch_reels
