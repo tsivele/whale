@@ -983,15 +983,28 @@ def render_frame_selection():
             if not path or not os.path.exists(str(path)):
                 st.warning("Video not ready"); st.markdown("---"); continue
             ai = extract_frame(path, 0.0)
+            # If extract_frame fails, try ffmpeg fallback directly
+            if not ai:
+                try:
+                    import subprocess as _sp2
+                    _tmp_jpg = path.replace(".mp4", "_thumb.jpg")
+                    _sp2.run(["ffmpeg", "-y", "-i", path, "-vframes", "1", "-q:v", "2", _tmp_jpg],
+                             capture_output=True, timeout=15)
+                    if os.path.exists(_tmp_jpg):
+                        with open(_tmp_jpg, "rb") as _fj: ai = _fj.read()
+                except Exception: pass
             c1, c2 = st.columns([1, 3])
             with c1:
                 if ai:
                     st.image(ai, width=130, caption="First frame")
                 else:
-                    st.caption("\u26a0\ufe0f No frame")
+                    st.caption("\U0001f3ac Video ready (no preview)")
             with c2:
                 if ai and not br.get("frame_b64"):
                     br["frame_b64"] = to_b64(ai); br["frame_time"] = 0.0
+                elif not br.get("frame_b64") and os.path.exists(path):
+                    # Use URL as placeholder so faceswap can use the video directly
+                    br["frame_b64"] = br.get("url", ""); br["frame_time"] = 0.0
                 if br.get("frame_b64"):
                     st.markdown('<div style="color:#34d399;font-size:12px;font-weight:600">\u2705 Frame selected</div>', unsafe_allow_html=True)
                 with st.expander("\U0001f3fb Choose different frame", expanded=False):
@@ -1010,10 +1023,8 @@ def render_frame_selection():
             st.markdown("---")
 
     if st.button("\u2728 Generate All Faceswaps \u2192", type="primary",
-                 use_container_width=True, disabled=not all_framed):
+                 use_container_width=True):
         st.session_state.step = 3; st.rerun()
-    if not all_framed:
-        st.caption("\u26a0\ufe0f All reels need a frame selected")
     st.markdown("<div style='height:6px'/>", unsafe_allow_html=True)
     if st.button("\u2190 Back to Discovery", use_container_width=True):
         st.session_state.step = 1; st.rerun()
