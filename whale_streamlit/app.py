@@ -943,12 +943,17 @@ def render_frame_selection():
             st.session_state.step = 1; st.rerun()
         return
 
+    # Safety: filter out any non-dict elements from corrupted session state
+    st.session_state.batch_reels = [b for b in st.session_state.batch_reels if isinstance(b, dict)]
+    batch = st.session_state.batch_reels
+
     # Reset reels stuck with NoneType error (from missing reference photo)
     for br in batch:
-        if br.get("error","").startswith("a bytes-like object"):
+        err = br.get("error") or ""
+        if isinstance(err, str) and "bytes-like" in err:
             br["status"] = "ready"; br["error"] = None; br["swapped_url"] = None
 
-    needs_dl = [br for br in batch if br["status"] == "queued"]
+    needs_dl = [br for br in batch if br.get("status") == "queued"]
     if needs_dl:
         prog = st.progress(0); ph = st.empty()
         total = len(batch)
@@ -1035,14 +1040,19 @@ def render_review():
             st.session_state.step = 2; st.rerun()
         return
 
-    # Reset reels that failed with NoneType (missing reference photo)
+    # Safety: filter corrupted session state
+    st.session_state.batch_reels = [b for b in st.session_state.batch_reels if isinstance(b, dict)]
+    batch = st.session_state.batch_reels
+
+    # Reset reels stuck with NoneType error
     for br in batch:
-        if br.get("error","").startswith("a bytes-like object"):
+        err = br.get("error") or ""
+        if isinstance(err, str) and "bytes-like" in err:
             br["status"] = "ready"; br["error"] = None; br["swapped_url"] = None
 
     needs_swap = [br for br in batch
                   if br.get("frame_b64") and not br.get("swapped_url")
-                  and br["status"] not in ("error","faceswapping","done")]
+                  and br.get("status") not in ("error","faceswapping","done")]
     if needs_swap:
         prog = st.progress(0); ph = st.empty()
         total_app = len([b for b in batch if b.get("frame_b64")])
