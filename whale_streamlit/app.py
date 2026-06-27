@@ -1002,14 +1002,12 @@ def render_frame_selection():
             with c2:
                 if ai and not br.get("frame_b64"):
                     br["frame_b64"] = to_b64(ai); br["frame_time"] = 0.0
-                elif not br.get("frame_b64") and os.path.exists(path):
-                    # Use URL as placeholder so faceswap can use the video directly
-                    br["frame_b64"] = br.get("url", ""); br["frame_time"] = 0.0
+
                 if br.get("frame_b64"):
                     st.markdown('<div style="color:#34d399;font-size:12px;font-weight:600">\u2705 Frame selected</div>', unsafe_allow_html=True)
                 with st.expander("\U0001f3fb Choose different frame", expanded=False):
                     dur = br.get("duration", 60.0)
-                    ft = st.slider("", 0.0, max(0.1, dur - 0.1),
+                    ft = st.slider("Frame time", 0.0, max(0.1, dur - 0.1),
                                    float(br.get("frame_time", 0.0)),
                                    0.5, format="%.1f s",
                                    label_visibility="collapsed", key=f"sl_{idx}")
