@@ -613,20 +613,49 @@ elif st.session_state.step == 4:
         st.session_state.step = 3
         st.rerun()
 session_state.final_path = final_path
-                status.empty()
-                st.rerun()
-            except Exception as e:
-                st.error(f"Σφάλμα: {e}")
-    else:
-        st.success("🎉 Pipeline ολοκληρώθηκε! Καθαρό από AI marks, C2PA metadata, με film grain.")
-        st.video(st.session_state.final_path)
-        with open(st.session_state.final_path, "rb") as f:
-            st.download_button("⬇ Download Final MP4", f, file_name="whale_final.mp4", mime="video/mp4",
-                                type="primary")
+      # Υποθετικό if που ελέγχει σε ποιο βήμα (step) βρισκόμαστε
+if st.session_state.step == 1:
+    try:
+        # ... (εδώ μπαίνει ο κώδικας της επεξεργασίας) ...
+        status.empty()
+        st.session_state.step = 2 # Προχωράμε στο επόμενο βήμα πριν το rerun
+        st.rerun()
+    except Exception as e:
+        st.error(f"Σφάλμα: {e}")
 
-        if st.button("🔄 Νέο Video"):
-            for k in ["video_path", "video_dur", "frame_options", "frame_b64",
-                      "swapped_url", "gen_url", "final_path", "ig_url", "motion_video_path"]:
+# Όταν ολοκληρωθεί το pipeline, εμφανίζουμε το αποτέλεσμα 🐋
+elif st.session_state.step == 2:
+    st.success("🎉 Pipeline ολοκληρώθηκε! Καθαρό από AI marks, C2PA metadata, με film grain.")
+    
+    # Εμφάνιση του βίντεο
+    st.video(st.session_state.final_path)
+    
+    # Κουμπί για Download
+    with open(st.session_state.final_path, "rb") as f:
+        st.download_button(
+            label="⬇ Download Final MP4", 
+            data=f, 
+            file_name="whale_final.mp4", 
+            mime="video/mp4",
+            type="primary"
+        )
+
+    # Κουμπί για Reset (Νέο Video)
+    if st.button("🔄 Νέο Video"):
+        # Λίστα με τα κλειδιά που πρέπει να καθαριστούν
+        keys_to_reset = [
+            "video_path", "video_dur", "frame_options", "frame_b64",
+            "swapped_url", "gen_url", "final_path", "ig_url", "motion_video_path"
+        ]
+        
+        # Ασφαλής τρόπος: Διαγράφουμε τα κλειδιά από το session_state
+        # Ή τα επαναφέρουμε με .get() για να αποφύγουμε KeyError
+        for k in keys_to_reset:
+            if k in st.session_state and k in defaults:
                 st.session_state[k] = defaults[k]
-            st.session_state.step = 1
-            st.rerun()  
+            elif k in st.session_state:
+                del st.session_state[k]
+                
+        # Επιστροφή στο αρχικό βήμα και rerun
+        st.session_state.step = 1
+        st.rerun()
