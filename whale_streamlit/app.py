@@ -612,7 +612,7 @@ elif st.session_state.step == 4:
     if st.button("← Πίσω"):
         st.session_state.step = 3
         st.rerun()
-st.session_state.final_path = final_path
+st.session_state.final_path = locals().get('final_path', 'default_path.mp4')
       # Υποθετικό if που ελέγχει σε ποιο βήμα (step) βρισκόμαστε
 if st.session_state.step == 1:
     try:
