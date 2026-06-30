@@ -47,7 +47,7 @@ hr{border-color:#222!important;}
 </style>
 """, unsafe_allow_html=True)
 
-WS_API = "wsk_live_twkay-EgRjNULTtKrhxKbBQ1PRYpsF0ZIF5yR6JCFbA"
+WS_API = "https://api.wavespeed.ai/api/v3"
 HIKER_API  = "https://api.hikerapi.com/v2/media/info/by/url"
 APIFY_BASE = "https://api.apify.com/v2"
 APIFY_ACTOR = "apify~instagram-reel-scraper"   # Official, free with credits, no rental needed
