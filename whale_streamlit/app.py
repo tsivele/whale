@@ -74,9 +74,7 @@ DEFAULT_FACE_SWAP_PROMPT = (
 )
 
 DEFAULT_VIDEO_PROMPT = (
-    "Cinematic ambient video. Slow smooth camera push-in. "
-    "Subtle ambient motion, gentle light rays, depth-of-field bokeh. "
-    "Vertical 9:16. No text, no overlays."
+    "Animate the character from the reference image using the exact motion from the driving video. The character identity must remain exactly as shown in the reference image throughout every single frame — never drift toward or blend with any person from the driving video. Lip-sync is the top priority: replicate every mouth shape, jaw movement, and lip position frame-by-frame to match the original audio and speech timing with perfect accuracy. Transfer all body movements precisely: shoulder shifts, head tilts, arm gestures, hand positions, and torso motion must mirror the driving video exactly. If the person in the driving video is holding any object — a phone, microphone, drink, prop, or anything else — the character must also be holding that same object in the same hand position throughout. Maintain consistent character appearance, clothing, and all visible features in every frame."
 )
 
 MODELS = {
@@ -592,10 +590,13 @@ elif st.session_state.step == 3:
                          "duration": 5, "resolution": "1080p", "seed": -1},
                     )
                 else:  # kling
+                    with open(st.session_state.video_path, "rb") as f:
+                        video_b64 = to_b64(f.read(), mime="video/mp4")
                     pred_id = ws_submit(
                         "kwaivgi/kling-v3.0-pro/motion-control",
                         {
                             "image": st.session_state.swapped_url,
+                            "video": video_b64,
                             "prompt": prompt,
                             "duration": 5,
                             "aspect_ratio": "9:16",
