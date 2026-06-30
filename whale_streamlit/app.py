@@ -48,7 +48,7 @@ hr{border-color:#222!important;}
 """, unsafe_allow_html=True)
 
 APIFY_KEY = "apify_api_NGZAc1YjIoPbEcvTFFVQMc1KCurD2J1uWF9C"
-HIKER_KEY = "al5ljq13xjh5l8as6vyxx1wn5178evn7"
+HIKER_KEY = "cny9uet9isrlaujqia0cxcgz54xjg1k6"
 WS_KEY = "wsk_live_01W2XsbCVV54Ds8xJum2p4vklrGRrDbL99IMCVcyNPw"
 
 GRAIN_PROMPT = (
