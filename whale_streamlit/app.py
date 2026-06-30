@@ -156,6 +156,26 @@ with st.sidebar:
             except Exception as e:
                 st.error(str(e))
 
+    if st.button("⚡ Test Wavespeed Key"):
+        if not WS_KEY:
+            st.error("Βάλε Wavespeed key πρώτα")
+        else:
+            try:
+                _base = WS_API if WS_API.startswith("http") else "https://api.wavespeed.ai/api/v3"
+                r = requests.get(
+                    f"{_base}/models",
+                    headers={"Authorization": f"Bearer {WS_KEY}"},
+                    timeout=15,
+                )
+                if r.status_code == 200:
+                    st.success("✅ Wavespeed key λειτουργεί!")
+                elif r.status_code == 401:
+                    st.error(f"❌ 401 Unauthorized — λάθος ή expired key: {r.text[:200]}")
+                else:
+                    st.warning(f"HTTP {r.status_code}: {r.text[:200]}")
+            except Exception as e:
+                st.error(str(e))
+
     st.markdown("---")
     st.markdown("**Creator photo**")
     creator_file = st.file_uploader("Upload φωτό", type=["jpg","jpeg","png"], key="creator_upload")
@@ -182,13 +202,17 @@ def to_b64(image_bytes, mime="image/jpeg"):
 # WAVESPEED HELPERS
 # ──────────────────────────────────────────────────────────
 def ws_submit(endpoint, payload):
+    _base = WS_API if WS_API.startswith("http") else "https://api.wavespeed.ai/api/v3"
     r = requests.post(
-        f"{WS_API}/{endpoint}",
+        f"{_base}/{endpoint}",
         headers={"Authorization": f"Bearer {WS_KEY}", "Content-Type": "application/json"},
         json=payload,
         timeout=30,
     )
-    r.raise_for_status()
+    if r.status_code == 401:
+        raise RuntimeError(f"Wavespeed 401 Unauthorized — το API key είναι λάθος ή έχει λήξει. Έλεγξε το key στο sidebar.\nResponse: {r.text[:300]}")
+    if not r.ok:
+        raise RuntimeError(f"Wavespeed {r.status_code}: {r.text[:300]}")
     data = r.json()
     pred_id = data.get("data", {}).get("id")
     if not pred_id:
@@ -197,10 +221,11 @@ def ws_submit(endpoint, payload):
 
 
 def ws_poll(pred_id, status_box):
+    _base = WS_API if WS_API.startswith("http") else "https://api.wavespeed.ai/api/v3"
     for i in range(150):
         time.sleep(4)
         r = requests.get(
-            f"{WS_API}/predictions/{pred_id}/result",
+            f"{_base}/predictions/{pred_id}/result",
             headers={"Authorization": f"Bearer {WS_KEY}"},
             timeout=30,
         )
@@ -567,15 +592,15 @@ elif st.session_state.step == 3:
                          "duration": 5, "resolution": "1080p", "seed": -1},
                     )
                 else:  # kling
-                    with open(st.session_state.video_path, "rb") as f:
-                        video_b64 = to_b64(f.read(), mime="video/mp4")
                     pred_id = ws_submit(
                         "kwaivgi/kling-v3.0-pro/motion-control",
                         {
                             "image": st.session_state.swapped_url,
-                            "video": video_b64,
-                            "character_orientation": "video",
                             "prompt": prompt,
+                            "duration": 5,
+                            "aspect_ratio": "9:16",
+                            "cfg_scale": 0.5,
+                            "seed": -1,
                         },
                     )
                 result = ws_poll(pred_id, status)
