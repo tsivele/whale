@@ -48,9 +48,8 @@ hr{border-color:#222!important;}
 """, unsafe_allow_html=True)
 
 APIFY_KEY = "apify_api_NGZAc1YjIoPbEcvTFFVQMc1KCurD2J1uWF9C"
-HIKER_KEY = "zw9usO0t8j3aiimwvjvd3600iqelqj8x"
+HIKER_KEY = "al5ljq13xjh5l8as6vyxx1wn5178evn7"
 WS_KEY = "wsk_live_01W2XsbCVV54Ds8xJum2p4vklrGRrDbL99IMCVcyNPw"
-APIFY_ACTOR = "apify~instagram-reel-scraper"   # Official, free with credits, no rental needed
 
 GRAIN_PROMPT = (
     "Add subtle 1% natural film grain texture across all frames uniformly. "
