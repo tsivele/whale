@@ -3,6 +3,7 @@ import requests
 import subprocess
 import tempfile
 import os
+import shutil
 import time
 import base64
 
@@ -63,7 +64,9 @@ DEFAULT_FACE_SWAP_PROMPT = (
 )
 
 DEFAULT_VIDEO_PROMPT = (
-    "Animate the character from the reference image using the exact motion from the driving video. The character identity must remain exactly as shown in the reference image throughout every single frame — never drift toward or blend with any person from the driving video. Lip-sync is the top priority: replicate every mouth shape, jaw movement, and lip position frame-by-frame to match the original audio and speech timing with perfect accuracy. Transfer all body movements precisely: shoulder shifts, head tilts, arm gestures, hand positions, and torso motion must mirror the driving video exactly. If the person in the driving video is holding any object — a phone, microphone, drink, prop, or anything else — the character must also be holding that same object in the same hand position throughout. Maintain consistent character appearance, clothing, and all visible features in every frame."
+    "Cinematic ambient video. Slow smooth camera push-in. "
+    "Subtle ambient motion, gentle light rays, depth-of-field bokeh. "
+    "Vertical 9:16. No text, no overlays."
 )
 
 MODELS = {
@@ -584,38 +587,45 @@ elif st.session_state.step == 3:
         c1, c2 = st.columns(2)
         with c1:
             if st.button("✅ Approve", type="primary"):
-                with st.spinner("Wiping metadata and running anti-detection cleaning..."):
-                    try:
-                        src = st.session_state.final_path
-                        base_dir = os.path.dirname(src)
-                        base_name = os.path.basename(src)
-                        clean_path = os.path.join(base_dir, f"clean_{base_name}")
+                if not shutil.which("ffmpeg"):
+                    st.error(
+                        "⚠️ Το FFmpeg δεν βρέθηκε στο σύστημα. "
+                        "Πρόσθεσέ το στο `packages.txt` (Streamlit Cloud) ή κάνε "
+                        "`brew install ffmpeg` (τοπικά) και κάνε redeploy/restart."
+                    )
+                else:
+                    with st.spinner("Wiping metadata and running anti-detection cleaning..."):
+                        try:
+                            src = st.session_state.final_path
+                            base_dir = os.path.dirname(src)
+                            base_name = os.path.basename(src)
+                            clean_path = os.path.join(base_dir, f"clean_{base_name}")
 
-                        # Native FFmpeg anti-detection pass: libx264 re-encode + full
-                        # metadata/chapter wipe + bit-exact muxing + optional grain texture.
-                        # No external c2pa/filmgrain binaries — those aren't installed anywhere.
-                        subprocess.run(
-                            [
-                                "ffmpeg", "-y", "-i", src,
-                                "-map_metadata", "-1",
-                                "-map_chapters", "-1",
-                                "-fflags", "+bitexact",
-                                "-flags:v", "+bitexact",
-                                "-flags:a", "+bitexact",
-                                "-c:v", "libx264", "-preset", "medium", "-crf", "23",
-                                "-vf", "noise=alls=10:allf=t",
-                                "-c:a", "aac",
-                                clean_path,
-                            ],
-                            check=True, capture_output=True,
-                        )
+                            # Native FFmpeg anti-detection pass: libx264 re-encode + full
+                            # metadata/chapter wipe + bit-exact muxing + optional grain texture.
+                            # No external c2pa/filmgrain binaries — those aren't installed anywhere.
+                            subprocess.run(
+                                [
+                                    "ffmpeg", "-y", "-i", src,
+                                    "-map_metadata", "-1",
+                                    "-map_chapters", "-1",
+                                    "-fflags", "+bitexact",
+                                    "-flags:v", "+bitexact",
+                                    "-flags:a", "+bitexact",
+                                    "-c:v", "libx264", "-preset", "medium", "-crf", "23",
+                                    "-vf", "noise=alls=10:allf=t",
+                                    "-c:a", "aac",
+                                    clean_path,
+                                ],
+                                check=True, capture_output=True,
+                            )
 
-                        st.session_state.post_processed_path = clean_path
-                        st.rerun()
-                    except (subprocess.CalledProcessError, OSError) as e:
-                        detail = e.stderr.decode(errors="ignore") if getattr(e, "stderr", None) else str(e)
-                        print(f"[post-processing failed] {e}\n{detail}")
-                        st.error(f"Post-processing απέτυχε: {e}")
+                            st.session_state.post_processed_path = clean_path
+                            st.rerun()
+                        except (subprocess.CalledProcessError, OSError) as e:
+                            detail = e.stderr.decode(errors="ignore") if getattr(e, "stderr", None) else str(e)
+                            print(f"[post-processing failed] {e}\n{detail}")
+                            st.error(f"Post-processing απέτυχε: {e}")
         with c2:
             if st.button("❌ Reject"):
                 st.session_state.gen_url = None
