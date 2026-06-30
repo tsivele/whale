@@ -47,9 +47,10 @@ hr{border-color:#222!important;}
 </style>
 """, unsafe_allow_html=True)
 
-APIFY_KEY = "apify_api_NGZAc1YjIoPbEcvTFFVQMc1KCurD2J1uWF9C"
-HIKER_KEY = "cny9uet9isrlaujqia0cxcgz54xjg1k6"
-WS_KEY = "wsk_live_01W2XsbCVV54Ds8xJum2p4vklrGRrDbL99IMCVcyNPw"
+WS_API = "https://api.wavespeed.ai/api/v3"
+HIKER_API  = "https://api.hikerapi.com/v2/media/info/by/url"
+APIFY_BASE = "https://api.apify.com/v2"
+APIFY_ACTOR = "apify~instagram-reel-scraper"   # Official, free with credits, no rental needed
 
 GRAIN_PROMPT = (
     "Add subtle 1% natural film grain texture across all frames uniformly. "
@@ -227,7 +228,7 @@ def hiker_get_video_url(ig_url):
     headers = {"x-access-key": HIKER_KEY, "accept": "application/json"}
 
     r = requests.get(
-        "https://api.hikerapi.com/v1/media/by/url",
+        HIKER_API,
         params={"url": ig_url},
         headers=headers,
         timeout=30,
@@ -241,8 +242,13 @@ def hiker_get_video_url(ig_url):
 
     data = r.json()
 
-    # HikerAPI v1 wraps the media object inside "media_or_ad"
-    media = data.get("media_or_ad") or data.get("media") or data
+    # v2 wraps in "data", v1 in "media_or_ad" or "media" — try all
+    media = (
+        data.get("data")
+        or data.get("media_or_ad")
+        or data.get("media")
+        or data
+    )
 
     candidates = [
         media.get("video_url"),
@@ -254,8 +260,8 @@ def hiker_get_video_url(ig_url):
             return c
 
     raise RuntimeError(
-        f"HikerAPI: no video URL inside media_or_ad. "
-        f"Media keys: {list(media.keys()) if isinstance(media, dict) else type(media)}"
+        f"HikerAPI: no video URL in response. "
+        f"Top-level keys: {list(data.keys()) if isinstance(data, dict) else type(data)}"
     )
 
 
