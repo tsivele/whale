@@ -7,15 +7,29 @@ import shutil
 import time
 import base64
 
-# Βάζει τα static ffmpeg/ffprobe binaries του πακέτου static-ffmpeg στο PATH
-# κατά την εκκίνηση του app, ώστε όλα τα subprocess calls (extract_frame,
-# get_duration, strip_metadata, το Approve pipeline) να δουλεύουν παντού,
-# χωρίς να εξαρτόμαστε από το αν το ffmpeg είναι ήδη εγκατεστημένο στο σύστημα.
-try:
-    import static_ffmpeg
-    static_ffmpeg.add_paths()
-except Exception:
-    pass
+def _find_bin(name):
+    import shutil as _sh
+    # 1) already on PATH (packages.txt installed it)
+    p = _sh.which(name)
+    if p:
+        return p
+    # 2) static-ffmpeg: download + inject bundled binaries into PATH
+    try:
+        import static_ffmpeg
+        static_ffmpeg.add_paths()
+        p = _sh.which(name)
+        if p:
+            return p
+    except Exception:
+        pass
+    # 3) common fixed paths (Streamlit Cloud / Debian)
+    for _p in [f"/usr/bin/{name}", f"/usr/local/bin/{name}", f"/bin/{name}"]:
+        if os.path.exists(_p):
+            return _p
+    return None
+
+FFMPEG_BIN  = _find_bin("ffmpeg")
+FFPROBE_BIN = _find_bin("ffprobe")
 
 
 # ── DEFAULT CREATOR PHOTO (pre-loaded) ────────────────────
@@ -339,7 +353,7 @@ def download_video_url(url):
 def get_duration(path):
     try:
         out = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", path],
+            [FFPROBE_BIN or "ffprobe", "-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", path],
             capture_output=True, text=True, timeout=10,
         )
         return float(out.stdout.strip())
@@ -358,7 +372,7 @@ def extract_frame(video_path, timestamp):
     # Try ffmpeg first
     try:
         result = subprocess.run(
-            ["ffmpeg", "-y", "-ss", str(timestamp), "-i", video_path,
+            [FFMPEG_BIN or "ffmpeg", "-y", "-ss", str(timestamp), "-i", video_path,
              "-frames:v", "1", "-q:v", "2", out_path],
             capture_output=True, timeout=30,
         )
@@ -399,7 +413,7 @@ def extract_frame(video_path, timestamp):
 def strip_metadata(in_path):
     out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
     subprocess.run(
-        ["ffmpeg", "-y", "-i", in_path, "-map_metadata", "-1", "-c", "copy", out_path],
+        [FFMPEG_BIN or "ffmpeg", "-y", "-i", in_path, "-map_metadata", "-1", "-c", "copy", out_path],
         capture_output=True,
     )
     return out_path
@@ -628,12 +642,10 @@ elif st.session_state.step == 3:
         c1, c2 = st.columns(2)
         with c1:
             if st.button("✅ Approve", type="primary"):
-                # Το static_ffmpeg.add_paths() (στην κορυφή του app.py) έχει ήδη
-                # προσθέσει το ffmpeg στο PATH κατά την εκκίνηση — απλός έλεγχος εδώ.
-                if not shutil.which("ffmpeg"):
+                if not FFMPEG_BIN:
                     st.error(
-                        "⚠️ Το FFmpeg δεν βρέθηκε στο PATH. Έλεγξε ότι το `requirements.txt` "
-                        "περιέχει `static-ffmpeg` και κάνε redeploy/restart."
+                        "⚠️ Το FFmpeg δεν βρέθηκε. Βεβαιώσου ότι το `packages.txt` περιέχει "
+                        "`ffmpeg` και το `requirements.txt` περιέχει `static-ffmpeg`, και κάνε redeploy."
                     )
                 else:
                     with st.spinner("Wiping metadata and running anti-detection cleaning..."):
@@ -643,12 +655,9 @@ elif st.session_state.step == 3:
                             base_name = os.path.basename(src)
                             clean_path = os.path.join(base_dir, f"clean_{base_name}")
 
-                            # Native FFmpeg anti-detection pass: libx264 re-encode + full
-                            # metadata/chapter wipe + bit-exact muxing + optional grain texture.
-                            # No external c2pa/filmgrain binaries — those aren't installed anywhere.
                             subprocess.run(
                                 [
-                                    "ffmpeg", "-y", "-i", src,
+                                    FFMPEG_BIN, "-y", "-i", src,
                                     "-map_metadata", "-1",
                                     "-map_chapters", "-1",
                                     "-fflags", "+bitexact",
