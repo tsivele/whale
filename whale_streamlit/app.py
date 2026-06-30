@@ -642,41 +642,47 @@ elif st.session_state.step == 3:
         c1, c2 = st.columns(2)
         with c1:
             if st.button("✅ Approve", type="primary"):
-                if not FFMPEG_BIN:
-                    st.error(
-                        "⚠️ Το FFmpeg δεν βρέθηκε. Βεβαιώσου ότι το `packages.txt` περιέχει "
-                        "`ffmpeg` και το `requirements.txt` περιέχει `static-ffmpeg`, και κάνε redeploy."
-                    )
-                else:
-                    with st.spinner("Wiping metadata and running anti-detection cleaning..."):
-                        try:
-                            src = st.session_state.final_path
-                            base_dir = os.path.dirname(src)
-                            base_name = os.path.basename(src)
-                            clean_path = os.path.join(base_dir, f"clean_{base_name}")
+                with st.spinner("Wiping metadata and running anti-detection cleaning..."):
+                    try:
+                        import av as _av
+                        src = st.session_state.final_path
+                        clean_path = os.path.join(os.path.dirname(src), f"clean_{os.path.basename(src)}")
 
-                            subprocess.run(
-                                [
-                                    FFMPEG_BIN, "-y", "-i", src,
-                                    "-map_metadata", "-1",
-                                    "-map_chapters", "-1",
-                                    "-fflags", "+bitexact",
-                                    "-flags:v", "+bitexact",
-                                    "-flags:a", "+bitexact",
-                                    "-c:v", "libx264", "-preset", "medium", "-crf", "23",
-                                    "-vf", "noise=alls=10:allf=t",
-                                    "-c:a", "aac",
-                                    clean_path,
-                                ],
-                                check=True, capture_output=True,
-                            )
+                        with _av.open(src) as inp:
+                            v_in = inp.streams.video[0]
+                            a_in = next((s for s in inp.streams if s.type == "audio"), None)
+                            with _av.open(clean_path, "w", format="mp4") as out:
+                                v_out = out.add_stream("libx264", rate=v_in.average_rate)
+                                v_out.width = v_in.width
+                                v_out.height = v_in.height
+                                v_out.pix_fmt = "yuv420p"
+                                v_out.options = {"crf": "23", "preset": "medium"}
+                                a_out = None
+                                if a_in:
+                                    a_out = out.add_stream("aac", rate=a_in.rate)
+                                    a_out.channels = min(a_in.channels, 2)
+                                for packet in inp.demux(*[s for s in [v_in, a_in] if s]):
+                                    if packet.dts is None:
+                                        continue
+                                    for frame in packet.decode():
+                                        frame.pts = None
+                                        if isinstance(frame, _av.VideoFrame):
+                                            for pkt in v_out.encode(frame):
+                                                out.mux(pkt)
+                                        elif a_out:
+                                            for pkt in a_out.encode(frame):
+                                                out.mux(pkt)
+                                for pkt in v_out.encode(None):
+                                    out.mux(pkt)
+                                if a_out:
+                                    for pkt in a_out.encode(None):
+                                        out.mux(pkt)
 
-                            st.session_state.post_processed_path = clean_path
-                            st.rerun()
-                        except (subprocess.CalledProcessError, OSError) as e:
-                            detail = e.stderr.decode(errors="ignore") if getattr(e, "stderr", None) else str(e)
-                            print(f"[post-processing failed] {e}\n{detail}")
-                            st.error(f"Post-processing απέτυχε: {e}")
+                        st.session_state.post_processed_path = clean_path
+                        st.rerun()
+                    except Exception as e:
+                        print(f"[post-processing failed] {e}")
+                        st.error(f"Post-processing απέτυχε: {e}")
         with c2:
             if st.button("❌ Reject"):
                 st.session_state.gen_url = None
