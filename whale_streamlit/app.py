@@ -88,7 +88,16 @@ DEFAULT_FACE_SWAP_PROMPT = (
 )
 
 DEFAULT_VIDEO_PROMPT = (
-    "Animate the character from the reference image using the exact motion from the driving video. The character identity must remain exactly as shown in the reference image throughout every single frame — never drift toward or blend with any person from the driving video. Lip-sync is the top priority: replicate every mouth shape, jaw movement, and lip position frame-by-frame to match the original audio and speech timing with perfect accuracy. Transfer all body movements precisely: shoulder shifts, head tilts, arm gestures, hand positions, and torso motion must mirror the driving video exactly. If the person in the driving video is holding any object — a phone, microphone, drink, prop, or anything else — the character must also be holding that same object in the same hand position throughout. Maintain consistent character appearance, clothing, and all visible features in every frame."
+    "Animate the character from the reference image using the exact motion from the driving video. "
+    "The character identity must remain exactly as shown in the reference image throughout every single frame "
+    "— never drift toward or blend with any person from the driving video. "
+    "Lip-sync is the top priority: replicate every mouth shape, jaw movement, and lip position frame-by-frame "
+    "to match the original audio and speech timing with perfect accuracy. "
+    "Transfer all body movements precisely: shoulder shifts, head tilts, arm gestures, hand positions, "
+    "and torso motion must mirror the driving video exactly. "
+    "If the person in the driving video is holding any object — a phone, microphone, drink, prop, or anything else "
+    "— the character must also be holding that same object in the same hand position throughout. "
+    "Maintain consistent character appearance, clothing, and all visible features in every frame."
 )
 
 MODELS = {
@@ -115,6 +124,7 @@ defaults = {
     "use_custom_frame": False,
     "custom_face_swap_prompt": "",
     "post_processed_path": None,
+    "generating": False,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -232,9 +242,10 @@ def ws_submit(endpoint, payload):
     return pred_id
 
 
-def ws_poll(pred_id, status_box):
+def ws_poll(pred_id, progress_bar):
     _base = WS_API if WS_API.startswith("http") else "https://api.wavespeed.ai/api/v3"
-    for i in range(150):
+    max_iter = 150  # 150 × 4s = 10 min max
+    for i in range(max_iter):
         time.sleep(4)
         r = requests.get(
             f"{_base}/predictions/{pred_id}/result",
@@ -243,8 +254,11 @@ def ws_poll(pred_id, status_box):
         )
         d = r.json().get("data", {})
         status = d.get("status", "running")
-        status_box.text(f"⏳ {status}... {(i + 1) * 4}s")
+        # 0 → 90% linearly over ~4 min, then 100% on complete
+        pct = min(0.9, (i + 1) / 60)
+        progress_bar.progress(pct, text=f"⏳ {status}... {(i + 1) * 4}s")
         if status == "completed":
+            progress_bar.progress(1.0, text="✅ Ολοκληρώθηκε!")
             outputs = d.get("outputs", [])
             return outputs[0] if outputs else None
         if status == "failed":
@@ -534,8 +548,10 @@ elif st.session_state.step == 2:
                 placeholder="Προαιρετικό — προστίθεται στο τέλος του default prompt",
             )
 
-            if st.button("🎭 Generate Faceswap", type="primary"):
-                status = st.empty()
+            if st.button("🎭 Generate Faceswap", type="primary",
+                         disabled=st.session_state.generating):
+                st.session_state.generating = True
+                progress = st.progress(0, text="⏳ Στέλνω αίτημα face swap...")
                 try:
                     final_prompt = DEFAULT_FACE_SWAP_PROMPT
                     if custom_face_prompt.strip():
@@ -550,11 +566,14 @@ elif st.session_state.step == 2:
                             "seed": -1,
                         },
                     )
-                    result = ws_poll(pred_id, status)
+                    result = ws_poll(pred_id, progress)
                     st.session_state.swapped_url = result
-                    status.empty()
+                    st.session_state.generating = False
+                    progress.empty()
                     st.rerun()
                 except Exception as e:
+                    st.session_state.generating = False
+                    progress.empty()
                     st.error(f"Σφάλμα: {e}")
         else:
             st.success("👁 Αποτέλεσμα — Εγκρίνεις;")
@@ -587,8 +606,10 @@ elif st.session_state.step == 3:
     model = MODELS[model_label]
 
     if not st.session_state.gen_url:
-        if st.button("🎬 Δημιούργησε Video", type="primary"):
-            status = st.empty()
+        if st.button("🎬 Δημιούργησε Video", type="primary",
+                     disabled=st.session_state.generating):
+            st.session_state.generating = True
+            progress = st.progress(0, text="⏳ Στέλνω αίτημα...")
             try:
                 prompt = DEFAULT_VIDEO_PROMPT
                 if model == "seedance":
@@ -618,15 +639,18 @@ elif st.session_state.step == 3:
                             "seed": -1,
                         },
                     )
-                result = ws_poll(pred_id, status)
+                result = ws_poll(pred_id, progress)
                 st.session_state.gen_url = result
 
-                status.info("Κατεβάζω το video τοπικά...")
+                progress.progress(1.0, text="⬇️ Κατεβάζω το video...")
                 st.session_state.final_path = download_video_url(result)
 
-                status.empty()
+                progress.empty()
+                st.session_state.generating = False
                 st.rerun()
             except Exception as e:
+                st.session_state.generating = False
+                progress.empty()
                 st.error(f"Σφάλμα: {e}")
 
     elif not st.session_state.post_processed_path:
@@ -642,47 +666,20 @@ elif st.session_state.step == 3:
         c1, c2 = st.columns(2)
         with c1:
             if st.button("✅ Approve", type="primary"):
-                with st.spinner("Wiping metadata and running anti-detection cleaning..."):
-                    try:
-                        import av as _av
-                        src = st.session_state.final_path
-                        clean_path = os.path.join(os.path.dirname(src), f"clean_{os.path.basename(src)}")
-
-                        with _av.open(src) as inp:
-                            v_in = inp.streams.video[0]
-                            a_in = next((s for s in inp.streams if s.type == "audio"), None)
-                            with _av.open(clean_path, "w", format="mp4") as out:
-                                v_out = out.add_stream("libx264", rate=v_in.average_rate)
-                                v_out.width = v_in.width
-                                v_out.height = v_in.height
-                                v_out.pix_fmt = "yuv420p"
-                                v_out.options = {"crf": "23", "preset": "medium"}
-                                a_out = None
-                                if a_in:
-                                    a_out = out.add_stream("aac", rate=a_in.rate)
-                                    a_out.channels = min(a_in.channels, 2)
-                                for packet in inp.demux(*[s for s in [v_in, a_in] if s]):
-                                    if packet.dts is None:
-                                        continue
-                                    for frame in packet.decode():
-                                        frame.pts = None
-                                        if isinstance(frame, _av.VideoFrame):
-                                            for pkt in v_out.encode(frame):
-                                                out.mux(pkt)
-                                        elif a_out:
-                                            for pkt in a_out.encode(frame):
-                                                out.mux(pkt)
-                                for pkt in v_out.encode(None):
-                                    out.mux(pkt)
-                                if a_out:
-                                    for pkt in a_out.encode(None):
-                                        out.mux(pkt)
-
-                        st.session_state.post_processed_path = clean_path
-                        st.rerun()
-                    except Exception as e:
-                        print(f"[post-processing failed] {e}")
-                        st.error(f"Post-processing απέτυχε: {e}")
+                progress = st.progress(0, text="⏳ Ξεκινώ επεξεργασία...")
+                try:
+                    from processor import VideoProcessor
+                    clean_path = VideoProcessor.process(
+                        st.session_state.final_path,
+                        progress_cb=lambda p, t: progress.progress(p, text=t),
+                    )
+                    st.session_state.post_processed_path = clean_path
+                    progress.empty()
+                    st.rerun()
+                except Exception as e:
+                    progress.empty()
+                    print(f"[post-processing failed] {e}")
+                    st.error(f"Post-processing απέτυχε: {e}")
         with c2:
             if st.button("❌ Reject"):
                 st.session_state.gen_url = None
