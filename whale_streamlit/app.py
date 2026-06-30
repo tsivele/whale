@@ -47,9 +47,9 @@ hr{border-color:#222!important;}
 </style>
 """, unsafe_allow_html=True)
 
-APIFY_API = "apify_api_NGZAc1YjIoPbEcvTFFVQMc1KCurD2J1uWF9C"
-HIKER_API = "zw9usO0t8j3aiimwvjvd3600iqelqj8x"
-WAVESPEED_API = "wsk_live_01W2XsbCVV54Ds8xJum2p4vklrGRrDbL99IMCVcyNPw"
+APIFY_KEY = "apify_api_NGZAc1YjIoPbEcvTFFVQMc1KCurD2J1uWF9C"
+HIKER_KEY = "zw9usO0t8j3aiimwvjvd3600iqelqj8x"
+WS_KEY = "wsk_live_01W2XsbCVV54Ds8xJum2p4vklrGRrDbL99IMCVcyNPw"
 APIFY_ACTOR = "apify~instagram-reel-scraper"   # Official, free with credits, no rental needed
 
 GRAIN_PROMPT = (
