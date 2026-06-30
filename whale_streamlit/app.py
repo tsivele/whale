@@ -7,6 +7,16 @@ import shutil
 import time
 import base64
 
+# Βάζει τα static ffmpeg/ffprobe binaries του πακέτου static-ffmpeg στο PATH
+# κατά την εκκίνηση του app, ώστε όλα τα subprocess calls (extract_frame,
+# get_duration, strip_metadata, το Approve pipeline) να δουλεύουν παντού,
+# χωρίς να εξαρτόμαστε από το αν το ffmpeg είναι ήδη εγκατεστημένο στο σύστημα.
+try:
+    import static_ffmpeg
+    static_ffmpeg.add_paths()
+except Exception:
+    pass
+
 
 # ── DEFAULT CREATOR PHOTO (pre-loaded) ────────────────────
 import base64 as _b64
@@ -506,7 +516,7 @@ elif st.session_state.step == 2:
                     st.error(f"Σφάλμα: {e}")
         else:
             st.success("👁 Αποτέλεσμα — Εγκρίνεις;")
-            st.image(st.session_state.swapped_url)
+            st.image(st.session_state.swapped_url, width=300)
             c1, c2 = st.columns(2)
             with c1:
                 if st.button("✓ Εγκρίνω →", type="primary"):
@@ -587,11 +597,12 @@ elif st.session_state.step == 3:
         c1, c2 = st.columns(2)
         with c1:
             if st.button("✅ Approve", type="primary"):
+                # Το static_ffmpeg.add_paths() (στην κορυφή του app.py) έχει ήδη
+                # προσθέσει το ffmpeg στο PATH κατά την εκκίνηση — απλός έλεγχος εδώ.
                 if not shutil.which("ffmpeg"):
                     st.error(
-                        "⚠️ Το FFmpeg δεν βρέθηκε στο σύστημα. "
-                        "Πρόσθεσέ το στο `packages.txt` (Streamlit Cloud) ή κάνε "
-                        "`brew install ffmpeg` (τοπικά) και κάνε redeploy/restart."
+                        "⚠️ Το FFmpeg δεν βρέθηκε στο PATH. Έλεγξε ότι το `requirements.txt` "
+                        "περιέχει `static-ffmpeg` και κάνε redeploy/restart."
                     )
                 else:
                     with st.spinner("Wiping metadata and running anti-detection cleaning..."):
