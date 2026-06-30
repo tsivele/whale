@@ -46,6 +46,28 @@ GRAIN_PROMPT = (
     "Camera sensor noise, warm tone. Preserve ALL motion, faces, and composition exactly."
 )
 
+DEFAULT_FACE_SWAP_PROMPT = (
+    "Use Image A as the complete identity reference and Image B as the base/body reference. "
+    "Replace the person in Image B entirely with the girl from Image A while preserving the exact pose, "
+    "body position, clothing, framing, camera angle, lighting, background, and scene composition from Image B. "
+    "The final image must look as if the girl from Image A was originally photographed in the scene of Image B. "
+    "Match the facial identity from Image A with maximum accuracy, including: "
+    "* exact face shape * skin tone and texture * hairstyle and hair color * hair length and hairline "
+    "* eyes, eyebrows, nose, lips, and jawline * makeup style and facial details * expression consistency when possible "
+    "Do not retain any facial or hair features from Image B. Only use Image B for the body, clothing, pose, environment, "
+    "and composition. Ensure: * seamless and photorealistic blending * natural lighting adaptation "
+    "* accurate perspective and head angle alignment * realistic shadows and skin integration * proportional anatomy "
+    "* ultra-detailed facial realism * no distortions, warping, or uncanny features "
+    "The output should appear completely natural and indistinguishable from a real photograph. "
+    "Keep the first hair color and Face Visible and Larger breast no captions no text no font and Bigger breast."
+)
+
+DEFAULT_VIDEO_PROMPT = (
+    "Cinematic ambient video. Slow smooth camera push-in. "
+    "Subtle ambient motion, gentle light rays, depth-of-field bokeh. "
+    "Vertical 9:16. No text, no overlays."
+)
+
 MODELS = {
     "Kling v3 Pro (motion control)": "kling",
     "Seedance 2.0 (γρήγορο)": "seedance",
@@ -56,7 +78,7 @@ MODELS = {
 # SESSION STATE
 # ──────────────────────────────────────────────────────────
 defaults = {
-    "step": 0,
+    "step": 1,
     "video_path": None,
     "video_dur": 10.0,
     "frame_options": [],
@@ -67,6 +89,9 @@ defaults = {
     "model": "Kling v3 Pro (motion control)",
     "ig_url": "",
     "motion_video_path": None,
+    "use_custom_frame": False,
+    "custom_face_swap_prompt": "",
+    "final_approved": False,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -347,13 +372,13 @@ def strip_metadata(in_path):
 st.title("🐋 Whale Pipeline")
 st.caption("AI Video Generation · Cloud · Wavespeed + HikerAPI")
 
-steps = ["Setup", "Download", "Review", "Face Swap", "Video", "Done"]
+steps = ["Download", "Review", "Face Swap", "Video", "Done"]
 cols = st.columns(len(steps))
 for i, (col, name) in enumerate(zip(cols, steps)):
     with col:
-        if i < st.session_state.step:
+        if i + 1 < st.session_state.step:
             st.markdown(f"✅ **{name}**")
-        elif i == st.session_state.step:
+        elif i + 1 == st.session_state.step:
             st.markdown(f"🔵 **{name}**")
         else:
             st.markdown(f"⚪ {name}")
@@ -361,30 +386,9 @@ st.divider()
 
 
 # ──────────────────────────────────────────────────────────
-# STEP 0 — SETUP
-# ──────────────────────────────────────────────────────────
-if st.session_state.step == 0:
-    st.subheader("Βήμα 0 — Ρύθμιση")
-    st.write("Βάλε τα API keys στο sidebar (αριστερά) και ανέβασε creator photo.")
-
-    ready = bool(WS_KEY) and (bool(HIKER_KEY) or bool(APIFY_KEY)) and "creator_bytes" in st.session_state
-
-    if not WS_KEY:
-        st.warning("⚠️ Χρειάζεσαι Wavespeed API key")
-    if not HIKER_KEY and not APIFY_KEY:
-        st.warning("⚠️ Χρειάζεσαι HikerAPI ή Apify key (για auto-download)")
-    if "creator_bytes" not in st.session_state:
-        st.warning("⚠️ Ανέβασε creator photo στο sidebar")
-
-    if st.button("Ξεκίνα Pipeline →", disabled=not ready, type="primary"):
-        st.session_state.step = 1
-        st.rerun()
-
-
-# ──────────────────────────────────────────────────────────
 # STEP 1 — DOWNLOAD
 # ──────────────────────────────────────────────────────────
-elif st.session_state.step == 1:
+if st.session_state.step == 1:
     st.subheader("Βήμα 1 — Κατέβασμα Instagram Video")
     ig_url = st.text_input("Instagram Reel URL", value=st.session_state.ig_url,
                             placeholder="https://www.instagram.com/reel/...")
@@ -421,15 +425,17 @@ elif st.session_state.step == 1:
                     fp = extract_frame(path, min(t, dur - 0.2))
                     frames.append((t, fp))
                 st.session_state.frame_options = frames
+
+                # Default frame selection = start of video (0s)
+                default_fp = extract_frame(path, 0.0)
+                with open(default_fp, "rb") as f:
+                    st.session_state.frame_b64 = to_b64(f.read())
+
                 status.empty()
                 st.session_state.step = 2
                 st.rerun()
         except Exception as e:
             st.error(f"Σφάλμα: {e}")
-
-    if st.button("← Πίσω"):
-        st.session_state.step = 0
-        st.rerun()
 
 
 # ──────────────────────────────────────────────────────────
@@ -441,45 +447,31 @@ elif st.session_state.step == 2:
     if st.session_state.video_path:
         st.video(st.session_state.video_path)
 
-    st.write("**Auto-extracted frames** — διάλεξε ή πάτα custom timestamp:")
-    cols = st.columns(5)
-    for i, (t, fp) in enumerate(st.session_state.frame_options):
-        with cols[i]:
-            st.image(fp, caption=f"{t:.1f}s")
-            if st.button("Επιλογή", key=f"frame_{i}"):
-                with open(fp, "rb") as f:
-                    st.session_state.frame_b64 = to_b64(f.read())
-                st.rerun()
+    use_custom = st.checkbox("🎯 Custom Frame", key="use_custom_frame",
+                              help="Default: frame 0 (η αρχή του video). Ενεργοποίησέ το για να διαλέξεις άλλο frame.")
 
-    custom_t = st.slider("Ή scrub σε custom χρόνο", 0.0, st.session_state.video_dur, 1.0, 0.1)
-    if st.button("📸 Capture custom frame"):
-        fp = extract_frame(st.session_state.video_path, custom_t)
-        with open(fp, "rb") as f:
-            st.session_state.frame_b64 = to_b64(f.read())
-        st.rerun()
+    if use_custom:
+        st.write("**Auto-extracted frames** — διάλεξε ή πάτα custom timestamp:")
+        cols = st.columns(5)
+        for i, (t, fp) in enumerate(st.session_state.frame_options):
+            with cols[i]:
+                st.image(fp, caption=f"{t:.1f}s")
+                if st.button("Επιλογή", key=f"frame_{i}"):
+                    with open(fp, "rb") as f:
+                        st.session_state.frame_b64 = to_b64(f.read())
+                    st.rerun()
+
+        custom_t = st.slider("Ή scrub σε custom χρόνο", 0.0, st.session_state.video_dur, 1.0, 0.1)
+        if st.button("📸 Capture custom frame"):
+            fp = extract_frame(st.session_state.video_path, custom_t)
+            with open(fp, "rb") as f:
+                st.session_state.frame_b64 = to_b64(f.read())
+            st.rerun()
 
     if st.session_state.frame_b64:
-        st.success("✓ Frame επιλέχθηκε")
+        st.success("✓ Frame επιλέχθηκε" + ("" if use_custom else " (default: 0s)"))
         st.image(st.session_state.frame_b64, width=200)
-        st.divider()
-        st.markdown("**Prompts** (default αν αφεθεί κενό)")
-        
-        col_p1, col_p2 = st.columns(2)
-        with col_p1:
-            fs_prompt = st.text_area(
-                "Face Swap prompt",
-                value=st.session_state.get("face_swap_prompt", "Use Image A as the complete identity reference and Image B as the base/body reference. Replace the person in Image B entirely with the girl from Image A while preserving the exact pose, body position, clothing, framing, camera angle, lighting, background, and scene composition from Image B. The final image must look as if the girl from Image A was originally photographed in the scene of Image B. Match the facial identity from Image A with maximum accuracy, including: * exact face shape * skin tone and texture * hairstyle and hair color * hair length and hairline * eyes, eyebrows, nose, lips, and jawline * makeup style and facial details * expression consistency when possible Do not retain any facial or hair features from Image B. Only use Image B for the body, clothing, pose, environment, and composition. Ensure: * seamless and photorealistic blending * natural lighting adaptation * accurate perspective and head angle alignment * realistic shadows and skin integration * proportional anatomy * ultra-detailed facial realism * no distortions, warping, or uncanny features The output should appear completely natural and indistinguishable from a real photograph. Keep the first hair color and Face Visible and Larger breast no captions no text no font and Bigger breast."),
-                height=80, key="fs_p"
-            )
-            st.session_state["face_swap_prompt"] = fs_prompt
-        with col_p2:
-            vid_prompt = st.text_area(
-                "Video generation prompt",
-                value=st.session_state.get("video_prompt", "Cinematic ambient video. Slow smooth camera push-in. Subtle ambient motion, gentle light rays, depth-of-field bokeh. Vertical 9:16. No text, no overlays."),
-                height=80, key="vid_p"
-            )
-            st.session_state["video_prompt"] = vid_prompt
-            
+
         if st.button("Επόμενο: Face Swap →", type="primary"):
             st.session_state.step = 3
             st.rerun()
@@ -495,28 +487,29 @@ elif st.session_state.step == 2:
 elif st.session_state.step == 3:
     st.subheader("Βήμα 3 — Face Swap")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.write("**Viral Frame**")
-        st.image(st.session_state.frame_b64)
-    with col2:
-        st.write("**Creator Photo**")
-        st.image(st.session_state["creator_bytes"])
-
     if not st.session_state.swapped_url:
-        if st.button("🎭 Εκτέλεση Face Swap", type="primary"):
+        with st.expander("⚙️ Default prompt (advanced)"):
+            st.caption(DEFAULT_FACE_SWAP_PROMPT)
+
+        custom_face_prompt = st.text_input(
+            "Custom Prompt Section",
+            key="custom_face_swap_prompt",
+            placeholder="Προαιρετικό — προστίθεται στο τέλος του default prompt",
+        )
+
+        if st.button("🎭 Generate Faceswap", type="primary"):
             status = st.empty()
             try:
+                final_prompt = DEFAULT_FACE_SWAP_PROMPT
+                if custom_face_prompt.strip():
+                    final_prompt = f"{DEFAULT_FACE_SWAP_PROMPT} {custom_face_prompt.strip()}"
+
                 creator_b64 = to_b64(st.session_state["creator_bytes"])
                 pred_id = ws_submit(
                     "wavespeed-ai/qwen-image-2.0-pro/edit",
                     {
                         "images": [creator_b64, st.session_state.frame_b64],
-                        "prompt": st.session_state.get("face_swap_prompt",                             
-                            "Place the person from image 1 in the scene of image 2, "
-                            "same pose and framing. Photorealistic, vertical 9:16, 4K, "
-                            "warm cinematic color grading. No text, no watermarks."
-                        ),
+                        "prompt": final_prompt,
                         "seed": -1,
                     },
                 )
@@ -561,11 +554,7 @@ elif st.session_state.step == 4:
         if st.button("🎬 Δημιούργησε Video", type="primary", disabled=not can_generate):
             status = st.empty()
             try:
-                prompt = st.session_state.get("video_prompt", (                    
-                    "Cinematic ambient video. Slow smooth camera push-in. "
-                    "Subtle ambient motion, gentle light rays, depth-of-field bokeh. "
-                    "Vertical 9:16. No text, no overlays."
-                ))
+                prompt = DEFAULT_VIDEO_PROMPT
                 if model == "seedance":
                     pred_id = ws_submit(
                         "bytedance/seedance-2.0/image-to-video",
@@ -612,50 +601,69 @@ elif st.session_state.step == 4:
     if st.button("← Πίσω"):
         st.session_state.step = 3
         st.rerun()
-st.session_state.final_path = locals().get('final_path', 'default_path.mp4')
-      # Υποθετικό if που ελέγχει σε ποιο βήμα (step) βρισκόμαστε
-if st.session_state.step == 1:
-    try:
-        # ... (εδώ μπαίνει ο κώδικας της επεξεργασίας) ...
-        status.empty()
-        st.session_state.step = 2 # Προχωράμε στο επόμενο βήμα πριν το rerun
-        st.rerun()
-    except Exception as e:
-        st.error(f"Σφάλμα: {e}")
 
-# Όταν ολοκληρωθεί το pipeline, εμφανίζουμε το αποτέλεσμα 🐋
-elif st.session_state.step == 2:
-    st.success("🎉 Pipeline ολοκληρώθηκε! Καθαρό από AI marks, C2PA metadata, με film grain.")
-    
-    # Εμφάνιση του βίντεο
-    st.video(st.session_state.final_path)
-    
-    # Κουμπί για Download
-    with open(st.session_state.final_path, "rb") as f:
-        st.download_button(
-            label="⬇ Download Final MP4", 
-            data=f, 
-            file_name="whale_final.mp4", 
-            mime="video/mp4",
-            type="primary"
-        )
 
-    # Κουμπί για Reset (Νέο Video)
-    if st.button("🔄 Νέο Video"):
-        # Λίστα με τα κλειδιά που πρέπει να καθαριστούν
-        keys_to_reset = [
-            "video_path", "video_dur", "frame_options", "frame_b64",
-            "swapped_url", "gen_url", "final_path", "ig_url", "motion_video_path"
-        ]
-        
-        # Ασφαλής τρόπος: Διαγράφουμε τα κλειδιά από το session_state
-        # Ή τα επαναφέρουμε με .get() για να αποφύγουμε KeyError
-        for k in keys_to_reset:
-            if k in st.session_state and k in defaults:
+# ──────────────────────────────────────────────────────────
+# STEP 5 — POST-PROCESSING
+# ──────────────────────────────────────────────────────────
+elif st.session_state.step == 5:
+    st.subheader("Βήμα 5 — Post-Processing")
+
+    if not st.session_state.final_path:
+        if st.button("✨ Καθάρισμα & Οριστικοποίηση", type="primary"):
+            status = st.empty()
+            try:
+                status.info("Κατεβάζω το generated video...")
+                motion_path = download_video_url(st.session_state.gen_url)
+                st.session_state.motion_video_path = motion_path
+
+                status.info("Αφαιρώ metadata (C2PA strip)...")
+                final_path = strip_metadata(motion_path)
+                st.session_state.final_path = final_path
+
+                status.empty()
+                st.rerun()
+            except Exception as e:
+                st.error(f"Σφάλμα: {e}")
+    else:
+        st.success("🎉 Pipeline ολοκληρώθηκε! Καθαρό από AI marks, C2PA metadata, με film grain.")
+
+        final_path = st.session_state.get("final_path")
+        if final_path and os.path.exists(final_path):
+            st.video(final_path)
+            with open(final_path, "rb") as f:
+                st.download_button("⬇ Download Final MP4", f, file_name="whale_final.mp4", mime="video/mp4",
+                                    type="primary")
+
+            if not st.session_state.get("final_approved"):
+                st.divider()
+                st.write("**Τελική έγκριση**")
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("✅ Approve", type="primary"):
+                        st.session_state.final_approved = True
+                        st.rerun()
+                with c2:
+                    if st.button("❌ Reject"):
+                        st.session_state.gen_url = None
+                        st.session_state.motion_video_path = None
+                        st.session_state.final_path = None
+                        st.session_state.step = 4
+                        st.rerun()
+            else:
+                st.success("✅ Video approved.")
+        else:
+            st.error("⚠️ Το τελικό video δεν βρέθηκε στο δίσκο — δοκίμασε ξανά το post-processing.")
+            st.session_state.final_path = None
+
+        if st.button("🔄 Νέο Video"):
+            for k in ["video_path", "video_dur", "frame_options", "frame_b64",
+                      "swapped_url", "gen_url", "final_path", "ig_url",
+                      "motion_video_path", "final_approved"]:
                 st.session_state[k] = defaults[k]
-            elif k in st.session_state:
-                del st.session_state[k]
-                
-        # Επιστροφή στο αρχικό βήμα και rerun
-        st.session_state.step = 1
+            st.session_state.step = 1
+            st.rerun()
+
+    if st.button("← Πίσω"):
+        st.session_state.step = 4
         st.rerun()
