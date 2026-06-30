@@ -89,7 +89,7 @@ defaults = {
     "motion_video_path": None,
     "use_custom_frame": False,
     "custom_face_swap_prompt": "",
-    "final_approved": False,
+    "post_processed_path": None,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -370,7 +370,7 @@ def strip_metadata(in_path):
 st.title("🐋 Whale Pipeline")
 st.caption("AI Video Generation · Cloud · Wavespeed + HikerAPI")
 
-steps = ["Download", "Review", "Face Swap", "Video", "Done"]
+steps = ["Download", "Frame & Prompt", "Video"]
 cols = st.columns(len(steps))
 for i, (col, name) in enumerate(zip(cols, steps)):
     with col:
@@ -440,10 +440,7 @@ if st.session_state.step == 1:
 # STEP 2 — REVIEW & FRAME SELECTION
 # ──────────────────────────────────────────────────────────
 elif st.session_state.step == 2:
-    st.subheader("Βήμα 2 — Review & Επιλογή Frame")
-
-    if st.session_state.video_path:
-        st.video(st.session_state.video_path)
+    st.subheader("Βήμα 2 - Επιλογή Frame & Ρυθμίσεις Prompt")
 
     use_custom = st.checkbox("🎯 Custom Frame", key="use_custom_frame",
                               help="Default: frame 0 (η αρχή του video). Ενεργοποίησέ το για να διαλέξεις άλλο frame.")
@@ -470,9 +467,52 @@ elif st.session_state.step == 2:
         st.success("✓ Frame επιλέχθηκε" + ("" if use_custom else " (default: 0s)"))
         st.image(st.session_state.frame_b64, width=200)
 
-        if st.button("Επόμενο: Face Swap →", type="primary"):
-            st.session_state.step = 3
-            st.rerun()
+        st.divider()
+
+        if not st.session_state.swapped_url:
+            with st.expander("⚙️ Default prompt (advanced)"):
+                st.caption(DEFAULT_FACE_SWAP_PROMPT)
+
+            custom_face_prompt = st.text_input(
+                "Custom Prompt Section",
+                key="custom_face_swap_prompt",
+                placeholder="Προαιρετικό — προστίθεται στο τέλος του default prompt",
+            )
+
+            if st.button("🎭 Generate Faceswap", type="primary"):
+                status = st.empty()
+                try:
+                    final_prompt = DEFAULT_FACE_SWAP_PROMPT
+                    if custom_face_prompt.strip():
+                        final_prompt = f"{DEFAULT_FACE_SWAP_PROMPT} {custom_face_prompt.strip()}"
+
+                    creator_b64 = to_b64(st.session_state["creator_bytes"])
+                    pred_id = ws_submit(
+                        "wavespeed-ai/qwen-image-2.0-pro/edit",
+                        {
+                            "images": [creator_b64, st.session_state.frame_b64],
+                            "prompt": final_prompt,
+                            "seed": -1,
+                        },
+                    )
+                    result = ws_poll(pred_id, status)
+                    st.session_state.swapped_url = result
+                    status.empty()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Σφάλμα: {e}")
+        else:
+            st.success("👁 Αποτέλεσμα — Εγκρίνεις;")
+            st.image(st.session_state.swapped_url)
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("✓ Εγκρίνω →", type="primary"):
+                    st.session_state.step = 3
+                    st.rerun()
+            with c2:
+                if st.button("✗ Ξανά"):
+                    st.session_state.swapped_url = None
+                    st.rerun()
 
     if st.button("← Πίσω"):
         st.session_state.step = 1
@@ -480,66 +520,10 @@ elif st.session_state.step == 2:
 
 
 # ──────────────────────────────────────────────────────────
-# STEP 3 — FACE SWAP
+# STEP 3 — VIDEO GENERATION & POST-PROCESSING
 # ──────────────────────────────────────────────────────────
 elif st.session_state.step == 3:
-    st.subheader("Βήμα 3 — Face Swap")
-
-    if not st.session_state.swapped_url:
-        with st.expander("⚙️ Default prompt (advanced)"):
-            st.caption(DEFAULT_FACE_SWAP_PROMPT)
-
-        custom_face_prompt = st.text_input(
-            "Custom Prompt Section",
-            key="custom_face_swap_prompt",
-            placeholder="Προαιρετικό — προστίθεται στο τέλος του default prompt",
-        )
-
-        if st.button("🎭 Generate Faceswap", type="primary"):
-            status = st.empty()
-            try:
-                final_prompt = DEFAULT_FACE_SWAP_PROMPT
-                if custom_face_prompt.strip():
-                    final_prompt = f"{DEFAULT_FACE_SWAP_PROMPT} {custom_face_prompt.strip()}"
-
-                creator_b64 = to_b64(st.session_state["creator_bytes"])
-                pred_id = ws_submit(
-                    "wavespeed-ai/qwen-image-2.0-pro/edit",
-                    {
-                        "images": [creator_b64, st.session_state.frame_b64],
-                        "prompt": final_prompt,
-                        "seed": -1,
-                    },
-                )
-                result = ws_poll(pred_id, status)
-                st.session_state.swapped_url = result
-                status.empty()
-                st.rerun()
-            except Exception as e:
-                st.error(f"Σφάλμα: {e}")
-    else:
-        st.success("👁 Αποτέλεσμα — Εγκρίνεις;")
-        st.image(st.session_state.swapped_url)
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("✓ Εγκρίνω →", type="primary"):
-                st.session_state.step = 4
-                st.rerun()
-        with c2:
-            if st.button("✗ Ξανά"):
-                st.session_state.swapped_url = None
-                st.rerun()
-
-    if st.button("← Πίσω"):
-        st.session_state.step = 2
-        st.rerun()
-
-
-# ──────────────────────────────────────────────────────────
-# STEP 4 — VIDEO GENERATION
-# ──────────────────────────────────────────────────────────
-elif st.session_state.step == 4:
-    st.subheader("Βήμα 4 — Video Generation")
+    st.subheader("Βήμα 3 — Video Generation")
     st.image(st.session_state.swapped_url, width=300)
 
     model_label = st.selectbox("Μοντέλο video", list(MODELS.keys()),
@@ -548,8 +532,7 @@ elif st.session_state.step == 4:
     model = MODELS[model_label]
 
     if not st.session_state.gen_url:
-        can_generate = True
-        if st.button("🎬 Δημιούργησε Video", type="primary", disabled=not can_generate):
+        if st.button("🎬 Δημιούργησε Video", type="primary"):
             status = st.empty()
             try:
                 prompt = DEFAULT_VIDEO_PROMPT
@@ -579,89 +562,84 @@ elif st.session_state.step == 4:
                     )
                 result = ws_poll(pred_id, status)
                 st.session_state.gen_url = result
+
+                status.info("Κατεβάζω το video τοπικά...")
+                st.session_state.final_path = download_video_url(result)
+
                 status.empty()
                 st.rerun()
             except Exception as e:
                 st.error(f"Σφάλμα: {e}")
-    else:
+
+    elif not st.session_state.post_processed_path:
         st.success("👁 Video — Εγκρίνεις;")
-        st.video(st.session_state.gen_url)
+
+        col_l, col_mid, col_r = st.columns([1, 2, 1])
+        with col_mid:
+            if st.session_state.final_path and os.path.exists(st.session_state.final_path):
+                st.video(st.session_state.final_path)
+            else:
+                st.error("⚠️ Το video δεν βρέθηκε στο δίσκο.")
+
         c1, c2 = st.columns(2)
         with c1:
-            if st.button("✓ Εγκρίνω → Post-Process", type="primary"):
-                st.session_state.step = 5
-                st.rerun()
+            if st.button("✅ Approve", type="primary"):
+                with st.spinner("Wiping metadata and running anti-detection cleaning..."):
+                    try:
+                        src = st.session_state.final_path
+                        base_dir = os.path.dirname(src)
+                        base_name = os.path.basename(src)
+                        clean_path = os.path.join(base_dir, f"clean_{base_name}")
+
+                        # Native FFmpeg anti-detection pass: libx264 re-encode + full
+                        # metadata/chapter wipe + bit-exact muxing + optional grain texture.
+                        # No external c2pa/filmgrain binaries — those aren't installed anywhere.
+                        subprocess.run(
+                            [
+                                "ffmpeg", "-y", "-i", src,
+                                "-map_metadata", "-1",
+                                "-map_chapters", "-1",
+                                "-fflags", "+bitexact",
+                                "-flags:v", "+bitexact",
+                                "-flags:a", "+bitexact",
+                                "-c:v", "libx264", "-preset", "medium", "-crf", "23",
+                                "-vf", "noise=alls=10:allf=t",
+                                "-c:a", "aac",
+                                clean_path,
+                            ],
+                            check=True, capture_output=True,
+                        )
+
+                        st.session_state.post_processed_path = clean_path
+                        st.rerun()
+                    except (subprocess.CalledProcessError, OSError) as e:
+                        detail = e.stderr.decode(errors="ignore") if getattr(e, "stderr", None) else str(e)
+                        print(f"[post-processing failed] {e}\n{detail}")
+                        st.error(f"Post-processing απέτυχε: {e}")
         with c2:
-            if st.button("✗ Ξανά"):
+            if st.button("❌ Reject"):
                 st.session_state.gen_url = None
+                st.session_state.final_path = None
+                st.session_state.post_processed_path = None
                 st.rerun()
 
-    if st.button("← Πίσω"):
-        st.session_state.step = 3
-        st.rerun()
-
-
-# ──────────────────────────────────────────────────────────
-# STEP 5 — POST-PROCESSING
-# ──────────────────────────────────────────────────────────
-elif st.session_state.step == 5:
-    st.subheader("Βήμα 5 — Post-Processing")
-
-    if not st.session_state.final_path:
-        if st.button("✨ Καθάρισμα & Οριστικοποίηση", type="primary"):
-            status = st.empty()
-            try:
-                status.info("Κατεβάζω το generated video...")
-                motion_path = download_video_url(st.session_state.gen_url)
-                st.session_state.motion_video_path = motion_path
-
-                status.info("Αφαιρώ metadata (C2PA strip)...")
-                final_path = strip_metadata(motion_path)
-                st.session_state.final_path = final_path
-
-                status.empty()
-                st.rerun()
-            except Exception as e:
-                st.error(f"Σφάλμα: {e}")
     else:
-        st.success("🎉 Pipeline ολοκληρώθηκε! Καθαρό από AI marks, C2PA metadata, με film grain.")
-
-        final_path = st.session_state.get("final_path")
-        if final_path and os.path.exists(final_path):
-            st.video(final_path)
-            with open(final_path, "rb") as f:
-                st.download_button("⬇ Download Final MP4", f, file_name="whale_final.mp4", mime="video/mp4",
-                                    type="primary")
-
-            if not st.session_state.get("final_approved"):
-                st.divider()
-                st.write("**Τελική έγκριση**")
-                c1, c2 = st.columns(2)
-                with c1:
-                    if st.button("✅ Approve", type="primary"):
-                        st.session_state.final_approved = True
-                        st.rerun()
-                with c2:
-                    if st.button("❌ Reject"):
-                        st.session_state.gen_url = None
-                        st.session_state.motion_video_path = None
-                        st.session_state.final_path = None
-                        st.session_state.step = 4
-                        st.rerun()
-            else:
-                st.success("✅ Video approved.")
+        st.success("🎉 Pipeline ολοκληρώθηκε! Καθαρό από metadata & tracking artifacts.")
+        if os.path.exists(st.session_state.post_processed_path):
+            with open(st.session_state.post_processed_path, "rb") as f:
+                st.download_button("⬇ Download Final MP4", f, file_name="whale_final.mp4",
+                                    mime="video/mp4", type="primary")
         else:
-            st.error("⚠️ Το τελικό video δεν βρέθηκε στο δίσκο — δοκίμασε ξανά το post-processing.")
-            st.session_state.final_path = None
+            st.error("⚠️ Το επεξεργασμένο video δεν βρέθηκε στο δίσκο.")
 
         if st.button("🔄 Νέο Video"):
             for k in ["video_path", "video_dur", "frame_options", "frame_b64",
-                      "swapped_url", "gen_url", "final_path", "ig_url",
-                      "motion_video_path", "final_approved"]:
+                      "swapped_url", "gen_url", "final_path", "post_processed_path",
+                      "ig_url", "motion_video_path"]:
                 st.session_state[k] = defaults[k]
             st.session_state.step = 1
             st.rerun()
 
     if st.button("← Πίσω"):
-        st.session_state.step = 4
+        st.session_state.step = 2
         st.rerun()
