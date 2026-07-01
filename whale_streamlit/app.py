@@ -543,23 +543,13 @@ elif st.session_state.step == 2:
         st.divider()
 
         if not st.session_state.swapped_url:
-            with st.expander("⚙️ Default prompt (advanced)"):
-                st.caption(DEFAULT_FACE_SWAP_PROMPT)
-
-            custom_face_prompt = st.text_input(
-                "Custom Prompt Section",
-                key="custom_face_swap_prompt",
-                placeholder="Προαιρετικό — προστίθεται στο τέλος του default prompt",
-            )
-
-            if st.button("🎭 Generate Faceswap", type="primary",
-                         disabled=st.session_state.generating):
-                st.session_state.generating = True
+            # ── API call run (triggered by _fs_run flag set on click) ──────
+            if st.session_state.get("_fs_run"):
+                st.session_state["_fs_run"] = False
                 progress = st.progress(0, text="⏳ Στέλνω αίτημα face swap...")
+                _err = None
                 try:
-                    final_prompt = DEFAULT_FACE_SWAP_PROMPT
-                    if custom_face_prompt.strip():
-                        final_prompt = f"{DEFAULT_FACE_SWAP_PROMPT} {custom_face_prompt.strip()}"
+                    final_prompt = st.session_state.get("_fs_prompt", DEFAULT_FACE_SWAP_PROMPT)
                     creator_b64 = to_b64(st.session_state["creator_bytes"])
                     pred_id = ws_submit(
                         "wavespeed-ai/qwen-image-2.0-pro/edit",
@@ -571,13 +561,36 @@ elif st.session_state.step == 2:
                     )
                     result = ws_poll(pred_id, progress)
                     st.session_state.swapped_url = result
-                    st.session_state.generating = False
-                    progress.empty()
-                    st.rerun()
                 except Exception as e:
-                    st.session_state.generating = False
+                    _err = e
+                finally:
+                    st.session_state.generating = False  # always reset
                     progress.empty()
-                    st.error(f"Σφάλμα: {e}")
+                if _err:
+                    st.error(f"Σφάλμα: {_err}")
+                else:
+                    st.rerun()
+
+            # ── UI (button disabled=True while generating) ──────────────────
+            with st.expander("⚙️ Default prompt (advanced)"):
+                st.caption(DEFAULT_FACE_SWAP_PROMPT)
+
+            custom_face_prompt = st.text_input(
+                "Custom Prompt Section",
+                key="custom_face_swap_prompt",
+                placeholder="Προαιρετικό — προστίθεται στο τέλος του default prompt",
+            )
+
+            if st.button("🎭 Generate Faceswap", type="primary",
+                         disabled=st.session_state.generating):
+                if not st.session_state.generating:
+                    fp = DEFAULT_FACE_SWAP_PROMPT
+                    if custom_face_prompt.strip():
+                        fp = f"{DEFAULT_FACE_SWAP_PROMPT} {custom_face_prompt.strip()}"
+                    st.session_state["_fs_prompt"] = fp
+                    st.session_state.generating = True
+                    st.session_state["_fs_run"] = True
+                    st.rerun()  # αμέσως → button γίνεται γκρι, click 2 καταργείται
         else:
             st.success("👁 Αποτέλεσμα — Εγκρίνεις;")
             st.image(st.session_state.swapped_url, width=300)
@@ -611,19 +624,21 @@ elif st.session_state.step == 3:
     model = MODELS[model_label]
 
     if not st.session_state.gen_url:
-        if st.button("🎬 Δημιούργησε Video", type="primary",
-                     disabled=st.session_state.generating):
-            st.session_state.generating = True
+        # ── API call run (triggered by _vid_run flag set on click) ─────
+        if st.session_state.get("_vid_run"):
+            st.session_state["_vid_run"] = False
+            _m = st.session_state.get("_vid_model", model)
             progress = st.progress(0, text="⏳ Στέλνω αίτημα...")
+            _err = None
             try:
                 prompt = DEFAULT_VIDEO_PROMPT
-                if model == "seedance":
+                if _m == "seedance":
                     pred_id = ws_submit(
                         "bytedance/seedance-2.0/image-to-video",
                         {"image": st.session_state.swapped_url, "prompt": prompt,
                          "duration": 5, "resolution": "1080p", "seed": -1},
                     )
-                elif model == "wan":
+                elif _m == "wan":
                     pred_id = ws_submit(
                         "alibaba/wan-2.7/image-to-video",
                         {"image": st.session_state.swapped_url, "prompt": prompt,
@@ -648,13 +663,24 @@ elif st.session_state.step == 3:
                 st.session_state.gen_url = result
                 progress.progress(1.0, text="⬇️ Κατεβάζω το video...")
                 st.session_state.final_path = download_video_url(result)
-                progress.empty()
-                st.session_state.generating = False
-                st.rerun()
             except Exception as e:
-                st.session_state.generating = False
+                _err = e
+            finally:
+                st.session_state.generating = False  # always reset
                 progress.empty()
-                st.error(f"Σφάλμα: {e}")
+            if _err:
+                st.error(f"Σφάλμα: {_err}")
+            else:
+                st.rerun()
+
+        # ── Button (disabled=True while generating) ──────────────────────
+        if st.button("🎬 Δημιούργησε Video", type="primary",
+                     disabled=st.session_state.generating):
+            if not st.session_state.generating:
+                st.session_state["_vid_model"] = model
+                st.session_state.generating = True
+                st.session_state["_vid_run"] = True
+                st.rerun()  # αμέσως → button γίνεται γκρι, click 2 καταργείται
 
     elif not st.session_state.post_processed_path:
         st.success("👁 Video — Εγκρίνεις;")
