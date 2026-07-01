@@ -62,7 +62,7 @@ hr{border-color:#222!important;}
 """, unsafe_allow_html=True)
 
 WS_API = "https://api.wavespeed.ai/api/v3"
-HIKER_API  = "https://api.hikerapi.com/v2/media/info/by/url"
+HIKER_API  = "https://api.hikerapi.com/v2/media/by/url"
 APIFY_BASE = "https://api.apify.com/v2"
 APIFY_ACTOR = "apify~instagram-reel-scraper"   # Official, free with credits, no rental needed
 
@@ -278,37 +278,39 @@ import streamlit as st
 def hiker_get_video_url(ig_url):
     headers = {"x-access-key": HIKER_KEY, "accept": "application/json"}
 
-    r = requests.get(
-        HIKER_API,
-        params={"url": ig_url},
-        headers=headers,
-        timeout=30,
-    )
-
-    if r.status_code == 401:
-        raise RuntimeError(f"HikerAPI 401: λάθος access key")
-    if r.status_code == 404:
-        raise RuntimeError("HikerAPI: post δεν βρέθηκε")
-    r.raise_for_status()
-
-    data = r.json()
-
-    # v2 wraps in "data", v1 in "media_or_ad" or "media" — try all
-    media = (
-        data.get("data")
-        or data.get("media_or_ad")
-        or data.get("media")
-        or data
-    )
-
-    candidates = [
-        media.get("video_url"),
-        (media.get("video_versions") or [{}])[0].get("url"),
-        (media.get("clips_metadata", {}).get("original_sound_info") or {}).get("original_url"),
+    # Try v2 first, fall back to v1 if 404
+    endpoints = [
+        HIKER_API,                                       # v2: /v2/media/by/url
+        "https://api.hikerapi.com/v1/media/by/url",     # v1 fallback
     ]
-    for c in candidates:
-        if c:
-            return c
+
+    for endpoint in endpoints:
+        r = requests.get(endpoint, params={"url": ig_url}, headers=headers, timeout=30)
+
+        if r.status_code == 401:
+            raise RuntimeError("HikerAPI 401: λάθος access key")
+        if r.status_code == 404:
+            continue  # try next endpoint
+
+        r.raise_for_status()
+
+        data = r.json()
+        media = (
+            data.get("data")
+            or data.get("media_or_ad")
+            or data.get("media")
+            or data
+        )
+        candidates = [
+            media.get("video_url"),
+            (media.get("video_versions") or [{}])[0].get("url"),
+            (media.get("clips_metadata", {}).get("original_sound_info") or {}).get("original_url"),
+        ]
+        for c in candidates:
+            if c:
+                return c
+
+    raise RuntimeError("HikerAPI: post δεν βρέθηκε")
 
     raise RuntimeError(
         f"HikerAPI: no video URL in response. "
