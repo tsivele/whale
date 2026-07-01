@@ -124,7 +124,8 @@ defaults = {
     "use_custom_frame": False,
     "custom_face_swap_prompt": "",
     "post_processed_path": None,
-    "generating": False,
+    "app_state": "idle",
+    "_gen_error": None,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -457,70 +458,16 @@ st.divider()
 
 
 # ──────────────────────────────────────────────────────────
-# STEP 1 — DOWNLOAD
+# STATE MACHINE
 # ──────────────────────────────────────────────────────────
-if st.session_state.step == 1:
-    st.subheader("Βήμα 1 — Κατέβασμα Instagram Video")
-    ig_url = st.text_input("Instagram Reel URL", value=st.session_state.ig_url,
-                            placeholder="https://www.instagram.com/reel/...")
-    st.session_state.ig_url = ig_url
-
-    if st.button("⬇ Download", type="primary", disabled=not ig_url):
-        status = st.empty()
-        try:
-            video_url = None
-            if HIKER_KEY:
-                status.info("Δοκιμάζω HikerAPI...")
-                try:
-                    video_url = hiker_get_video_url(ig_url)
-                except Exception as e:
-                    st.warning(f"HikerAPI: {e}")
-
-            if not video_url and APIFY_KEY:
-                status.info("Δοκιμάζω Apify (backup)...")
-                video_url = apify_get_video_url(ig_url)
-
-            if not video_url:
-                st.error("Δεν βρέθηκε video. Δοκίμασε άλλο link ή έλεγξε τα API keys.")
-            else:
-                status.info("Κατεβάζω το video...")
-                path = download_video_url(video_url)
-                st.session_state.video_path = path
-                st.session_state.video_dur = get_duration(path)
-                # Auto-extract 5 candidate frames
-                dur = st.session_state.video_dur
-                times = [max(0.3, p * dur) for p in [0.05, 0.2, 0.4, 0.6, 0.8]]
-                frames = []
-                status.info("Εξάγω frames...")
-                for t in times:
-                    fp = extract_frame(path, min(t, dur - 0.2))
-                    frames.append((t, fp))
-                st.session_state.frame_options = frames
-
-                # Default frame selection = start of video (0s)
-                default_fp = extract_frame(path, 0.0)
-                with open(default_fp, "rb") as f:
-                    st.session_state.frame_b64 = to_b64(f.read())
-
-                status.empty()
-                st.session_state.step = 2
-                st.rerun()
-        except Exception as e:
-            st.error(f"Σφάλμα: {e}")
-
-
-# ──────────────────────────────────────────────────────────
-# STEP 2 — REVIEW & FRAME SELECTION
-# ──────────────────────────────────────────────────────────
-elif st.session_state.step == 2:
-
-    # ── Faceswap API call ───────────────────────────────────────────
-    if st.session_state.get("_fs_run"):
-        st.session_state["_fs_run"] = False
-        progress = st.progress(0, text="⏳ Στέλνω αίτημα face swap...")
-        _err = None
-        try:
-            final_prompt = st.session_state.get("_fs_prompt", DEFAULT_FACE_SWAP_PROMPT)
+if st.session_state.app_state == "generating":
+    _gen_type = st.session_state.get("_gen_type", "")
+    _label = "⏳ Δημιουργία Faceswap..." if _gen_type == "faceswap" else "⏳ Δημιουργία Video..."
+    progress = st.progress(0, text=_label)
+    _err = None
+    try:
+        if _gen_type == "faceswap":
+            final_prompt = st.session_state.get("_gen_prompt", DEFAULT_FACE_SWAP_PROMPT)
             creator_b64 = to_b64(st.session_state["creator_bytes"])
             pred_id = ws_submit(
                 "wavespeed-ai/qwen-image-2.0-pro/edit",
@@ -532,95 +479,8 @@ elif st.session_state.step == 2:
             )
             result = ws_poll(pred_id, progress)
             st.session_state.swapped_url = result
-        except Exception as e:
-            _err = e
-        finally:
-            st.session_state.generating = False
-            progress.empty()
-        if _err:
-            st.error(f"Σφάλμα: {_err}")
-        else:
-            st.rerun()
-
-    # ── Normal UI ──────────────────────────────────────────────────
-    st.subheader("Βήμα 2 - Επιλογή Frame & Ρυθμίσεις Prompt")
-
-    use_custom = st.checkbox("🎯 Custom Frame", key="use_custom_frame",
-                              help="Default: frame 0 (η αρχή του video). Ενεργοποίησέ το για να διαλέξεις άλλο frame.")
-
-    if use_custom:
-        st.write("**Auto-extracted frames** — διάλεξε ή πάτα custom timestamp:")
-        cols = st.columns(5)
-        for i, (t, fp) in enumerate(st.session_state.frame_options):
-            with cols[i]:
-                st.image(fp, caption=f"{t:.1f}s")
-                if st.button("Επιλογή", key=f"frame_{i}"):
-                    with open(fp, "rb") as f:
-                        st.session_state.frame_b64 = to_b64(f.read())
-                    st.rerun()
-
-        custom_t = st.slider("Ή scrub σε custom χρόνο", 0.0, st.session_state.video_dur, 1.0, 0.1)
-        if st.button("📸 Capture custom frame"):
-            fp = extract_frame(st.session_state.video_path, custom_t)
-            with open(fp, "rb") as f:
-                st.session_state.frame_b64 = to_b64(f.read())
-            st.rerun()
-
-    if st.session_state.frame_b64:
-        st.success("✓ Frame επιλέχθηκε" + ("" if use_custom else " (default: 0s)"))
-        st.image(st.session_state.frame_b64, width=200)
-        st.divider()
-
-        if not st.session_state.swapped_url:
-            with st.expander("⚙️ Default prompt (advanced)"):
-                st.caption(DEFAULT_FACE_SWAP_PROMPT)
-
-            custom_face_prompt = st.text_input(
-                "Custom Prompt Section",
-                key="custom_face_swap_prompt",
-                placeholder="Προαιρετικό — προστίθεται στο τέλος του default prompt",
-            )
-
-            if st.button("🎭 Generate Faceswap", type="primary",
-                         disabled=st.session_state.generating):
-                if not st.session_state.generating:
-                    fp = DEFAULT_FACE_SWAP_PROMPT
-                    if custom_face_prompt.strip():
-                        fp = f"{DEFAULT_FACE_SWAP_PROMPT} {custom_face_prompt.strip()}"
-                    st.session_state["_fs_prompt"] = fp
-                    st.session_state.generating = True
-                    st.session_state["_fs_run"] = True
-                    st.rerun()
-        else:
-            st.success("👁 Αποτέλεσμα — Εγκρίνεις;")
-            st.image(st.session_state.swapped_url, width=300)
-            c1, c2 = st.columns(2)
-            with c1:
-                if st.button("✓ Εγκρίνω →", type="primary"):
-                    st.session_state.step = 3
-                    st.rerun()
-            with c2:
-                if st.button("✗ Ξανά"):
-                    st.session_state.swapped_url = None
-                    st.rerun()
-
-    if st.button("← Πίσω"):
-        st.session_state.step = 1
-        st.rerun()
-
-
-# ──────────────────────────────────────────────────────────
-# STEP 3 — VIDEO GENERATION & POST-PROCESSING
-# ──────────────────────────────────────────────────────────
-elif st.session_state.step == 3:
-
-    # ── Video API call ──────────────────────────────────────────────
-    if st.session_state.get("_vid_run"):
-        st.session_state["_vid_run"] = False
-        _m = st.session_state.get("_vid_model", "kling")
-        progress = st.progress(0, text="⏳ Στέλνω αίτημα...")
-        _err = None
-        try:
+        else:  # video
+            _m = st.session_state.get("_gen_model", "kling")
             prompt = DEFAULT_VIDEO_PROMPT
             if _m == "seedance":
                 pred_id = ws_submit(
@@ -653,88 +513,207 @@ elif st.session_state.step == 3:
             st.session_state.gen_url = result
             progress.progress(1.0, text="⬇️ Κατεβάζω το video...")
             st.session_state.final_path = download_video_url(result)
-        except Exception as e:
-            _err = e
-        finally:
-            st.session_state.generating = False
-            progress.empty()
-        if _err:
-            st.error(f"Σφάλμα: {_err}")
-        else:
-            st.rerun()
+    except Exception as e:
+        _err = e
+    finally:
+        progress.empty()
+        st.session_state.app_state = "idle"
+    if _err:
+        st.session_state["_gen_error"] = str(_err)
+    st.rerun()
 
-    # ── Normal UI ──────────────────────────────────────────────────
-    st.subheader("Βήμα 3 — Video Generation")
-    st.image(st.session_state.swapped_url, width=300)
+else:  # app_state == "idle"
 
-    model_label = st.selectbox("Μοντέλο video", list(MODELS.keys()),
-                                index=list(MODELS.keys()).index(st.session_state.model))
-    st.session_state.model = model_label
-    model = MODELS[model_label]
+    if st.session_state.get("_gen_error"):
+        st.error(f"Σφάλμα: {st.session_state.pop('_gen_error', '')}")
 
-    if not st.session_state.gen_url:
-        if st.button("🎬 Δημιούργησε Video", type="primary",
-                     disabled=st.session_state.generating):
-            if not st.session_state.generating:
-                st.session_state["_vid_model"] = model
-                st.session_state.generating = True
-                st.session_state["_vid_run"] = True
-                st.rerun()
+    # ──────────────────────────────────────────────────────────
+    # STEP 1 — DOWNLOAD
+    # ──────────────────────────────────────────────────────────
+    if st.session_state.step == 1:
+        st.subheader("Βήμα 1 — Κατέβασμα Instagram Video")
+        ig_url = st.text_input("Instagram Reel URL", value=st.session_state.ig_url,
+                                placeholder="https://www.instagram.com/reel/...")
+        st.session_state.ig_url = ig_url
 
-    elif not st.session_state.post_processed_path:
-        st.success("👁 Video — Εγκρίνεις;")
+        if st.button("⬇ Download", type="primary", disabled=not ig_url):
+            status = st.empty()
+            try:
+                video_url = None
+                if HIKER_KEY:
+                    status.info("Δοκιμάζω HikerAPI...")
+                    try:
+                        video_url = hiker_get_video_url(ig_url)
+                    except Exception as e:
+                        st.warning(f"HikerAPI: {e}")
 
-        col_l, col_mid, col_r = st.columns([1, 2, 1])
-        with col_mid:
-            if st.session_state.final_path and os.path.exists(st.session_state.final_path):
-                st.video(st.session_state.final_path)
-            else:
-                st.error("⚠️ Το video δεν βρέθηκε στο δίσκο.")
+                if not video_url and APIFY_KEY:
+                    status.info("Δοκιμάζω Apify (backup)...")
+                    video_url = apify_get_video_url(ig_url)
 
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("✅ Approve", type="primary"):
-                progress = st.progress(0, text="⏳ Ξεκινώ επεξεργασία...")
-                try:
-                    from processor import VideoProcessor
-                    clean_path = VideoProcessor.process(
-                        st.session_state.final_path,
-                        progress_cb=lambda p, t: progress.progress(p, text=t),
-                    )
-                    st.session_state.post_processed_path = clean_path
-                    progress.empty()
+                if not video_url:
+                    st.error("Δεν βρέθηκε video. Δοκίμασε άλλο link ή έλεγξε τα API keys.")
+                else:
+                    status.info("Κατεβάζω το video...")
+                    path = download_video_url(video_url)
+                    st.session_state.video_path = path
+                    st.session_state.video_dur = get_duration(path)
+                    dur = st.session_state.video_dur
+                    times = [max(0.3, p * dur) for p in [0.05, 0.2, 0.4, 0.6, 0.8]]
+                    frames = []
+                    status.info("Εξάγω frames...")
+                    for t in times:
+                        fp = extract_frame(path, min(t, dur - 0.2))
+                        frames.append((t, fp))
+                    st.session_state.frame_options = frames
+
+                    default_fp = extract_frame(path, 0.0)
+                    with open(default_fp, "rb") as f:
+                        st.session_state.frame_b64 = to_b64(f.read())
+
+                    status.empty()
+                    st.session_state.step = 2
                     st.rerun()
-                except Exception as e:
-                    progress.empty()
-                    print(f"[post-processing failed] {e}")
-                    st.error(f"Post-processing απέτυχε: {e}")
-        with c2:
-            if st.button("❌ Reject"):
-                st.session_state.gen_url = None
-                st.session_state.final_path = None
-                st.session_state.post_processed_path = None
-                st.session_state.generating = False
+            except Exception as e:
+                st.error(f"Σφάλμα: {e}")
+
+    # ──────────────────────────────────────────────────────────
+    # STEP 2 — REVIEW & FRAME SELECTION
+    # ──────────────────────────────────────────────────────────
+    elif st.session_state.step == 2:
+        st.subheader("Βήμα 2 - Επιλογή Frame & Ρυθμίσεις Prompt")
+
+        use_custom = st.checkbox("🎯 Custom Frame", key="use_custom_frame",
+                                  help="Default: frame 0 (η αρχή του video). Ενεργοποίησέ το για να διαλέξεις άλλο frame.")
+
+        if use_custom:
+            st.write("**Auto-extracted frames** — διάλεξε ή πάτα custom timestamp:")
+            cols = st.columns(5)
+            for i, (t, fp) in enumerate(st.session_state.frame_options):
+                with cols[i]:
+                    st.image(fp, caption=f"{t:.1f}s")
+                    if st.button("Επιλογή", key=f"frame_{i}"):
+                        with open(fp, "rb") as f:
+                            st.session_state.frame_b64 = to_b64(f.read())
+                        st.rerun()
+
+            custom_t = st.slider("Ή scrub σε custom χρόνο", 0.0, st.session_state.video_dur, 1.0, 0.1)
+            if st.button("📸 Capture custom frame"):
+                fp = extract_frame(st.session_state.video_path, custom_t)
+                with open(fp, "rb") as f:
+                    st.session_state.frame_b64 = to_b64(f.read())
                 st.rerun()
 
-    else:
-        st.success("🎉 Pipeline ολοκληρώθηκε! Καθαρό από metadata & tracking artifacts.")
-        if os.path.exists(st.session_state.post_processed_path):
-            with open(st.session_state.post_processed_path, "rb") as f:
-                st.download_button("⬇ Download Final MP4", f, file_name="whale_final.mp4",
-                                    mime="video/mp4", type="primary")
-        else:
-            st.error("⚠️ Το επεξεργασμένο video δεν βρέθηκε στο δίσκο.")
+        if st.session_state.frame_b64:
+            st.success("✓ Frame επιλέχθηκε" + ("" if use_custom else " (default: 0s)"))
+            st.image(st.session_state.frame_b64, width=200)
+            st.divider()
 
-        if st.button("🔄 Νέο Video"):
-            for k in ["video_path", "video_dur", "frame_options", "frame_b64",
-                      "swapped_url", "gen_url", "final_path", "post_processed_path",
-                      "ig_url", "motion_video_path"]:
-                st.session_state[k] = defaults[k]
-            st.session_state.generating = False
+            if not st.session_state.swapped_url:
+                with st.expander("⚙️ Default prompt (advanced)"):
+                    st.caption(DEFAULT_FACE_SWAP_PROMPT)
+
+                custom_face_prompt = st.text_input(
+                    "Custom Prompt Section",
+                    key="custom_face_swap_prompt",
+                    placeholder="Προαιρετικό — προστίθεται στο τέλος του default prompt",
+                )
+
+                if st.button("🎭 Generate Faceswap", type="primary"):
+                    fp = DEFAULT_FACE_SWAP_PROMPT
+                    if custom_face_prompt.strip():
+                        fp = f"{DEFAULT_FACE_SWAP_PROMPT} {custom_face_prompt.strip()}"
+                    st.session_state["_gen_prompt"] = fp
+                    st.session_state["_gen_type"] = "faceswap"
+                    st.session_state.app_state = "generating"
+                    st.rerun()
+            else:
+                st.success("👁 Αποτέλεσμα — Εγκρίνεις;")
+                st.image(st.session_state.swapped_url, width=300)
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("✓ Εγκρίνω →", type="primary"):
+                        st.session_state.step = 3
+                        st.rerun()
+                with c2:
+                    if st.button("✗ Ξανά"):
+                        st.session_state.swapped_url = None
+                        st.rerun()
+
+        if st.button("← Πίσω"):
             st.session_state.step = 1
             st.rerun()
 
-    if st.button("← Πίσω"):
-        st.session_state.generating = False
-        st.session_state.step = 2
-        st.rerun()
+    # ──────────────────────────────────────────────────────────
+    # STEP 3 — VIDEO GENERATION & POST-PROCESSING
+    # ──────────────────────────────────────────────────────────
+    elif st.session_state.step == 3:
+        st.subheader("Βήμα 3 — Video Generation")
+        st.image(st.session_state.swapped_url, width=300)
+
+        model_label = st.selectbox("Μοντέλο video", list(MODELS.keys()),
+                                    index=list(MODELS.keys()).index(st.session_state.model))
+        st.session_state.model = model_label
+        model = MODELS[model_label]
+
+        if not st.session_state.gen_url:
+            if st.button("🎬 Δημιούργησε Video", type="primary"):
+                st.session_state["_gen_model"] = model
+                st.session_state["_gen_type"] = "video"
+                st.session_state.app_state = "generating"
+                st.rerun()
+
+        elif not st.session_state.post_processed_path:
+            st.success("👁 Video — Εγκρίνεις;")
+
+            col_l, col_mid, col_r = st.columns([1, 2, 1])
+            with col_mid:
+                if st.session_state.final_path and os.path.exists(st.session_state.final_path):
+                    st.video(st.session_state.final_path)
+                else:
+                    st.error("⚠️ Το video δεν βρέθηκε στο δίσκο.")
+
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("✅ Approve", type="primary"):
+                    progress = st.progress(0, text="⏳ Ξεκινώ επεξεργασία...")
+                    try:
+                        from processor import VideoProcessor
+                        clean_path = VideoProcessor.process(
+                            st.session_state.final_path,
+                            progress_cb=lambda p, t: progress.progress(p, text=t),
+                        )
+                        st.session_state.post_processed_path = clean_path
+                        progress.empty()
+                        st.rerun()
+                    except Exception as e:
+                        progress.empty()
+                        print(f"[post-processing failed] {e}")
+                        st.error(f"Post-processing απέτυχε: {e}")
+            with c2:
+                if st.button("❌ Reject"):
+                    st.session_state.gen_url = None
+                    st.session_state.final_path = None
+                    st.session_state.post_processed_path = None
+                    st.rerun()
+
+        else:
+            st.success("🎉 Pipeline ολοκληρώθηκε! Καθαρό από metadata & tracking artifacts.")
+            if os.path.exists(st.session_state.post_processed_path):
+                with open(st.session_state.post_processed_path, "rb") as f:
+                    st.download_button("⬇ Download Final MP4", f, file_name="whale_final.mp4",
+                                        mime="video/mp4", type="primary")
+            else:
+                st.error("⚠️ Το επεξεργασμένο video δεν βρέθηκε στο δίσκο.")
+
+            if st.button("🔄 Νέο Video"):
+                for k in ["video_path", "video_dur", "frame_options", "frame_b64",
+                          "swapped_url", "gen_url", "final_path", "post_processed_path",
+                          "ig_url", "motion_video_path"]:
+                    st.session_state[k] = defaults[k]
+                st.session_state.step = 1
+                st.rerun()
+
+        if st.button("← Πίσω"):
+            st.session_state.step = 2
+            st.rerun()
