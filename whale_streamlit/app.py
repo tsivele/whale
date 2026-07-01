@@ -514,10 +514,9 @@ if st.session_state.step == 1:
 # ──────────────────────────────────────────────────────────
 elif st.session_state.step == 2:
 
-    # ── Faceswap API call: ΜΟΝΟ progress bar, τίποτα άλλο ──────────
+    # ── Faceswap API call ───────────────────────────────────────────
     if st.session_state.get("_fs_run"):
         st.session_state["_fs_run"] = False
-        st.subheader("Βήμα 2 - Faceswap σε εξέλιξη...")
         progress = st.progress(0, text="⏳ Στέλνω αίτημα face swap...")
         _err = None
         try:
@@ -542,12 +541,6 @@ elif st.session_state.step == 2:
             st.error(f"Σφάλμα: {_err}")
         else:
             st.rerun()
-        st.stop()  # κανένα άλλο UI, κανένα button
-
-    # ── Safety: generating=True χωρίς run flag ─────────────────────
-    if st.session_state.generating:
-        st.info("⏳ Γενιά σε εξέλιξη...")
-        st.stop()
 
     # ── Normal UI ──────────────────────────────────────────────────
     st.subheader("Βήμα 2 - Επιλογή Frame & Ρυθμίσεις Prompt")
@@ -588,14 +581,16 @@ elif st.session_state.step == 2:
                 placeholder="Προαιρετικό — προστίθεται στο τέλος του default prompt",
             )
 
-            if st.button("🎭 Generate Faceswap", type="primary"):
-                fp = DEFAULT_FACE_SWAP_PROMPT
-                if custom_face_prompt.strip():
-                    fp = f"{DEFAULT_FACE_SWAP_PROMPT} {custom_face_prompt.strip()}"
-                st.session_state["_fs_prompt"] = fp
-                st.session_state.generating = True
-                st.session_state["_fs_run"] = True
-                st.rerun()
+            if st.button("🎭 Generate Faceswap", type="primary",
+                         disabled=st.session_state.generating):
+                if not st.session_state.generating:
+                    fp = DEFAULT_FACE_SWAP_PROMPT
+                    if custom_face_prompt.strip():
+                        fp = f"{DEFAULT_FACE_SWAP_PROMPT} {custom_face_prompt.strip()}"
+                    st.session_state["_fs_prompt"] = fp
+                    st.session_state.generating = True
+                    st.session_state["_fs_run"] = True
+                    st.rerun()
         else:
             st.success("👁 Αποτέλεσμα — Εγκρίνεις;")
             st.image(st.session_state.swapped_url, width=300)
@@ -619,11 +614,10 @@ elif st.session_state.step == 2:
 # ──────────────────────────────────────────────────────────
 elif st.session_state.step == 3:
 
-    # ── Video API call: ΜΟΝΟ progress bar, τίποτα άλλο ────────────
+    # ── Video API call ──────────────────────────────────────────────
     if st.session_state.get("_vid_run"):
         st.session_state["_vid_run"] = False
         _m = st.session_state.get("_vid_model", "kling")
-        st.subheader("Βήμα 3 — Video σε εξέλιξη...")
         progress = st.progress(0, text="⏳ Στέλνω αίτημα...")
         _err = None
         try:
@@ -668,12 +662,6 @@ elif st.session_state.step == 3:
             st.error(f"Σφάλμα: {_err}")
         else:
             st.rerun()
-        st.stop()  # κανένα άλλο UI, κανένα button
-
-    # ── Safety: generating=True χωρίς run flag ─────────────────────
-    if st.session_state.generating:
-        st.info("⏳ Γενιά σε εξέλιξη...")
-        st.stop()
 
     # ── Normal UI ──────────────────────────────────────────────────
     st.subheader("Βήμα 3 — Video Generation")
@@ -685,11 +673,13 @@ elif st.session_state.step == 3:
     model = MODELS[model_label]
 
     if not st.session_state.gen_url:
-        if st.button("🎬 Δημιούργησε Video", type="primary"):
-            st.session_state["_vid_model"] = model
-            st.session_state.generating = True
-            st.session_state["_vid_run"] = True
-            st.rerun()
+        if st.button("🎬 Δημιούργησε Video", type="primary",
+                     disabled=st.session_state.generating):
+            if not st.session_state.generating:
+                st.session_state["_vid_model"] = model
+                st.session_state.generating = True
+                st.session_state["_vid_run"] = True
+                st.rerun()
 
     elif not st.session_state.post_processed_path:
         st.success("👁 Video — Εγκρίνεις;")
