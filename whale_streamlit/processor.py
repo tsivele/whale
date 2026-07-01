@@ -1,5 +1,7 @@
 """
-Video post-processing pipeline — PyAV, no ffmpeg CLI.
+Video post-processing pipeline — stream copy remux, no re-encode, no ffmpeg CLI.
+Strips all source metadata by creating a new container.
+Preserves original fps, bitrate, and quality exactly.
 """
 
 import os
@@ -7,23 +9,17 @@ import tempfile
 import av
 
 
-def _try_open_output(path: str):
-    """Open av output, trying mp4 then matroska as fallback."""
-    try:
-        return av.open(path, "w", format="mp4")
-    except Exception:
-        mkv = path.replace(".mp4", ".mkv")
-        return av.open(mkv, "w", format="matroska")
-
-
 class VideoProcessor:
 
     @classmethod
     def process(cls, src: str, progress_cb=None) -> str:
+        """
+        Remux src into a clean MP4 — no re-encode, strips all source metadata.
+        Returns path of the output file.
+        """
         if progress_cb:
-            progress_cb(0.02, "Ανοίγω αρχείο...")
+            progress_cb(0.05, "Ανοίγω αρχείο...")
 
-        # Generate a temp path WITHOUT creating the file — av needs to create it itself
         dst = tempfile.mktemp(suffix=".mp4")
         print(f"[processor] src={src!r}  dst={dst!r}")
 
@@ -31,53 +27,45 @@ class VideoProcessor:
             with av.open(src) as inp:
                 v_in = inp.streams.video[0]
                 a_in = next((s for s in inp.streams if s.type == "audio"), None)
-                total_frames = v_in.frames or 0
-                print(f"[processor] {v_in.codec_context.name} {v_in.width}x{v_in.height}"
-                      f"  audio={'yes' if a_in else 'no'}  frames={total_frames}")
+                total = v_in.frames or 0
+                print(f"[processor] {v_in.codec_context.name} "
+                      f"{v_in.width}x{v_in.height} "
+                      f"{float(v_in.average_rate):.2f}fps  "
+                      f"audio={'yes' if a_in else 'no'}")
 
-                with _try_open_output(dst) as out:
-                    # Try libx264, fall back to mpeg4 (always built-in)
-                    try:
-                        v_out = out.add_stream("libx264", rate=v_in.average_rate)
-                        v_out.options = {"crf": "23", "preset": "medium"}
-                    except Exception as e:
-                        print(f"[processor] libx264 unavailable ({e}), using mpeg4")
-                        v_out = out.add_stream("mpeg4", rate=v_in.average_rate)
+                if progress_cb:
+                    progress_cb(0.10, "Αντιγραφή streams...")
 
-                    v_out.width  = v_in.width
-                    v_out.height = v_in.height
-                    v_out.pix_fmt = "yuv420p"
+                with av.open(dst, "w", format="mp4") as out:
+                    # Stream copy — copy codec params, mux packets without re-encoding
+                    out_v = out.add_stream(v_in.codec_context.name)
+                    out_v.codec_context.extradata = v_in.codec_context.extradata
+                    out_v.width     = v_in.width
+                    out_v.height    = v_in.height
+                    out_v.pix_fmt   = v_in.pix_fmt or "yuv420p"
+                    out_v.time_base = v_in.time_base
 
-                    a_out = None
+                    out_a = None
                     if a_in:
-                        try:
-                            a_out = out.add_stream("aac", rate=a_in.rate)
-                            a_out.layout = "stereo" if a_in.channels >= 2 else "mono"
-                        except Exception as e:
-                            print(f"[processor] aac unavailable ({e}), skipping audio")
+                        out_a = out.add_stream(a_in.codec_context.name)
+                        out_a.codec_context.extradata = a_in.codec_context.extradata
+                        out_a.time_base = a_in.time_base
 
-                    encoded = 0
-                    for packet in inp.demux(*[s for s in [v_in, a_in] if s]):
+                    copied = 0
+                    in_streams = [s for s in [v_in, a_in] if s]
+                    for packet in inp.demux(*in_streams):
                         if packet.dts is None:
                             continue
-                        for frame in packet.decode():
-                            frame.pts = None
-                            if isinstance(frame, av.VideoFrame):
-                                for pkt in v_out.encode(frame):
-                                    out.mux(pkt)
-                                encoded += 1
-                                if progress_cb and total_frames:
-                                    pct = min(0.92, 0.05 + 0.87 * encoded / total_frames)
-                                    progress_cb(pct, f"Frame {encoded}/{total_frames}...")
-                            elif a_out:
-                                for pkt in a_out.encode(frame):
-                                    out.mux(pkt)
-
-                    for pkt in v_out.encode(None):
-                        out.mux(pkt)
-                    if a_out:
-                        for pkt in a_out.encode(None):
-                            out.mux(pkt)
+                        if packet.stream == v_in:
+                            packet.stream = out_v
+                            out.mux(packet)
+                            copied += 1
+                            if progress_cb and total:
+                                pct = min(0.95, 0.10 + 0.85 * copied / total)
+                                progress_cb(pct, f"Frame {copied}/{total}...")
+                        elif out_a and packet.stream == a_in:
+                            packet.stream = out_a
+                            out.mux(packet)
 
             print(f"[processor] done — {os.path.getsize(dst)} bytes")
 
@@ -101,6 +89,7 @@ class VideoProcessor:
                 "video_codec": v.codec_context.name,
                 "width": v.width,
                 "height": v.height,
+                "fps": float(v.average_rate),
                 "metadata": dict(c.metadata),
                 "audio_codec": a.codec_context.name if a else None,
             }
