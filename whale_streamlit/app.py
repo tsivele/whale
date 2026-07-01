@@ -126,6 +126,7 @@ defaults = {
     "post_processed_path": None,
     "app_state": "idle",
     "_gen_error": None,
+    "_gen_pred_id": None,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -441,6 +442,10 @@ def strip_metadata(in_path):
 # ──────────────────────────────────────────────────────────
 # UI — STEP BAR
 # ──────────────────────────────────────────────────────────
+# If a prediction is already in flight, keep generating state alive across reruns
+if st.session_state.get("_gen_pred_id"):
+    st.session_state.app_state = "generating"
+
 st.title("🐋 Whale Pipeline")
 st.caption("AI Video Generation · Cloud · Wavespeed + HikerAPI")
 
@@ -466,58 +471,75 @@ if st.session_state.app_state == "generating":
     progress = st.progress(0, text=_label)
     _err = None
     try:
-        if _gen_type == "faceswap":
-            final_prompt = st.session_state.get("_gen_prompt", DEFAULT_FACE_SWAP_PROMPT)
-            creator_b64 = to_b64(st.session_state["creator_bytes"])
-            pred_id = ws_submit(
-                "wavespeed-ai/qwen-image-2.0-pro/edit",
-                {
-                    "images": [creator_b64, st.session_state.frame_b64],
-                    "prompt": final_prompt,
-                    "seed": -1,
-                },
-            )
-            result = ws_poll(pred_id, progress)
-            st.session_state.swapped_url = result
-        else:  # video
-            _m = st.session_state.get("_gen_model", "kling")
-            prompt = DEFAULT_VIDEO_PROMPT
-            if _m == "seedance":
+        # Idempotency: submit only once; if pred_id is already stored, resume polling
+        if not st.session_state.get("_gen_pred_id"):
+            if _gen_type == "faceswap":
+                final_prompt = st.session_state.get("_gen_prompt", DEFAULT_FACE_SWAP_PROMPT)
+                creator_b64 = to_b64(st.session_state["creator_bytes"])
                 pred_id = ws_submit(
-                    "bytedance/seedance-2.0/image-to-video",
-                    {"image": st.session_state.swapped_url, "prompt": prompt,
-                     "duration": 5, "resolution": "1080p", "seed": -1},
-                )
-            elif _m == "wan":
-                pred_id = ws_submit(
-                    "alibaba/wan-2.7/image-to-video",
-                    {"image": st.session_state.swapped_url, "prompt": prompt,
-                     "duration": 5, "resolution": "1080p", "seed": -1},
-                )
-            else:  # kling
-                with open(st.session_state.video_path, "rb") as f:
-                    video_b64 = to_b64(f.read(), mime="video/mp4")
-                pred_id = ws_submit(
-                    "kwaivgi/kling-v3.0-pro/motion-control",
+                    "wavespeed-ai/qwen-image-2.0-pro/edit",
                     {
-                        "image": st.session_state.swapped_url,
-                        "video": video_b64,
-                        "prompt": prompt,
-                        "duration": 5,
-                        "aspect_ratio": "9:16",
-                        "cfg_scale": 0.5,
+                        "images": [creator_b64, st.session_state.frame_b64],
+                        "prompt": final_prompt,
                         "seed": -1,
                     },
                 )
-            result = ws_poll(pred_id, progress)
+            else:  # video
+                _m = st.session_state.get("_gen_model", "kling")
+                prompt = DEFAULT_VIDEO_PROMPT
+                if _m == "seedance":
+                    pred_id = ws_submit(
+                        "bytedance/seedance-2.0/image-to-video",
+                        {"image": st.session_state.swapped_url, "prompt": prompt,
+                         "duration": 5, "resolution": "1080p", "seed": -1},
+                    )
+                elif _m == "wan":
+                    pred_id = ws_submit(
+                        "alibaba/wan-2.7/image-to-video",
+                        {"image": st.session_state.swapped_url, "prompt": prompt,
+                         "duration": 5, "resolution": "1080p", "seed": -1},
+                    )
+                else:  # kling
+                    with open(st.session_state.video_path, "rb") as f:
+                        video_b64 = to_b64(f.read(), mime="video/mp4")
+                    pred_id = ws_submit(
+                        "kwaivgi/kling-v3.0-pro/motion-control",
+                        {
+                            "image": st.session_state.swapped_url,
+                            "video": video_b64,
+                            "prompt": prompt,
+                            "duration": 5,
+                            "aspect_ratio": "9:16",
+                            "cfg_scale": 0.5,
+                            "seed": -1,
+                        },
+                    )
+            st.session_state["_gen_pred_id"] = pred_id  # persist immediately
+
+        pred_id = st.session_state["_gen_pred_id"]
+        result = ws_poll(pred_id, progress)
+
+        if _gen_type == "faceswap":
+            st.session_state.swapped_url = result
+        else:
             st.session_state.gen_url = result
             progress.progress(1.0, text="⬇️ Κατεβάζω το video...")
             st.session_state.final_path = download_video_url(result)
+        st.session_state["_gen_pred_id"] = None  # clear on success
+
     except Exception as e:
+        # Streamlit rerun/stop signals are not real errors — re-raise them
+        if type(e).__name__ in ("RerunException", "StopException"):
+            raise
         _err = e
+        st.session_state["_gen_pred_id"] = None  # clear on real error
+
     finally:
         progress.empty()
-        st.session_state.app_state = "idle"
+        # Only return to idle if no prediction is still pending
+        if not st.session_state.get("_gen_pred_id"):
+            st.session_state.app_state = "idle"
+
     if _err:
         st.session_state["_gen_error"] = str(_err)
     st.rerun()
