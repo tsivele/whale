@@ -50,14 +50,7 @@ class VideoProcessor:
 
             total_frames = v_in.frames or None  # may be 0 if not in header
 
-            # movflags +faststart is an optimisation — skip if the av version rejects it.
-            try:
-                _out_ctx = av.open(dst, "w", format="mp4", options={"movflags": "+faststart"})
-                _out_ctx.close()
-                _open_kwargs = {"options": {"movflags": "+faststart"}}
-            except Exception:
-                _open_kwargs = {}
-            with av.open(dst, "w", format="mp4", **_open_kwargs) as out:
+            with av.open(dst, "w", format="mp4") as out:
                 v_out = out.add_stream("libx264", rate=v_in.average_rate)
                 v_out.width  = v_in.width
                 v_out.height = v_in.height
