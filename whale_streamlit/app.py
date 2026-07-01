@@ -256,7 +256,7 @@ def ws_poll(pred_id, progress_bar):
         status = d.get("status", "running")
         # 0 → 90% linearly over ~4 min, then 100% on complete
         pct = min(0.9, (i + 1) / 60)
-        progress_bar.progress(pct, text=f"⏳ {status}... {(i + 1) * 4}s")
+        progress_bar.progress(pct, text=f"⏳ {status}...")
         if status == "completed":
             progress_bar.progress(1.0, text="✅ Ολοκληρώθηκε!")
             outputs = d.get("outputs", [])
@@ -550,33 +550,35 @@ elif st.session_state.step == 2:
                 placeholder="Προαιρετικό — προστίθεται στο τέλος του default prompt",
             )
 
-            if st.button("🎭 Generate Faceswap", type="primary",
-                         disabled=st.session_state.generating):
-                st.session_state.generating = True
-                progress = st.progress(0, text="⏳ Στέλνω αίτημα face swap...")
-                try:
-                    final_prompt = DEFAULT_FACE_SWAP_PROMPT
-                    if custom_face_prompt.strip():
-                        final_prompt = f"{DEFAULT_FACE_SWAP_PROMPT} {custom_face_prompt.strip()}"
+            if not st.session_state.generating:
+                if st.button("🎭 Generate Faceswap", type="primary"):
+                    st.session_state.generating = True
+                    progress = st.progress(0, text="⏳ Στέλνω αίτημα face swap...")
+                    try:
+                        final_prompt = DEFAULT_FACE_SWAP_PROMPT
+                        if custom_face_prompt.strip():
+                            final_prompt = f"{DEFAULT_FACE_SWAP_PROMPT} {custom_face_prompt.strip()}"
 
-                    creator_b64 = to_b64(st.session_state["creator_bytes"])
-                    pred_id = ws_submit(
-                        "wavespeed-ai/qwen-image-2.0-pro/edit",
-                        {
-                            "images": [creator_b64, st.session_state.frame_b64],
-                            "prompt": final_prompt,
-                            "seed": -1,
-                        },
-                    )
-                    result = ws_poll(pred_id, progress)
-                    st.session_state.swapped_url = result
-                    st.session_state.generating = False
-                    progress.empty()
-                    st.rerun()
-                except Exception as e:
-                    st.session_state.generating = False
-                    progress.empty()
-                    st.error(f"Σφάλμα: {e}")
+                        creator_b64 = to_b64(st.session_state["creator_bytes"])
+                        pred_id = ws_submit(
+                            "wavespeed-ai/qwen-image-2.0-pro/edit",
+                            {
+                                "images": [creator_b64, st.session_state.frame_b64],
+                                "prompt": final_prompt,
+                                "seed": -1,
+                            },
+                        )
+                        result = ws_poll(pred_id, progress)
+                        st.session_state.swapped_url = result
+                        st.session_state.generating = False
+                        progress.empty()
+                        st.rerun()
+                    except Exception as e:
+                        st.session_state.generating = False
+                        progress.empty()
+                        st.error(f"Σφάλμα: {e}")
+            else:
+                st.info("⏳ Γίνεται επεξεργασία... Παρακαλώ περιμένετε.")
         else:
             st.success("👁 Αποτέλεσμα — Εγκρίνεις;")
             st.image(st.session_state.swapped_url, width=300)
@@ -608,52 +610,54 @@ elif st.session_state.step == 3:
     model = MODELS[model_label]
 
     if not st.session_state.gen_url:
-        if st.button("🎬 Δημιούργησε Video", type="primary",
-                     disabled=st.session_state.generating):
-            st.session_state.generating = True
-            progress = st.progress(0, text="⏳ Στέλνω αίτημα...")
-            try:
-                prompt = DEFAULT_VIDEO_PROMPT
-                if model == "seedance":
-                    pred_id = ws_submit(
-                        "bytedance/seedance-2.0/image-to-video",
-                        {"image": st.session_state.swapped_url, "prompt": prompt,
-                         "duration": 5, "resolution": "1080p", "seed": -1},
-                    )
-                elif model == "wan":
-                    pred_id = ws_submit(
-                        "alibaba/wan-2.7/image-to-video",
-                        {"image": st.session_state.swapped_url, "prompt": prompt,
-                         "duration": 5, "resolution": "1080p", "seed": -1},
-                    )
-                else:  # kling
-                    with open(st.session_state.video_path, "rb") as f:
-                        video_b64 = to_b64(f.read(), mime="video/mp4")
-                    pred_id = ws_submit(
-                        "kwaivgi/kling-v3.0-pro/motion-control",
-                        {
-                            "image": st.session_state.swapped_url,
-                            "video": video_b64,
-                            "prompt": prompt,
-                            "duration": 5,
-                            "aspect_ratio": "9:16",
-                            "cfg_scale": 0.5,
-                            "seed": -1,
-                        },
-                    )
-                result = ws_poll(pred_id, progress)
-                st.session_state.gen_url = result
+        if not st.session_state.generating:
+            if st.button("🎬 Δημιούργησε Video", type="primary"):
+                st.session_state.generating = True
+                progress = st.progress(0, text="⏳ Στέλνω αίτημα...")
+                try:
+                    prompt = DEFAULT_VIDEO_PROMPT
+                    if model == "seedance":
+                        pred_id = ws_submit(
+                            "bytedance/seedance-2.0/image-to-video",
+                            {"image": st.session_state.swapped_url, "prompt": prompt,
+                             "duration": 5, "resolution": "1080p", "seed": -1},
+                        )
+                    elif model == "wan":
+                        pred_id = ws_submit(
+                            "alibaba/wan-2.7/image-to-video",
+                            {"image": st.session_state.swapped_url, "prompt": prompt,
+                             "duration": 5, "resolution": "1080p", "seed": -1},
+                        )
+                    else:  # kling
+                        with open(st.session_state.video_path, "rb") as f:
+                            video_b64 = to_b64(f.read(), mime="video/mp4")
+                        pred_id = ws_submit(
+                            "kwaivgi/kling-v3.0-pro/motion-control",
+                            {
+                                "image": st.session_state.swapped_url,
+                                "video": video_b64,
+                                "prompt": prompt,
+                                "duration": 5,
+                                "aspect_ratio": "9:16",
+                                "cfg_scale": 0.5,
+                                "seed": -1,
+                            },
+                        )
+                    result = ws_poll(pred_id, progress)
+                    st.session_state.gen_url = result
 
-                progress.progress(1.0, text="⬇️ Κατεβάζω το video...")
-                st.session_state.final_path = download_video_url(result)
+                    progress.progress(1.0, text="⬇️ Κατεβάζω το video...")
+                    st.session_state.final_path = download_video_url(result)
 
-                progress.empty()
-                st.session_state.generating = False
-                st.rerun()
-            except Exception as e:
-                st.session_state.generating = False
-                progress.empty()
-                st.error(f"Σφάλμα: {e}")
+                    progress.empty()
+                    st.session_state.generating = False
+                    st.rerun()
+                except Exception as e:
+                    st.session_state.generating = False
+                    progress.empty()
+                    st.error(f"Σφάλμα: {e}")
+        else:
+            st.info("⏳ Γίνεται επεξεργασία... Παρακαλώ περιμένετε.")
 
     elif not st.session_state.post_processed_path:
         st.success("👁 Video — Εγκρίνεις;")
