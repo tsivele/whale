@@ -1,7 +1,6 @@
 """
-Video post-processing pipeline — stream copy remux, no re-encode, no ffmpeg CLI.
-Strips all source metadata by creating a new container.
-Preserves original fps, bitrate, and quality exactly.
+Video post-processing pipeline — re-encode with libx264/aac, strips all source metadata.
+Works with PyAV 11.x and 17.x. Correct fps guaranteed via input-stream time_base alignment.
 """
 
 import os
@@ -14,7 +13,7 @@ class VideoProcessor:
     @classmethod
     def process(cls, src: str, progress_cb=None) -> str:
         """
-        Remux src into a clean MP4 — no re-encode, strips all source metadata.
+        Re-encodes src into a clean MP4 with libx264/aac, stripping all source metadata.
         Returns path of the output file.
         """
         if progress_cb:
@@ -27,47 +26,67 @@ class VideoProcessor:
             with av.open(src) as inp:
                 v_in = inp.streams.video[0]
                 a_in = next((s for s in inp.streams if s.type == "audio"), None)
-                total = v_in.frames or 0
+
+                fps = float(v_in.average_rate)
+                tb = v_in.time_base
+                # pts_step: how many time_base ticks = one frame
+                # e.g. tb=1/90000, fps=25 → pts_step=3600
+                pts_step = round(tb.denominator / (fps * tb.numerator))
+
+                total_frames = int(v_in.frames) if v_in.frames else 0
                 print(f"[processor] {v_in.codec_context.name} "
                       f"{v_in.width}x{v_in.height} "
-                      f"{float(v_in.average_rate):.2f}fps  "
-                      f"audio={'yes' if a_in else 'no'}")
+                      f"{fps:.3f}fps  tb={tb}  pts_step={pts_step}  "
+                      f"frames={total_frames}  audio={'yes' if a_in else 'no'}")
 
                 if progress_cb:
-                    progress_cb(0.10, "Αντιγραφή streams...")
+                    progress_cb(0.10, "Ξεκινώ re-encode...")
 
                 with av.open(dst, "w", format="mp4") as out:
-                    # Stream copy — copy codec params, mux packets without re-encoding
-                    out_v = out.add_stream(v_in.codec_context.name)
-                    out_v.codec_context.extradata = v_in.codec_context.extradata
-                    out_v.width     = v_in.width
-                    out_v.height    = v_in.height
-                    out_v.pix_fmt   = v_in.pix_fmt or "yuv420p"
-                    out_v.time_base = v_in.time_base
+                    v_out = out.add_stream("libx264", rate=v_in.average_rate)
+                    v_out.width = v_in.width
+                    v_out.height = v_in.height
+                    v_out.pix_fmt = "yuv420p"
 
-                    out_a = None
+                    a_out = None
                     if a_in:
-                        out_a = out.add_stream(a_in.codec_context.name)
-                        out_a.codec_context.extradata = a_in.codec_context.extradata
-                        out_a.time_base = a_in.time_base
+                        a_out = out.add_stream("aac")
 
-                    copied = 0
-                    in_streams = [s for s in [v_in, a_in] if s]
-                    for packet in inp.demux(*in_streams):
+                    v_idx = 0
+                    streams = [s for s in [v_in, a_in] if s]
+
+                    for packet in inp.demux(*streams):
                         if packet.dts is None:
                             continue
-                        if packet.stream == v_in:
-                            packet.stream = out_v
-                            out.mux(packet)
-                            copied += 1
-                            if progress_cb and total:
-                                pct = min(0.95, 0.10 + 0.85 * copied / total)
-                                progress_cb(pct, f"Frame {copied}/{total}...")
-                        elif out_a and packet.stream == a_in:
-                            packet.stream = out_a
-                            out.mux(packet)
 
-            print(f"[processor] done — {os.path.getsize(dst)} bytes")
+                        if packet.stream == v_in:
+                            for frame in packet.decode():
+                                # Assign pts in the input stream's time_base units
+                                # so the encoder produces the correct frame rate
+                                frame.pts = v_idx * pts_step
+                                v_idx += 1
+                                for pkt in v_out.encode(frame):
+                                    out.mux(pkt)
+                                if progress_cb and total_frames:
+                                    pct = min(0.95, 0.10 + 0.85 * v_idx / total_frames)
+                                    progress_cb(pct, f"Frame {v_idx}/{total_frames}...")
+
+                        elif a_out and packet.stream == a_in:
+                            for frame in packet.decode():
+                                for pkt in a_out.encode(frame):
+                                    out.mux(pkt)
+
+                    # Flush encoders
+                    for pkt in v_out.encode(None):
+                        out.mux(pkt)
+                    if a_out:
+                        for pkt in a_out.encode(None):
+                            out.mux(pkt)
+
+            size = os.path.getsize(dst)
+            print(f"[processor] done — {size} bytes")
+            if size < 1000:
+                raise RuntimeError(f"Output file suspiciously small: {size} bytes")
 
         except Exception:
             if os.path.exists(dst):
