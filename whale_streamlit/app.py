@@ -898,16 +898,10 @@ else:  # app_state == "idle"
                         from processor import VideoProcessor
                         if _v_dual:
                             _fpaths = st.session_state.get("final_paths") or [None, None]
-                            _pps = []
-                            for _pi, _fp in enumerate(_fpaths):
-                                _pn = "SOFIA" if _pi == 0 else "MELINA"
-                                progress.progress(_pi * 0.5, text=f"⏳ Επεξεργασία {_pn}...")
-                                _cp = VideoProcessor.process(
-                                    _fp,
-                                    progress_cb=lambda p, t, _i=_pi: progress.progress(
-                                        _i * 0.5 + p * 0.5, text=t),
-                                )
-                                _pps.append(_cp)
+                            _pps = VideoProcessor.process(
+                                _fpaths,
+                                progress_cb=lambda p, t: progress.progress(p, text=t),
+                            )
                             st.session_state["post_processed_paths"] = _pps
                             st.session_state.post_processed_path = _pps[0]
                         else:
