@@ -130,6 +130,11 @@ defaults = {
     "_gen_pred_id": None,
     "creator_mode": "SOFIA",
     "creator2_bytes": None,
+    "_gen_creator_idx": 0,
+    "swapped_results": None,
+    "gen_urls": None,
+    "final_paths": None,
+    "post_processed_paths": None,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -472,46 +477,51 @@ st.divider()
 # ──────────────────────────────────────────────────────────
 if st.session_state.app_state == "generating":
     _gen_type = st.session_state.get("_gen_type", "")
-    _label = "⏳ Δημιουργία Faceswap..." if _gen_type == "faceswap" else "⏳ Δημιουργία Video..."
+    _cmode    = st.session_state.get("_gen_creator_mode", "SOFIA")
+    _dual     = _cmode == "SOFIA + MELINA"
+    _idx      = st.session_state.get("_gen_creator_idx", 0)
+    _cname    = ("SOFIA" if _idx == 0 else "MELINA") if _dual else ""
+    if _gen_type == "faceswap":
+        _label = (f"⏳ Faceswap {_cname} ({_idx + 1}/2)..." if _dual
+                  else "⏳ Δημιουργία Faceswap...")
+    else:
+        _label = (f"⏳ Video {_cname} ({_idx + 1}/2)..." if _dual
+                  else "⏳ Δημιουργία Video...")
     progress = st.progress(0, text=_label)
     _err = None
     try:
-        # Idempotency: submit only once; if pred_id is already stored, resume polling
+        # Idempotency: submit only once; if pred_id already stored, resume polling
         if not st.session_state.get("_gen_pred_id"):
             if _gen_type == "faceswap":
                 final_prompt = st.session_state.get("_gen_prompt", DEFAULT_FACE_SWAP_PROMPT)
-                _cmode = st.session_state.get("_gen_creator_mode", "SOFIA")
-                if _cmode == "SOFIA + MELINA":
-                    images = [
-                        to_b64(st.session_state["creator_bytes"]),
-                        to_b64(st.session_state["creator2_bytes"]),
-                        st.session_state.frame_b64,
-                    ]
+                if _dual:
+                    _cb = st.session_state["creator_bytes"] if _idx == 0 else st.session_state["creator2_bytes"]
+                    images = [to_b64(_cb), st.session_state.frame_b64]
                 elif _cmode == "MELINA":
                     images = [to_b64(st.session_state["creator2_bytes"]), st.session_state.frame_b64]
                 else:
                     images = [to_b64(st.session_state["creator_bytes"]), st.session_state.frame_b64]
                 pred_id = ws_submit(
                     "wavespeed-ai/qwen-image-2.0-pro/edit",
-                    {
-                        "images": images,
-                        "prompt": final_prompt,
-                        "seed": -1,
-                    },
+                    {"images": images, "prompt": final_prompt, "seed": -1},
                 )
             else:  # video
                 _m = st.session_state.get("_gen_model", "kling")
                 prompt = DEFAULT_VIDEO_PROMPT
+                _swap_url = (
+                    (st.session_state.get("swapped_results") or [None, None])[_idx]
+                    if _dual else st.session_state.swapped_url
+                )
                 if _m == "seedance":
                     pred_id = ws_submit(
                         "bytedance/seedance-2.0/image-to-video",
-                        {"image": st.session_state.swapped_url, "prompt": prompt,
+                        {"image": _swap_url, "prompt": prompt,
                          "duration": 5, "resolution": "1080p", "seed": -1},
                     )
                 elif _m == "wan":
                     pred_id = ws_submit(
                         "alibaba/wan-2.7/image-to-video",
-                        {"image": st.session_state.swapped_url, "prompt": prompt,
+                        {"image": _swap_url, "prompt": prompt,
                          "duration": 5, "resolution": "1080p", "seed": -1},
                     )
                 else:  # kling
@@ -520,7 +530,7 @@ if st.session_state.app_state == "generating":
                     pred_id = ws_submit(
                         "kwaivgi/kling-v3.0-pro/motion-control",
                         {
-                            "image": st.session_state.swapped_url,
+                            "image": _swap_url,
                             "video": video_b64,
                             "prompt": prompt,
                             "duration": 5,
@@ -532,22 +542,96 @@ if st.session_state.app_state == "generating":
             st.session_state["_gen_pred_id"] = pred_id  # persist immediately
 
         pred_id = st.session_state["_gen_pred_id"]
-        result = ws_poll(pred_id, progress)
+        result  = ws_poll(pred_id, progress)
 
         if _gen_type == "faceswap":
-            st.session_state.swapped_url = result
-        else:
-            st.session_state.gen_url = result
-            progress.progress(1.0, text="⬇️ Κατεβάζω το video...")
-            st.session_state.final_path = download_video_url(result)
-        st.session_state["_gen_pred_id"] = None  # clear on success
+            if _dual:
+                _res = list(st.session_state.get("swapped_results") or [None, None])
+                _res[_idx] = result
+                st.session_state["swapped_results"] = _res
+                st.session_state["_gen_pred_id"] = None
+                if _idx == 0:
+                    # Chain: submit 2nd creator immediately so _gen_pred_id stays set
+                    st.session_state["_gen_creator_idx"] = 1
+                    final_prompt = st.session_state.get("_gen_prompt", DEFAULT_FACE_SWAP_PROMPT)
+                    pred_id2 = ws_submit(
+                        "wavespeed-ai/qwen-image-2.0-pro/edit",
+                        {"images": [to_b64(st.session_state["creator2_bytes"]),
+                                    st.session_state.frame_b64],
+                         "prompt": final_prompt, "seed": -1},
+                    )
+                    st.session_state["_gen_pred_id"] = pred_id2
+                else:
+                    st.session_state["_gen_creator_idx"] = 0  # both done, reset
+            else:
+                st.session_state.swapped_url = result
+                st.session_state["_gen_pred_id"] = None
+
+        else:  # video
+            if _dual:
+                _gurls = list(st.session_state.get("gen_urls") or [None, None])
+                _gurls[_idx] = result
+                st.session_state["gen_urls"] = _gurls
+                progress.progress(1.0, text=f"⬇️ Κατεβάζω {_cname} video...")
+                _fpaths = list(st.session_state.get("final_paths") or [None, None])
+                _fpaths[_idx] = download_video_url(result)
+                st.session_state["final_paths"] = _fpaths
+                st.session_state["_gen_pred_id"] = None
+                if _idx == 0:
+                    # Chain: submit 2nd video immediately
+                    st.session_state["_gen_creator_idx"] = 1
+                    _swap_url2 = (st.session_state.get("swapped_results") or [None, None])[1]
+                    _m2 = st.session_state.get("_gen_model", "kling")
+                    prompt2 = DEFAULT_VIDEO_PROMPT
+                    if _m2 == "seedance":
+                        pred_id2 = ws_submit(
+                            "bytedance/seedance-2.0/image-to-video",
+                            {"image": _swap_url2, "prompt": prompt2,
+                             "duration": 5, "resolution": "1080p", "seed": -1},
+                        )
+                    elif _m2 == "wan":
+                        pred_id2 = ws_submit(
+                            "alibaba/wan-2.7/image-to-video",
+                            {"image": _swap_url2, "prompt": prompt2,
+                             "duration": 5, "resolution": "1080p", "seed": -1},
+                        )
+                    else:  # kling
+                        with open(st.session_state.video_path, "rb") as f:
+                            video_b64_2 = to_b64(f.read(), mime="video/mp4")
+                        pred_id2 = ws_submit(
+                            "kwaivgi/kling-v3.0-pro/motion-control",
+                            {
+                                "image": _swap_url2,
+                                "video": video_b64_2,
+                                "prompt": prompt2,
+                                "duration": 5,
+                                "aspect_ratio": "9:16",
+                                "cfg_scale": 0.5,
+                                "seed": -1,
+                            },
+                        )
+                    st.session_state["_gen_pred_id"] = pred_id2
+                else:
+                    st.session_state["_gen_creator_idx"] = 0  # both done, reset
+            else:
+                st.session_state.gen_url = result
+                progress.progress(1.0, text="⬇️ Κατεβάζω το video...")
+                st.session_state.final_path = download_video_url(result)
+                st.session_state["_gen_pred_id"] = None
 
     except Exception as e:
         # Streamlit rerun/stop signals are not real errors — re-raise them
         if type(e).__name__ in ("RerunException", "StopException"):
             raise
         _err = e
-        st.session_state["_gen_pred_id"] = None  # clear on real error
+        st.session_state["_gen_pred_id"] = None
+        if _dual:
+            st.session_state["_gen_creator_idx"] = 0
+            if _gen_type == "faceswap":
+                st.session_state["swapped_results"] = None
+            else:
+                st.session_state["gen_urls"] = None
+                st.session_state["final_paths"] = None
 
     finally:
         progress.empty()
@@ -646,7 +730,9 @@ else:  # app_state == "idle"
             st.image(st.session_state.frame_b64, width=200)
             st.divider()
 
-            if not st.session_state.swapped_url:
+            _has_result = (st.session_state.swapped_url
+                           or st.session_state.get("swapped_results"))
+            if not _has_result:
                 # ── Creator Mode ───────────────────────────────────────────
                 creator_mode = st.radio(
                     "👥 Επέλεξε Creator",
@@ -690,21 +776,47 @@ else:  # app_state == "idle"
                         fp = f"{DEFAULT_FACE_SWAP_PROMPT} {custom_face_prompt.strip()}"
                     st.session_state["_gen_prompt"] = fp
                     st.session_state["_gen_creator_mode"] = creator_mode
+                    st.session_state["_gen_creator_idx"] = 0
+                    st.session_state["swapped_results"] = None
                     st.session_state["_gen_type"] = "faceswap"
                     st.session_state.app_state = "generating"
                     st.rerun()
             else:
-                st.success("👁 Αποτέλεσμα — Εγκρίνεις;")
-                st.image(st.session_state.swapped_url, width=300)
-                c1, c2 = st.columns(2)
-                with c1:
-                    if st.button("✓ Εγκρίνω →", type="primary"):
-                        st.session_state.step = 3
-                        st.rerun()
-                with c2:
-                    if st.button("✗ Ξανά"):
-                        st.session_state.swapped_url = None
-                        st.rerun()
+                # ── Review faceswap results ─────────────────────────────────
+                _swap_mode = st.session_state.get("_gen_creator_mode", "SOFIA")
+                if _swap_mode == "SOFIA + MELINA":
+                    _res = st.session_state.get("swapped_results") or [None, None]
+                    st.success("👁 Αποτελέσματα Faceswap — Εγκρίνεις;")
+                    col_r1, col_r2 = st.columns(2)
+                    with col_r1:
+                        st.markdown("**SOFIA**")
+                        if _res[0]:
+                            st.image(_res[0], width=200)
+                    with col_r2:
+                        st.markdown("**MELINA**")
+                        if _res[1]:
+                            st.image(_res[1], width=200)
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        if st.button("✓ Εγκρίνω →", type="primary"):
+                            st.session_state.step = 3
+                            st.rerun()
+                    with c2:
+                        if st.button("✗ Ξανά"):
+                            st.session_state["swapped_results"] = None
+                            st.rerun()
+                else:
+                    st.success("👁 Αποτέλεσμα — Εγκρίνεις;")
+                    st.image(st.session_state.swapped_url, width=300)
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        if st.button("✓ Εγκρίνω →", type="primary"):
+                            st.session_state.step = 3
+                            st.rerun()
+                    with c2:
+                        if st.button("✗ Ξανά"):
+                            st.session_state.swapped_url = None
+                            st.rerun()
 
         if st.button("← Πίσω"):
             st.session_state.step = 1
@@ -715,29 +827,68 @@ else:  # app_state == "idle"
     # ──────────────────────────────────────────────────────────
     elif st.session_state.step == 3:
         st.subheader("Βήμα 3 — Video Generation")
-        st.image(st.session_state.swapped_url, width=300)
+        _v_dual = st.session_state.get("_gen_creator_mode") == "SOFIA + MELINA"
+
+        # ── Preview of faceswap result(s) ──────────────────────
+        if _v_dual:
+            _sres = st.session_state.get("swapped_results") or [None, None]
+            _pc1, _pc2 = st.columns(2)
+            with _pc1:
+                st.markdown("**SOFIA**")
+                if _sres[0]:
+                    st.image(_sres[0], width=150)
+            with _pc2:
+                st.markdown("**MELINA**")
+                if _sres[1]:
+                    st.image(_sres[1], width=150)
+        else:
+            st.image(st.session_state.swapped_url, width=300)
 
         model_label = st.selectbox("Μοντέλο video", list(MODELS.keys()),
                                     index=list(MODELS.keys()).index(st.session_state.model))
         st.session_state.model = model_label
         model = MODELS[model_label]
 
-        if not st.session_state.gen_url:
+        # ── Gate: videos not yet generated ─────────────────────
+        _gurls = st.session_state.get("gen_urls") or [None, None]
+        _videos_ready = (all(_gurls) if _v_dual else bool(st.session_state.gen_url))
+
+        if not _videos_ready:
             if st.button("🎬 Δημιούργησε Video", type="primary"):
                 st.session_state["_gen_model"] = model
                 st.session_state["_gen_type"] = "video"
+                if _v_dual:
+                    st.session_state["_gen_creator_idx"] = 0
+                    st.session_state["gen_urls"] = None
+                    st.session_state["final_paths"] = None
                 st.session_state.app_state = "generating"
                 st.rerun()
 
         elif not st.session_state.post_processed_path:
             st.success("👁 Video — Εγκρίνεις;")
 
-            col_l, col_mid, col_r = st.columns([1, 2, 1])
-            with col_mid:
-                if st.session_state.final_path and os.path.exists(st.session_state.final_path):
-                    st.video(st.session_state.final_path)
-                else:
-                    st.error("⚠️ Το video δεν βρέθηκε στο δίσκο.")
+            if _v_dual:
+                _fpaths = st.session_state.get("final_paths") or [None, None]
+                _vc1, _vc2 = st.columns(2)
+                with _vc1:
+                    st.markdown("**SOFIA**")
+                    if _fpaths[0] and os.path.exists(_fpaths[0]):
+                        st.video(_fpaths[0])
+                    else:
+                        st.error("⚠️ Video SOFIA δεν βρέθηκε.")
+                with _vc2:
+                    st.markdown("**MELINA**")
+                    if _fpaths[1] and os.path.exists(_fpaths[1]):
+                        st.video(_fpaths[1])
+                    else:
+                        st.error("⚠️ Video MELINA δεν βρέθηκε.")
+            else:
+                col_l, col_mid, col_r = st.columns([1, 2, 1])
+                with col_mid:
+                    if st.session_state.final_path and os.path.exists(st.session_state.final_path):
+                        st.video(st.session_state.final_path)
+                    else:
+                        st.error("⚠️ Το video δεν βρέθηκε στο δίσκο.")
 
             c1, c2 = st.columns(2)
             with c1:
@@ -745,11 +896,26 @@ else:  # app_state == "idle"
                     progress = st.progress(0, text="⏳ Ξεκινώ επεξεργασία...")
                     try:
                         from processor import VideoProcessor
-                        clean_path = VideoProcessor.process(
-                            st.session_state.final_path,
-                            progress_cb=lambda p, t: progress.progress(p, text=t),
-                        )
-                        st.session_state.post_processed_path = clean_path
+                        if _v_dual:
+                            _fpaths = st.session_state.get("final_paths") or [None, None]
+                            _pps = []
+                            for _pi, _fp in enumerate(_fpaths):
+                                _pn = "SOFIA" if _pi == 0 else "MELINA"
+                                progress.progress(_pi * 0.5, text=f"⏳ Επεξεργασία {_pn}...")
+                                _cp = VideoProcessor.process(
+                                    _fp,
+                                    progress_cb=lambda p, t, _i=_pi: progress.progress(
+                                        _i * 0.5 + p * 0.5, text=t),
+                                )
+                                _pps.append(_cp)
+                            st.session_state["post_processed_paths"] = _pps
+                            st.session_state.post_processed_path = _pps[0]
+                        else:
+                            clean_path = VideoProcessor.process(
+                                st.session_state.final_path,
+                                progress_cb=lambda p, t: progress.progress(p, text=t),
+                            )
+                            st.session_state.post_processed_path = clean_path
                         progress.empty()
                         st.rerun()
                     except Exception as e:
@@ -758,25 +924,46 @@ else:  # app_state == "idle"
                         st.error(f"Post-processing απέτυχε: {e}")
             with c2:
                 if st.button("❌ Reject"):
-                    st.session_state.gen_url = None
-                    st.session_state.final_path = None
+                    if _v_dual:
+                        st.session_state["gen_urls"] = None
+                        st.session_state["final_paths"] = None
+                    else:
+                        st.session_state.gen_url = None
+                        st.session_state.final_path = None
                     st.session_state.post_processed_path = None
                     st.rerun()
 
         else:
             st.success("🎉 Pipeline ολοκληρώθηκε! Καθαρό από metadata & tracking artifacts.")
-            if os.path.exists(st.session_state.post_processed_path):
-                with open(st.session_state.post_processed_path, "rb") as f:
-                    st.download_button("⬇ Download Final MP4", f, file_name="whale_final.mp4",
-                                        mime="video/mp4", type="primary")
+            if _v_dual:
+                _pps = st.session_state.get("post_processed_paths") or [st.session_state.post_processed_path]
+                for _pi, _pp in enumerate(_pps):
+                    _pn = "SOFIA" if _pi == 0 else "MELINA"
+                    if _pp and os.path.exists(_pp):
+                        with open(_pp, "rb") as f:
+                            st.download_button(
+                                f"⬇ Download {_pn} MP4", f,
+                                file_name=f"whale_{_pn.lower()}_final.mp4",
+                                mime="video/mp4", type="primary",
+                                key=f"dl_{_pn}",
+                            )
+                    else:
+                        st.error(f"⚠️ Το επεξεργασμένο video {_pn} δεν βρέθηκε.")
             else:
-                st.error("⚠️ Το επεξεργασμένο video δεν βρέθηκε στο δίσκο.")
+                if os.path.exists(st.session_state.post_processed_path):
+                    with open(st.session_state.post_processed_path, "rb") as f:
+                        st.download_button("⬇ Download Final MP4", f, file_name="whale_final.mp4",
+                                            mime="video/mp4", type="primary")
+                else:
+                    st.error("⚠️ Το επεξεργασμένο video δεν βρέθηκε στο δίσκο.")
 
             if st.button("🔄 Νέο Video"):
                 for k in ["video_path", "video_dur", "frame_options", "frame_b64",
                           "swapped_url", "gen_url", "final_path", "post_processed_path",
-                          "ig_url", "motion_video_path"]:
-                    st.session_state[k] = defaults[k]
+                          "ig_url", "motion_video_path",
+                          "swapped_results", "gen_urls", "final_paths", "post_processed_paths"]:
+                    st.session_state[k] = defaults.get(k)
+                st.session_state["_gen_creator_idx"] = 0
                 st.session_state.step = 1
                 st.rerun()
 
