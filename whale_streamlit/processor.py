@@ -29,17 +29,35 @@ _STRUCTURAL_TAGS = frozenset({
 })
 
 
+def _find_bin(name: str) -> str:
+    """
+    Locate a binary using the same 3-step strategy as app.py:
+      1. PATH search (works when packages.txt installed system ffmpeg)
+      2. static_ffmpeg (skipped if lock.file write is denied — caught silently)
+      3. Known fixed paths on Debian/Streamlit Cloud (/usr/bin, /usr/local/bin)
+    Returns the resolved path, or bare name as last resort.
+    """
+    import shutil as _sh
+    p = _sh.which(name)
+    if p:
+        return p
+    try:
+        import static_ffmpeg
+        static_ffmpeg.add_paths()
+        p = _sh.which(name)
+        if p:
+            return p
+    except Exception:
+        pass
+    for candidate in (f"/usr/bin/{name}", f"/usr/local/bin/{name}", f"/bin/{name}"):
+        if os.path.exists(candidate):
+            return candidate
+    return name
+
+
 def _ffbin():
-    """
-    Return (ffmpeg_path, ffprobe_path).
-    app.py already calls static_ffmpeg.add_paths() at startup, so the binaries
-    are on PATH by the time processor runs. We just resolve them — never call
-    add_paths() here, which would try to write a lock file to the read-only venv.
-    """
-    import shutil
-    ffmpeg  = shutil.which("ffmpeg")  or "ffmpeg"
-    ffprobe = shutil.which("ffprobe") or "ffprobe"
-    return ffmpeg, ffprobe
+    """Return (ffmpeg_path, ffprobe_path)."""
+    return _find_bin("ffmpeg"), _find_bin("ffprobe")
 
 
 class VideoProcessor:
