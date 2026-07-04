@@ -193,25 +193,36 @@ class VideoProcessor:
     def _encode_and_scrub(cls, src: str, dst: str, ffmpeg: str) -> None:
         """
         Re-encode src → dst with libx264/aac while stripping all metadata in
-        the same pass:
+        the same pass.  Three layers of suppression to cover every injection point:
 
-          -map_metadata -1           drop all container-level tags
-          -map_metadata:s:v:0 -1     drop video-stream tags
-          -map_metadata:s:a:0 -1     drop audio-stream tags
-          -fflags +bitexact          suppress libavformat writing 'encoder=Lavf…'
-          -flags:v +bitexact         suppress per-video-stream encoder annotation
-          -flags:a +bitexact         suppress per-audio-stream encoder annotation
+          Layer 1 — map_metadata -1:
+            Drop every tag copied from the input container/streams.
+
+          Layer 2 — bitexact flags:
+            Prevent libavformat/libavcodec from injecting 'encoder=Lavf…' /
+            'encoder=Lavc…' during the write phase.
+
+          Layer 3 — explicit empty overwrite:
+            Force-set encoder tag to "" at container and both stream levels.
+            In FFmpeg ≥4 an empty value is equivalent to tag removal; this
+            handles versions where bitexact alone is insufficient.
         """
         cmd = [
             ffmpeg, "-y", "-i", src,
             "-c:v", "libx264", "-pix_fmt", "yuv420p",
             "-c:a", "aac",
+            # Layer 1: strip input metadata
             "-map_metadata",       "-1",
             "-map_metadata:s:v:0", "-1",
             "-map_metadata:s:a:0", "-1",
+            # Layer 2: bitexact — suppress muxer/encoder tag injection
             "-fflags",  "+bitexact",
             "-flags:v", "+bitexact",
             "-flags:a", "+bitexact",
+            # Layer 3: explicit empty-string overwrite (belt-and-suspenders)
+            "-metadata",       "encoder=",
+            "-metadata:s:v:0", "encoder=",
+            "-metadata:s:a:0", "encoder=",
             dst,
         ]
         r = subprocess.run(cmd, capture_output=True, text=True)
