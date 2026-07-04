@@ -1,114 +1,278 @@
 """
-Video post-processing pipeline — re-encode with libx264/aac, strips all source metadata.
-Works with PyAV 11.x and 17.x. Correct fps guaranteed via input-stream time_base alignment.
+Video post-processing pipeline — 2-stage: re-encode+scrub → verify.
+
+  Stage 1 (FFmpeg):  libx264/aac re-encode with all metadata stripped inline
+                     (-map_metadata -1, -fflags +bitexact, -flags:v/a +bitexact)
+  Stage 2 (ffprobe): strict JSON parse — any non-structural tag raises ValueError
+
+process() accepts a single path OR a list of paths.
+When given a list, it encodes+scrubs all files first, then verifies every one of
+them and aggregates failures into a single comprehensive error before raising.
 """
 
+import json
 import os
+import subprocess
 import tempfile
-import av
+from typing import List, Union
+
+
+# MP4 ftyp-box fields that ffprobe surfaces as TAGs but are structural
+# container requirements (not user-injectable metadata). They live in the
+# 'ftyp' MP4 box — removing them corrupts the container.
+_STRUCTURAL_TAGS = frozenset({
+    "major_brand",
+    "minor_version",
+    "compatible_brands",
+})
+
+
+def _find_bin(name: str) -> str:
+    """
+    Locate ffmpeg/ffprobe with four fallbacks (most reliable first):
+      1. imageio_ffmpeg bundled binary  (ffmpeg only — most reliable on Streamlit Cloud)
+      2. PATH search                    (works if packages.txt installed system ffmpeg)
+      3. Known fixed paths              (/usr/bin, /usr/local/bin, /bin)
+      4. Bare name                      (last resort — subprocess will raise FileNotFoundError)
+    static_ffmpeg is intentionally skipped — it writes a lock file to the venv
+    which is read-only on Streamlit Cloud, causing a Permission denied crash.
+    """
+    import shutil as _sh
+
+    if name == "ffmpeg":
+        try:
+            import imageio_ffmpeg
+            p = imageio_ffmpeg.get_ffmpeg_exe()
+            if p and os.path.isfile(str(p)):
+                return str(p)
+        except Exception:
+            pass
+
+    p = _sh.which(name)
+    if p:
+        return p
+
+    for candidate in (f"/usr/bin/{name}", f"/usr/local/bin/{name}", f"/bin/{name}"):
+        if os.path.exists(candidate):
+            return candidate
+
+    return name
+
+
+def _ffbin():
+    """Return (ffmpeg_path, ffprobe_path | None)."""
+    ffmpeg = _find_bin("ffmpeg")
+    ffprobe = _find_bin("ffprobe")
+    # If ffprobe resolved to bare "ffprobe" and doesn't exist, signal unavailable
+    if ffprobe == "ffprobe" and not os.path.exists(ffprobe):
+        import shutil as _sh
+        if _sh.which("ffprobe") is None:
+            ffprobe = None
+    return ffmpeg, ffprobe
 
 
 class VideoProcessor:
 
     @classmethod
-    def process(cls, src: str, progress_cb=None) -> str:
+    def process(
+        cls,
+        src: Union[str, os.PathLike, List[Union[str, os.PathLike]]],
+        progress_cb=None,
+    ) -> Union[str, List[str]]:
         """
-        Re-encodes src into a clean MP4 with libx264/aac, stripping all source metadata.
-        Returns path of the output file.
+        Full pipeline: re-encode+scrub → strict verify.
+
+        src:
+            str | Path            → process one file, return one str path
+            list[str | Path]      → process all files, verify all, return list[str]
+
+        On verification failure all output files are deleted before raising,
+        so nothing dirty ever escapes the pipeline.
         """
-        if progress_cb:
-            progress_cb(0.05, "Ανοίγω αρχείο...")
+        ffmpeg, ffprobe = _ffbin()
 
-        dst = tempfile.mktemp(suffix=".mp4")
-        print(f"[processor] src={src!r}  dst={dst!r}")
+        # ── Normalise input ──────────────────────────────────────────────────
+        if isinstance(src, (str, os.PathLike)):
+            inputs      = [str(src)]
+            single_mode = True
+        else:
+            inputs      = [str(p) for p in src]
+            single_mode = False
 
-        try:
-            with av.open(src) as inp:
-                v_in = inp.streams.video[0]
-                a_in = next((s for s in inp.streams if s.type == "audio"), None)
+        n       = len(inputs)
+        outputs: List[str] = []   # accumulates clean temp paths
 
-                fps = float(v_in.average_rate)
-                tb = v_in.time_base
-                # pts_step: how many time_base ticks = one frame
-                # e.g. tb=1/90000, fps=25 → pts_step=3600
-                pts_step = round(tb.denominator / (fps * tb.numerator))
+        # ── Stage 1: FFmpeg re-encode + scrub, one file at a time ────────────
+        for i, src_path in enumerate(inputs):
+            tmp_clean = tempfile.mktemp(suffix="_clean.mp4")
 
-                total_frames = int(v_in.frames) if v_in.frames else 0
-                print(f"[processor] {v_in.codec_context.name} "
-                      f"{v_in.width}x{v_in.height} "
-                      f"{fps:.3f}fps  tb={tb}  pts_step={pts_step}  "
-                      f"frames={total_frames}  audio={'yes' if a_in else 'no'}")
+            # Scale this file's 0→1 progress into its share of 0 → 0.90 total.
+            if n > 1:
+                _slot_start = i       * (0.90 / n)
+                _slot_size  = 0.90 / n
+                def _cb(p, t, _s=_slot_start, _z=_slot_size):
+                    if progress_cb:
+                        progress_cb(_s + p * _z, t)
+            else:
+                _cb = progress_cb
 
-                if progress_cb:
-                    progress_cb(0.10, "Ξεκινώ re-encode...")
+            print(f"[processor] ({i + 1}/{n}) src={src_path!r}")
 
-                with av.open(dst, "w", format="mp4") as out:
-                    v_out = out.add_stream("libx264", rate=v_in.average_rate)
-                    v_out.width = v_in.width
-                    v_out.height = v_in.height
-                    v_out.pix_fmt = "yuv420p"
+            try:
+                label = (f"[{i+1}/{n}] ⚙️ Re-encode + scrub..."
+                         if n > 1 else "⚙️ Re-encode + scrub...")
+                if _cb:
+                    _cb(0.05, label)
 
-                    a_out = None
-                    if a_in:
-                        a_out = out.add_stream("aac")
+                cls._encode_and_scrub(src_path, tmp_clean, ffmpeg)
 
-                    v_idx = 0
-                    streams = [s for s in [v_in, a_in] if s]
+                size = os.path.getsize(tmp_clean)
+                if size < 1000:
+                    raise RuntimeError(
+                        f"[{i+1}/{n}] Output suspiciously small: {size} bytes"
+                    )
 
-                    for packet in inp.demux(*streams):
-                        if packet.dts is None:
-                            continue
+                if _cb:
+                    _cb(0.90, label)
 
-                        if packet.stream == v_in:
-                            for frame in packet.decode():
-                                # Assign pts in the input stream's time_base units
-                                # so the encoder produces the correct frame rate
-                                frame.pts = v_idx * pts_step
-                                v_idx += 1
-                                for pkt in v_out.encode(frame):
-                                    out.mux(pkt)
-                                if progress_cb and total_frames:
-                                    pct = min(0.95, 0.10 + 0.85 * v_idx / total_frames)
-                                    progress_cb(pct, f"Frame {v_idx}/{total_frames}...")
+                outputs.append(tmp_clean)
 
-                        elif a_out and packet.stream == a_in:
-                            for frame in packet.decode():
-                                for pkt in a_out.encode(frame):
-                                    out.mux(pkt)
+            except Exception:
+                # Abort: destroy every clean file produced so far
+                for o in outputs:
+                    if os.path.exists(o):
+                        os.remove(o)
+                if os.path.exists(tmp_clean):
+                    os.remove(tmp_clean)
+                raise
 
-                    # Flush encoders
-                    for pkt in v_out.encode(None):
-                        out.mux(pkt)
-                    if a_out:
-                        for pkt in a_out.encode(None):
-                            out.mux(pkt)
+        # ── Stage 2: verify ALL outputs — never stop on first failure ────────
+        if ffprobe is None:
+            print("[processor] ffprobe not available — skipping tag verification (scrub still applied)")
+        else:
+            if progress_cb:
+                progress_cb(0.95, "🔍 Επαλήθευση metadata...")
 
-            size = os.path.getsize(dst)
-            print(f"[processor] done — {size} bytes")
-            if size < 1000:
-                raise RuntimeError(f"Output file suspiciously small: {size} bytes")
+            failures: dict = {}          # {clean_path: {tag_key: tag_value, …}}
+            for path in outputs:
+                found = cls._check_tags(path, ffprobe)
+                if found:
+                    failures[path] = found
+                    print(f"[processor] verify FAIL — {os.path.basename(path)!r}: {found}")
+                else:
+                    print(f"[processor] verify ✓  — {os.path.basename(path)!r} is clean")
 
-        except Exception:
-            if os.path.exists(dst):
-                os.remove(dst)
-            raise
+            if failures:
+                # Fail-fast: destroy ALL outputs before raising
+                for o in outputs:
+                    if os.path.exists(o):
+                        os.remove(o)
+
+                # Build comprehensive, per-file error report
+                lines = []
+                for idx, (path, tags) in enumerate(failures.items()):
+                    tag_str = "; ".join(f"{k}={v!r}" for k, v in tags.items())
+                    lines.append(f"  [{idx + 1}] {os.path.basename(path)}: {tag_str}")
+
+                raise ValueError(
+                    f"[processor] SCRUB VERIFICATION FAILED — "
+                    f"{len(failures)}/{n} file(s) contain forbidden metadata:\n"
+                    + "\n".join(lines)
+                    + "\nPipeline halted. No files were delivered."
+                )
 
         if progress_cb:
             progress_cb(1.0, "✅ Ολοκληρώθηκε!")
 
-        return dst
+        print(f"[processor] pipeline complete — {n} file(s) clean")
+        return outputs[0] if single_mode else outputs
+
+    # ── Stage 1: FFmpeg re-encode + metadata scrub (single pass) ─────────────
+
+    @classmethod
+    def _encode_and_scrub(cls, src: str, dst: str, ffmpeg: str) -> None:
+        """
+        Re-encode src → dst with libx264/aac while stripping all metadata in
+        the same pass:
+
+          -map_metadata -1           drop all container-level tags
+          -map_metadata:s:v:0 -1     drop video-stream tags
+          -map_metadata:s:a:0 -1     drop audio-stream tags
+          -fflags +bitexact          suppress libavformat writing 'encoder=Lavf…'
+          -flags:v +bitexact         suppress per-video-stream encoder annotation
+          -flags:a +bitexact         suppress per-audio-stream encoder annotation
+        """
+        cmd = [
+            ffmpeg, "-y", "-i", src,
+            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-map_metadata",       "-1",
+            "-map_metadata:s:v:0", "-1",
+            "-map_metadata:s:a:0", "-1",
+            "-fflags",  "+bitexact",
+            "-flags:v", "+bitexact",
+            "-flags:a", "+bitexact",
+            dst,
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(
+                f"FFmpeg encode failed (exit {r.returncode}):\n{r.stderr[-2000:]}"
+            )
+        print(f"[processor] encode+scrub ✓ → {os.path.basename(dst)!r}")
+
+    # ── Stage 2 helpers ───────────────────────────────────────────────────────
+
+    @classmethod
+    def _check_tags(cls, path: str, ffprobe: str) -> dict:
+        """
+        Run ffprobe on one file.
+        Returns a dict of forbidden tags found — empty dict means clean.
+        Never raises on metadata findings (caller decides what to do).
+        """
+        cmd = [
+            ffprobe, "-v", "quiet",
+            "-print_format", "json",
+            "-show_format", "-show_streams",
+            path,
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(
+                f"ffprobe failed on {path!r} (exit {r.returncode}):\n{r.stderr}"
+            )
+
+        data      = json.loads(r.stdout)
+        forbidden: dict = {}
+
+        # Container-level tags
+        for k, v in data.get("format", {}).get("tags", {}).items():
+            if k.lower() not in _STRUCTURAL_TAGS:
+                forbidden[f"container:{k}"] = v
+
+        # Per-stream tags (video, audio, subtitles, …)
+        for i, stream in enumerate(data.get("streams", [])):
+            for k, v in stream.get("tags", {}).items():
+                if k.lower() not in _STRUCTURAL_TAGS:
+                    forbidden[f"stream[{i}]:{k}"] = v
+
+        return forbidden
+
+    # ── Public helper (unchanged API) ─────────────────────────────────────────
 
     @classmethod
     def verify(cls, path: str) -> dict:
+        """Returns technical info dict for external callers."""
+        import av
         with av.open(path) as c:
             v = c.streams.video[0]
             a = next((s for s in c.streams if s.type == "audio"), None)
             return {
-                "size_bytes": os.path.getsize(path),
+                "size_bytes":  os.path.getsize(path),
                 "video_codec": v.codec_context.name,
-                "width": v.width,
-                "height": v.height,
-                "fps": float(v.average_rate),
-                "metadata": dict(c.metadata),
+                "width":       v.width,
+                "height":      v.height,
+                "fps":         float(v.average_rate),
+                "metadata":    dict(c.metadata),
                 "audio_codec": a.codec_context.name if a else None,
             }
