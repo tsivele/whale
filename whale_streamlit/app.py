@@ -135,6 +135,9 @@ defaults = {
     "gen_urls": None,
     "final_paths": None,
     "post_processed_paths": None,
+    "_approved_final_paths": None,
+    "_approved_faceswaps": None,
+    "_gen_single_creator": False,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -550,8 +553,9 @@ if st.session_state.app_state == "generating":
                 _res[_idx] = result
                 st.session_state["swapped_results"] = _res
                 st.session_state["_gen_pred_id"] = None
-                if _idx == 0:
-                    # Chain: submit 2nd creator immediately so _gen_pred_id stays set
+                _fs_single = st.session_state.get("_gen_single_creator", False)
+                if not _fs_single and _idx == 0:
+                    # Chain: submit 2nd creator immediately (batch mode only)
                     st.session_state["_gen_creator_idx"] = 1
                     final_prompt = st.session_state.get("_gen_prompt", DEFAULT_FACE_SWAP_PROMPT)
                     pred_id2 = ws_submit(
@@ -562,7 +566,9 @@ if st.session_state.app_state == "generating":
                     )
                     st.session_state["_gen_pred_id"] = pred_id2
                 else:
-                    st.session_state["_gen_creator_idx"] = 0  # both done, reset
+                    # Targeted single-creator retry done, OR both done in batch mode
+                    st.session_state["_gen_creator_idx"] = 0
+                    st.session_state["_gen_single_creator"] = False
             else:
                 st.session_state.swapped_url = result
                 st.session_state["_gen_pred_id"] = None
@@ -577,8 +583,9 @@ if st.session_state.app_state == "generating":
                 _fpaths[_idx] = download_video_url(result)
                 st.session_state["final_paths"] = _fpaths
                 st.session_state["_gen_pred_id"] = None
-                if _idx == 0:
-                    # Chain: submit 2nd video immediately
+                _single = st.session_state.get("_gen_single_creator", False)
+                if not _single and _idx == 0:
+                    # Chain: submit 2nd video immediately (full-batch mode only)
                     st.session_state["_gen_creator_idx"] = 1
                     _swap_url2 = (st.session_state.get("swapped_results") or [None, None])[1]
                     _m2 = st.session_state.get("_gen_model", "kling")
@@ -612,7 +619,9 @@ if st.session_state.app_state == "generating":
                         )
                     st.session_state["_gen_pred_id"] = pred_id2
                 else:
-                    st.session_state["_gen_creator_idx"] = 0  # both done, reset
+                    # Targeted single-creator retry done, OR both done in batch mode
+                    st.session_state["_gen_creator_idx"] = 0
+                    st.session_state["_gen_single_creator"] = False
             else:
                 st.session_state.gen_url = result
                 progress.progress(1.0, text="⬇️ Κατεβάζω το video...")
@@ -627,6 +636,7 @@ if st.session_state.app_state == "generating":
         st.session_state["_gen_pred_id"] = None
         if _dual:
             st.session_state["_gen_creator_idx"] = 0
+            st.session_state["_gen_single_creator"] = False
             if _gen_type == "faceswap":
                 st.session_state["swapped_results"] = None
             else:
@@ -778,6 +788,7 @@ else:  # app_state == "idle"
                     st.session_state["_gen_creator_mode"] = creator_mode
                     st.session_state["_gen_creator_idx"] = 0
                     st.session_state["swapped_results"] = None
+                    st.session_state["_approved_faceswaps"] = None
                     st.session_state["_gen_type"] = "faceswap"
                     st.session_state.app_state = "generating"
                     st.rerun()
@@ -786,24 +797,40 @@ else:  # app_state == "idle"
                 _swap_mode = st.session_state.get("_gen_creator_mode", "SOFIA")
                 if _swap_mode == "SOFIA + MELINA":
                     _res = st.session_state.get("swapped_results") or [None, None]
-                    st.success("👁 Αποτελέσματα Faceswap — Εγκρίνεις;")
+                    _appr_fs = dict(st.session_state.get("_approved_faceswaps") or {})
+                    st.success("👁 Αποτελέσματα Faceswap — Εγκρίνεις κάθε creator ξεχωριστά:")
                     col_r1, col_r2 = st.columns(2)
-                    with col_r1:
-                        st.markdown("**SOFIA**")
-                        if _res[0]:
-                            st.image(_res[0], width=200)
-                    with col_r2:
-                        st.markdown("**MELINA**")
-                        if _res[1]:
-                            st.image(_res[1], width=200)
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        if st.button("✓ Εγκρίνω →", type="primary"):
+                    for _fci, (_fscol, _fsname) in enumerate(zip([col_r1, col_r2], ["SOFIA", "MELINA"])):
+                        with _fscol:
+                            st.markdown(f"**{_fsname}**")
+                            if _fci in _appr_fs:
+                                if _appr_fs[_fci]:
+                                    st.image(_appr_fs[_fci], width=200)
+                                st.success("✅ Approved")
+                            elif _res[_fci]:
+                                st.image(_res[_fci], width=200)
+                                _fa, _fb = st.columns(2)
+                                with _fa:
+                                    if st.button("✅ Approve", key=f"fs_app_{_fci}", type="primary"):
+                                        _appr_fs[_fci] = _res[_fci]
+                                        st.session_state["_approved_faceswaps"] = _appr_fs
+                                        st.rerun()
+                                with _fb:
+                                    if st.button("🔄 Recreate", key=f"fs_rec_{_fci}"):
+                                        _nr = list(_res); _nr[_fci] = None
+                                        st.session_state["swapped_results"]     = _nr
+                                        st.session_state["_gen_creator_idx"]    = _fci
+                                        st.session_state["_gen_single_creator"] = True
+                                        st.session_state["_gen_type"]           = "faceswap"
+                                        st.session_state["_gen_creator_mode"]   = "SOFIA + MELINA"
+                                        st.session_state.app_state              = "generating"
+                                        st.rerun()
+                            else:
+                                st.info("⏳ Αναμονή...")
+                    if len(_appr_fs) == 2:
+                        if st.button("✓ Συνέχεια →", type="primary"):
+                            st.session_state["swapped_results"] = [_appr_fs[0], _appr_fs[1]]
                             st.session_state.step = 3
-                            st.rerun()
-                    with c2:
-                        if st.button("✗ Ξανά"):
-                            st.session_state["swapped_results"] = None
                             st.rerun()
                 else:
                     st.success("👁 Αποτέλεσμα — Εγκρίνεις;")
@@ -850,10 +877,12 @@ else:  # app_state == "idle"
         model = MODELS[model_label]
 
         # ── Gate: videos not yet generated ─────────────────────
-        _gurls = st.session_state.get("gen_urls") or [None, None]
+        _gurls        = st.session_state.get("gen_urls") or [None, None]
+        _approved_fps = dict(st.session_state.get("_approved_final_paths") or {})
         _videos_ready = (all(_gurls) if _v_dual else bool(st.session_state.gen_url))
+        _in_review    = _videos_ready or bool(_approved_fps)
 
-        if not _videos_ready:
+        if not _in_review:
             if st.button("🎬 Δημιούργησε Video", type="primary"):
                 st.session_state["_gen_model"] = model
                 st.session_state["_gen_type"] = "video"
@@ -861,71 +890,96 @@ else:  # app_state == "idle"
                     st.session_state["_gen_creator_idx"] = 0
                     st.session_state["gen_urls"] = None
                     st.session_state["final_paths"] = None
+                    st.session_state["_approved_final_paths"] = None
                 st.session_state.app_state = "generating"
                 st.rerun()
 
         elif not st.session_state.post_processed_path:
-            st.success("👁 Video — Εγκρίνεις;")
 
             if _v_dual:
                 _fpaths = st.session_state.get("final_paths") or [None, None]
+                _names  = ["SOFIA", "MELINA"]
+                st.success("👁 Video — Εγκρίνεις κάθε creator ξεχωριστά:")
                 _vc1, _vc2 = st.columns(2)
-                with _vc1:
-                    st.markdown("**SOFIA**")
-                    if _fpaths[0] and os.path.exists(_fpaths[0]):
-                        st.video(_fpaths[0])
-                    else:
-                        st.error("⚠️ Video SOFIA δεν βρέθηκε.")
-                with _vc2:
-                    st.markdown("**MELINA**")
-                    if _fpaths[1] and os.path.exists(_fpaths[1]):
-                        st.video(_fpaths[1])
-                    else:
-                        st.error("⚠️ Video MELINA δεν βρέθηκε.")
+                for _ci, (_vcol, _cvname) in enumerate(zip([_vc1, _vc2], _names)):
+                    with _vcol:
+                        st.markdown(f"**{_cvname}**")
+                        if _ci in _approved_fps:
+                            _app_p = _approved_fps[_ci]
+                            if _app_p and os.path.exists(_app_p):
+                                st.video(_app_p)
+                            st.success("✅ Approved")
+                        elif _fpaths[_ci] and os.path.exists(_fpaths[_ci]):
+                            st.video(_fpaths[_ci])
+                            _ba, _bb = st.columns(2)
+                            with _ba:
+                                if st.button("✅ Approve", key=f"app_{_ci}", type="primary"):
+                                    _approved_fps[_ci] = _fpaths[_ci]
+                                    st.session_state["_approved_final_paths"] = _approved_fps
+                                    st.rerun()
+                            with _bb:
+                                if st.button("🔄 Recreate", key=f"rej_{_ci}"):
+                                    _ng = list(_gurls);  _ng[_ci]  = None
+                                    _nf = list(_fpaths); _nf[_ci]  = None
+                                    st.session_state["gen_urls"]            = _ng
+                                    st.session_state["final_paths"]         = _nf
+                                    st.session_state["_gen_creator_idx"]    = _ci
+                                    st.session_state["_gen_single_creator"] = True
+                                    st.session_state["_gen_type"]           = "video"
+                                    st.session_state["_gen_model"]          = model
+                                    st.session_state.app_state              = "generating"
+                                    st.rerun()
+                        else:
+                            st.info("⏳ Αναμονή...")
+
+                if len(_approved_fps) == 2:
+                    if st.button("▶ Process & Finalize", type="primary"):
+                        progress = st.progress(0, text="⏳ Ξεκινώ επεξεργασία...")
+                        try:
+                            from processor import VideoProcessor
+                            _pps = VideoProcessor.process(
+                                [_approved_fps[0], _approved_fps[1]],
+                                progress_cb=lambda p, t: progress.progress(p, text=t),
+                            )
+                            st.session_state["post_processed_paths"] = _pps
+                            st.session_state.post_processed_path = _pps[0]
+                            progress.empty()
+                            st.rerun()
+                        except Exception as e:
+                            progress.empty()
+                            print(f"[post-processing failed] {e}")
+                            st.error(f"Post-processing απέτυχε: {e}")
             else:
+                st.success("👁 Video — Εγκρίνεις;")
                 col_l, col_mid, col_r = st.columns([1, 2, 1])
                 with col_mid:
                     if st.session_state.final_path and os.path.exists(st.session_state.final_path):
                         st.video(st.session_state.final_path)
                     else:
                         st.error("⚠️ Το video δεν βρέθηκε στο δίσκο.")
-
-            c1, c2 = st.columns(2)
-            with c1:
-                if st.button("✅ Approve", type="primary"):
-                    progress = st.progress(0, text="⏳ Ξεκινώ επεξεργασία...")
-                    try:
-                        from processor import VideoProcessor
-                        if _v_dual:
-                            _fpaths = st.session_state.get("final_paths") or [None, None]
-                            _pps = VideoProcessor.process(
-                                _fpaths,
-                                progress_cb=lambda p, t: progress.progress(p, text=t),
-                            )
-                            st.session_state["post_processed_paths"] = _pps
-                            st.session_state.post_processed_path = _pps[0]
-                        else:
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("✅ Approve", type="primary"):
+                        progress = st.progress(0, text="⏳ Ξεκινώ επεξεργασία...")
+                        try:
+                            from processor import VideoProcessor
                             clean_path = VideoProcessor.process(
                                 st.session_state.final_path,
                                 progress_cb=lambda p, t: progress.progress(p, text=t),
                             )
                             st.session_state.post_processed_path = clean_path
-                        progress.empty()
-                        st.rerun()
-                    except Exception as e:
-                        progress.empty()
-                        print(f"[post-processing failed] {e}")
-                        st.error(f"Post-processing απέτυχε: {e}")
-            with c2:
-                if st.button("❌ Reject"):
-                    if _v_dual:
-                        st.session_state["gen_urls"] = None
-                        st.session_state["final_paths"] = None
-                    else:
-                        st.session_state.gen_url = None
+                            progress.empty()
+                            st.rerun()
+                        except Exception as e:
+                            progress.empty()
+                            print(f"[post-processing failed] {e}")
+                            st.error(f"Post-processing απέτυχε: {e}")
+                with c2:
+                    if st.button("❌ Reject"):
+                        st.session_state.gen_url   = None
                         st.session_state.final_path = None
-                    st.session_state.post_processed_path = None
-                    st.rerun()
+                        st.session_state.post_processed_path = None
+                        st.rerun()
 
         else:
             st.success("🎉 Pipeline ολοκληρώθηκε! Καθαρό από metadata & tracking artifacts.")
@@ -955,7 +1009,8 @@ else:  # app_state == "idle"
                 for k in ["video_path", "video_dur", "frame_options", "frame_b64",
                           "swapped_url", "gen_url", "final_path", "post_processed_path",
                           "ig_url", "motion_video_path",
-                          "swapped_results", "gen_urls", "final_paths", "post_processed_paths"]:
+                          "swapped_results", "gen_urls", "final_paths", "post_processed_paths",
+                          "_approved_final_paths", "_approved_faceswaps", "_gen_single_creator"]:
                     st.session_state[k] = defaults.get(k)
                 st.session_state["_gen_creator_idx"] = 0
                 st.session_state.step = 1
