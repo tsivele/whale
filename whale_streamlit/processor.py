@@ -217,23 +217,22 @@ class VideoProcessor:
             ffmpeg, "-y", "-i", src,
             "-c:v", "libx264", "-pix_fmt", "yuv420p",
             "-c:a", "aac",
-            # Layer 1
+            # Layer 1: strip all input metadata
             "-map_metadata",       "-1",
             "-map_metadata:s:v:0", "-1",
             "-map_metadata:s:a:0", "-1",
-            # Layer 2
+            # Layer 2: suppress muxer/codec tag injection
             "-fflags",  "+bitexact",
             "-flags:v", "+bitexact",
             "-flags:a", "+bitexact",
-            # Layer 3 — encoder tags
-            "-metadata",       "encoder=",
-            "-metadata:s:v:0", "encoder=",
-            "-metadata:s:a:0", "encoder=",
-            # Layer 4 — handler names
-            "-metadata:s:v:0", "handler_name=",
-            "-metadata:s:a:0", "handler_name=",
-            # Layer 5 — ftyp brand (mp42 = generic Android/camera, not isom/FFmpeg)
+            # Layer 5: ftyp brand remap (mp42 = generic Android/camera)
             "-brand", "mp42",
+            # Layers 3+4: stream overrides placed LAST so they win over anything
+            # the encoder wrote during the encode phase above
+            "-metadata:s:v:0", "encoder=",
+            "-metadata:s:v:0", "handler_name=",
+            "-metadata:s:a:0", "encoder=",
+            "-metadata:s:a:0", "handler_name=",
             dst,
         ]
         r = subprocess.run(cmd, capture_output=True, text=True)
