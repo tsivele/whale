@@ -192,54 +192,81 @@ class VideoProcessor:
     @classmethod
     def _encode_and_scrub(cls, src: str, dst: str, ffmpeg: str) -> None:
         """
-        Re-encode src → dst with libx264/aac. Five suppression layers:
+        Two-pass pipeline — encode then stream-copy-scrub:
 
-          Layer 1 — map_metadata -1
-            Drop every tag copied from the input container/streams.
+          Pass 1 (encode): re-encode to libx264/aac into a temp file.
+            No metadata flags here — let the encoder run freely.
 
-          Layer 2 — bitexact flags
-            Prevent libavformat/libavcodec injecting 'encoder=Lavf…' /
-            'encoder=Lavc…' during the write phase.
+          Pass 2 (stream-copy scrub): remux the encoded temp file into dst
+            using -c copy.  Because NO encoder runs in this pass, libavcodec
+            physically cannot inject 'encoder=Lavc libx264'.  Combined with
+            explicit metadata overrides, the output is provably clean:
 
-          Layer 3 — explicit encoder empty-overwrite
-            Force encoder tag to "" at container and both stream levels.
-            In FFmpeg ≥4 an empty value equals tag removal.
-
-          Layer 4 — handler_name empty-overwrite
-            Clears 'VideoHandler'/'SoundHandler' from the hdlr box, which
-            is the clearest FFmpeg fingerprint visible in stream metadata.
-
-          Layer 5 — brand remapping
-            Rewrites the ftyp major_brand from 'isom' (FFmpeg default) to
-            'mp42' (MPEG-4 v2, used by Android/generic camera apps).
+              -map_metadata -1          drop all container-level input tags
+              -map_metadata:s:v -1      drop ALL video-stream input tags
+              -map_metadata:s:a -1      drop ALL audio-stream input tags
+              -fflags +bitexact         suppress Lavf muxer signature
+              -flags:v +bitexact        suppress per-video-stream annotation
+              -flags:a +bitexact        suppress per-audio-stream annotation
+              -metadata:s:v:0 encoder=          wipe encoder tag, video
+              -metadata:s:v:0 handler_name=     wipe VideoHandler, video
+              -metadata:s:a:0 encoder=          wipe encoder tag, audio
+              -metadata:s:a:0 handler_name=     wipe SoundHandler, audio
+              -brand mp42               remap ftyp from isom → mp42
         """
-        cmd = [
-            ffmpeg, "-y", "-i", src,
-            "-c:v", "libx264", "-pix_fmt", "yuv420p",
-            "-c:a", "aac",
-            # Layer 1: strip all input metadata
-            "-map_metadata",       "-1",
-            "-map_metadata:s:v:0", "-1",
-            "-map_metadata:s:a:0", "-1",
-            # Layer 2: suppress muxer/codec tag injection
-            "-fflags",  "+bitexact",
-            "-flags:v", "+bitexact",
-            "-flags:a", "+bitexact",
-            # Layer 5: ftyp brand remap (mp42 = generic Android/camera)
-            "-brand", "mp42",
-            # Layers 3+4: stream overrides placed LAST so they win over anything
-            # the encoder wrote during the encode phase above
-            "-metadata:s:v:0", "encoder=",
-            "-metadata:s:v:0", "handler_name=",
-            "-metadata:s:a:0", "encoder=",
-            "-metadata:s:a:0", "handler_name=",
-            dst,
-        ]
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        if r.returncode != 0:
-            raise RuntimeError(
-                f"FFmpeg encode failed (exit {r.returncode}):\n{r.stderr[-2000:]}"
+        tmp_enc = tempfile.mktemp(suffix="_enc.mp4")
+        try:
+            # ── Pass 1: encode ───────────────────────────────────────────────
+            r1 = subprocess.run(
+                [
+                    ffmpeg, "-y", "-i", src,
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac",
+                    tmp_enc,
+                ],
+                capture_output=True, text=True,
             )
+            if r1.returncode != 0:
+                raise RuntimeError(
+                    f"FFmpeg encode failed (exit {r1.returncode}):\n{r1.stderr[-2000:]}"
+                )
+
+            # ── Pass 2: stream-copy + nuclear metadata wipe ──────────────────
+            # handler_name is set to a single space, not empty string.
+            # Reason: some FFmpeg builds treat "" as "unset" and fall back to
+            # the default "VideoHandler"/"SoundHandler". A literal space is
+            # written verbatim into the hdlr box and is not a known fingerprint.
+            r2 = subprocess.run(
+                [
+                    ffmpeg, "-y", "-i", tmp_enc,
+                    "-c", "copy",
+                    # strip all input tags at container and stream level
+                    "-map_metadata",     "-1",
+                    "-map_metadata:s:v", "-1",
+                    "-map_metadata:s:a", "-1",
+                    # prevent muxer writing its own signatures
+                    "-fflags",  "+bitexact",
+                    "-flags:v", "+bitexact",
+                    "-flags:a", "+bitexact",
+                    # remap ftyp brand
+                    "-brand", "mp42",
+                    # explicit stream-level wipes (last, so they win)
+                    "-metadata:s:v:0", "encoder=",
+                    "-metadata:s:v:0", "handler_name= ",
+                    "-metadata:s:a:0", "encoder=",
+                    "-metadata:s:a:0", "handler_name= ",
+                    dst,
+                ],
+                capture_output=True, text=True,
+            )
+            if r2.returncode != 0:
+                raise RuntimeError(
+                    f"FFmpeg scrub failed (exit {r2.returncode}):\n{r2.stderr[-2000:]}"
+                )
+        finally:
+            if os.path.exists(tmp_enc):
+                os.remove(tmp_enc)
+
         print(f"[processor] encode+scrub ✓ → {os.path.basename(dst)!r}")
 
     # ── Stage 2 helpers ───────────────────────────────────────────────────────
@@ -268,13 +295,13 @@ class VideoProcessor:
 
         # Container-level tags
         for k, v in data.get("format", {}).get("tags", {}).items():
-            if k.lower() not in _STRUCTURAL_TAGS:
+            if k.lower() not in _STRUCTURAL_TAGS and v.strip():
                 forbidden[f"container:{k}"] = v
 
         # Per-stream tags (video, audio, subtitles, …)
         for i, stream in enumerate(data.get("streams", [])):
             for k, v in stream.get("tags", {}).items():
-                if k.lower() not in _STRUCTURAL_TAGS:
+                if k.lower() not in _STRUCTURAL_TAGS and v.strip():
                     forbidden[f"stream[{i}]:{k}"] = v
 
         return forbidden
