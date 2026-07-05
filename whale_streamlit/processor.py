@@ -192,37 +192,48 @@ class VideoProcessor:
     @classmethod
     def _encode_and_scrub(cls, src: str, dst: str, ffmpeg: str) -> None:
         """
-        Re-encode src → dst with libx264/aac while stripping all metadata in
-        the same pass.  Three layers of suppression to cover every injection point:
+        Re-encode src → dst with libx264/aac. Five suppression layers:
 
-          Layer 1 — map_metadata -1:
+          Layer 1 — map_metadata -1
             Drop every tag copied from the input container/streams.
 
-          Layer 2 — bitexact flags:
-            Prevent libavformat/libavcodec from injecting 'encoder=Lavf…' /
+          Layer 2 — bitexact flags
+            Prevent libavformat/libavcodec injecting 'encoder=Lavf…' /
             'encoder=Lavc…' during the write phase.
 
-          Layer 3 — explicit empty overwrite:
-            Force-set encoder tag to "" at container and both stream levels.
-            In FFmpeg ≥4 an empty value is equivalent to tag removal; this
-            handles versions where bitexact alone is insufficient.
+          Layer 3 — explicit encoder empty-overwrite
+            Force encoder tag to "" at container and both stream levels.
+            In FFmpeg ≥4 an empty value equals tag removal.
+
+          Layer 4 — handler_name empty-overwrite
+            Clears 'VideoHandler'/'SoundHandler' from the hdlr box, which
+            is the clearest FFmpeg fingerprint visible in stream metadata.
+
+          Layer 5 — brand remapping
+            Rewrites the ftyp major_brand from 'isom' (FFmpeg default) to
+            'mp42' (MPEG-4 v2, used by Android/generic camera apps).
         """
         cmd = [
             ffmpeg, "-y", "-i", src,
             "-c:v", "libx264", "-pix_fmt", "yuv420p",
             "-c:a", "aac",
-            # Layer 1: strip input metadata
+            # Layer 1
             "-map_metadata",       "-1",
             "-map_metadata:s:v:0", "-1",
             "-map_metadata:s:a:0", "-1",
-            # Layer 2: bitexact — suppress muxer/encoder tag injection
+            # Layer 2
             "-fflags",  "+bitexact",
             "-flags:v", "+bitexact",
             "-flags:a", "+bitexact",
-            # Layer 3: explicit empty-string overwrite (belt-and-suspenders)
+            # Layer 3 — encoder tags
             "-metadata",       "encoder=",
             "-metadata:s:v:0", "encoder=",
             "-metadata:s:a:0", "encoder=",
+            # Layer 4 — handler names
+            "-metadata:s:v:0", "handler_name=",
+            "-metadata:s:a:0", "handler_name=",
+            # Layer 5 — ftyp brand (mp42 = generic Android/camera, not isom/FFmpeg)
+            "-brand", "mp42",
             dst,
         ]
         r = subprocess.run(cmd, capture_output=True, text=True)
