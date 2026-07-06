@@ -312,6 +312,12 @@ def verify_batch(
         # ── Verdict ──────────────────────────────────────────────────
         if not all_violations:
             log.info("   ✅ APPROVED — %s", path)
+            log.info("      C2PA/Content Credentials : NOT FOUND ✓")
+            log.info("      EXIF / GPS / Location    : NOT FOUND ✓")
+            log.info("      Encoder tags (Lavf/Lavc) : NOT FOUND ✓")
+            log.info("      Handler names            : NOT FOUND ✓")
+            log.info("      XMP / IPTC metadata      : NOT FOUND ✓")
+            log.info("      Binary signatures        : NOT FOUND ✓")
             approved.append(path)
         else:
             _log_violations(path, all_violations)
