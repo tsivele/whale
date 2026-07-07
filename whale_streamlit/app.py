@@ -462,102 +462,7 @@ if st.session_state.get("_gen_pred_id"):
 st.title("🐋 Whale Pipeline")
 st.caption("AI Video Generation · Cloud · Wavespeed + HikerAPI")
 
-# ── BATCH MODE (sidebar toggle) ────────────────────────────────────────────
-with st.sidebar:
-    st.divider()
-    _batch_mode = st.toggle("Batch Mode", value=False, key="batch_mode")
-
-if _batch_mode:
-    st.subheader("Batch Processing")
-    _pasted_urls = st.text_area(
-        "Paste URLs (one per line)",
-        placeholder="https://www.instagram.com/reel/ABC123/\nhttps://www.instagram.com/reel/DEF456/\nhttps://www.instagram.com/reel/GHI789/\n...",
-        height=350,
-        key="batch_url_text",
-    )
-    _batch_creator = st.radio(
-        "Creator mode", ["SOFIA", "MELINA", "SOFIA + MELINA"],
-        horizontal=True, key="batch_creator_mode",
-    )
-    _url_list = []
-    if _pasted_urls and _pasted_urls.strip():
-        from queue_manager import parse_url_text
-        _url_list = parse_url_text(_pasted_urls)
-        st.caption(f"{len(_url_list)} URL(s) detected")
-    if _url_list and st.button("▶ Run Batch", type="primary", key="run_batch_btn"):
-        from queue_manager import run_batch as _run_batch
-
-        _b_status   = st.empty()
-        _b_progress = st.progress(0)
-
-        def _batch_progress(current, total, url, stage):
-            _b_progress.progress(current / total)
-            _b_status.info(f"[{current}/{total}] {stage.upper()} — {url}")
-
-        def _generate_for_url(url: str):
-            _b_status.info(f"Downloading: {url}")
-            if HIKER_KEY:
-                video_url = hiker_get_video_url(url)
-            elif APIFY_KEY:
-                video_url = apify_get_video_url(url)
-            else:
-                raise RuntimeError("No download API key configured")
-            vpath = download_video_url(video_url)
-            _dur = get_duration(vpath)
-            frame_b64 = extract_frame(vpath, _dur / 2)
-            _creators = (
-                [("SOFIA",  st.session_state["creator_bytes"]),
-                 ("MELINA", st.session_state["creator2_bytes"])]
-                if _batch_creator == "SOFIA + MELINA"
-                else [("SOFIA",  st.session_state["creator_bytes"])]
-                if _batch_creator == "SOFIA"
-                else [("MELINA", st.session_state["creator2_bytes"])]
-            )
-            output_paths = []
-            for cname, cbytes in _creators:
-                _b_status.info(f"Faceswap {cname}…")
-                swap_url = ws_poll(
-                    ws_submit("wavespeed-ai/qwen-image-2.0-pro/edit",
-                              {"images": [to_b64(cbytes), frame_b64],
-                               "prompt": DEFAULT_FACE_SWAP_PROMPT, "seed": -1}),
-                    _b_progress,
-                )
-                _b_status.info(f"Video {cname}…")
-                with open(vpath, "rb") as _f:
-                    vb64 = to_b64(_f.read(), mime="video/mp4")
-                vid_url = ws_poll(
-                    ws_submit("kwaivgi/kling-v3.0-pro/motion-control",
-                              {"image": swap_url, "video": vb64,
-                               "prompt": DEFAULT_VIDEO_PROMPT,
-                               "duration": 5, "aspect_ratio": "9:16",
-                               "cfg_scale": 0.5, "seed": -1}),
-                    _b_progress,
-                )
-                output_paths.append(download_video_url(vid_url))
-            return output_paths
-
-        _result = _run_batch(
-            _url_list,
-            generate_fn=_generate_for_url,
-            progress_cb=_batch_progress,
-        )
-        _b_progress.empty()
-        _b_status.empty()
-
-        _s = _result["summary"]
-        st.success(f"Batch complete — {_s['successful']}/{_s['total']} succeeded")
-        for entry in _result["successful_urls"]:
-            st.write(f"✅ `{entry['url']}`")
-            for p in entry["output_paths"]:
-                if os.path.exists(p):
-                    with open(p, "rb") as _f:
-                        st.download_button(f"⬇ {os.path.basename(p)}", _f,
-                                           file_name=os.path.basename(p), mime="video/mp4")
-        for entry in _result["failed_urls"]:
-            st.error(f"✗ `{entry['url']}` — [{entry['stage']}] {entry['reason']}")
-    st.stop()
-
-# ── SINGLE URL MODE (existing pipeline) ───────────────────────────────────
+# ── PIPELINE (single or batch — auto-detected from Step 1 input) ──────────
 steps = ["Download", "Frame & Prompt", "Video"]
 cols = st.columns(len(steps))
 for i, (col, name) in enumerate(zip(cols, steps)):
@@ -755,54 +660,154 @@ else:  # app_state == "idle"
         st.error(f"Σφάλμα: {st.session_state.pop('_gen_error', '')}")
 
     # ──────────────────────────────────────────────────────────
-    # STEP 1 — DOWNLOAD
+    # STEP 1 — URL INPUT (single or batch, auto-detected)
     # ──────────────────────────────────────────────────────────
     if st.session_state.step == 1:
-        st.subheader("Βήμα 1 — Κατέβασμα Instagram Video")
-        ig_url = st.text_input("Instagram Reel URL", value=st.session_state.ig_url,
-                                placeholder="https://www.instagram.com/reel/...")
-        st.session_state.ig_url = ig_url
+        st.subheader("Βήμα 1 — Instagram URL(s)")
 
-        if st.button("⬇ Download", type="primary", disabled=not ig_url):
-            status = st.empty()
-            try:
-                video_url = None
-                if HIKER_KEY:
-                    status.info("Δοκιμάζω HikerAPI...")
-                    try:
-                        video_url = hiker_get_video_url(ig_url)
-                    except Exception as e:
-                        st.warning(f"HikerAPI: {e}")
+        _raw_input = st.text_area(
+            "Paste one or more Instagram Reel URLs (ένα ανά γραμμή)",
+            placeholder=(
+                "https://www.instagram.com/reel/ABC123/\n"
+                "https://www.instagram.com/reel/DEF456/\n"
+                "https://www.instagram.com/reel/GHI789/\n"
+                "..."
+            ),
+            height=150,
+            key="step1_url_input",
+        )
 
-                if not video_url and APIFY_KEY:
-                    status.info("Δοκιμάζω Apify (backup)...")
-                    video_url = apify_get_video_url(ig_url)
+        from queue_manager import parse_url_text as _parse_urls
+        _parsed_urls = _parse_urls(_raw_input or "")
+        _url_count   = len(_parsed_urls)
 
-                if not video_url:
-                    st.error("Δεν βρέθηκε video. Δοκίμασε άλλο link ή έλεγξε τα API keys.")
-                else:
-                    status.info("Κατεβάζω το video...")
-                    path = download_video_url(video_url)
-                    st.session_state.video_path = path
-                    st.session_state.video_dur = get_duration(path)
-                    dur = st.session_state.video_dur
-                    times = [max(0.3, p * dur) for p in [0.05, 0.2, 0.4, 0.6, 0.8]]
-                    frames = []
-                    status.info("Εξάγω frames...")
-                    for t in times:
-                        fp = extract_frame(path, min(t, dur - 0.2))
-                        frames.append((t, fp))
-                    st.session_state.frame_options = frames
+        if _url_count == 1:
+            # ── SINGLE MODE ──────────────────────────────────────────────
+            ig_url = _parsed_urls[0]
+            st.session_state.ig_url = ig_url
+            st.caption("1 URL — single mode")
 
-                    default_fp = extract_frame(path, 0.0)
-                    with open(default_fp, "rb") as f:
-                        st.session_state.frame_b64 = to_b64(f.read())
+            if st.button("⬇ Download", type="primary"):
+                status = st.empty()
+                try:
+                    video_url = None
+                    if HIKER_KEY:
+                        status.info("Δοκιμάζω HikerAPI...")
+                        try:
+                            video_url = hiker_get_video_url(ig_url)
+                        except Exception as e:
+                            st.warning(f"HikerAPI: {e}")
 
-                    status.empty()
-                    st.session_state.step = 2
-                    st.rerun()
-            except Exception as e:
-                st.error(f"Σφάλμα: {e}")
+                    if not video_url and APIFY_KEY:
+                        status.info("Δοκιμάζω Apify (backup)...")
+                        video_url = apify_get_video_url(ig_url)
+
+                    if not video_url:
+                        st.error("Δεν βρέθηκε video. Δοκίμασε άλλο link ή έλεγξε τα API keys.")
+                    else:
+                        status.info("Κατεβάζω το video...")
+                        path = download_video_url(video_url)
+                        st.session_state.video_path = path
+                        st.session_state.video_dur = get_duration(path)
+                        dur = st.session_state.video_dur
+                        times = [max(0.3, p * dur) for p in [0.05, 0.2, 0.4, 0.6, 0.8]]
+                        frames = []
+                        status.info("Εξάγω frames...")
+                        for t in times:
+                            fp = extract_frame(path, min(t, dur - 0.2))
+                            frames.append((t, fp))
+                        st.session_state.frame_options = frames
+
+                        default_fp = extract_frame(path, 0.0)
+                        with open(default_fp, "rb") as f:
+                            st.session_state.frame_b64 = to_b64(f.read())
+
+                        status.empty()
+                        st.session_state.step = 2
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"Σφάλμα: {e}")
+
+        elif _url_count > 1:
+            # ── BATCH MODE ───────────────────────────────────────────────
+            st.caption(f"**{_url_count} URLs** ανιχνεύθηκαν — batch mode")
+            _batch_creator = st.radio(
+                "Creator mode", ["SOFIA", "MELINA", "SOFIA + MELINA"],
+                horizontal=True, key="batch_creator_mode",
+            )
+            if st.button("▶ Run Batch", type="primary", key="run_batch_btn"):
+                from queue_manager import run_batch as _run_batch
+
+                _b_status   = st.empty()
+                _b_progress = st.progress(0)
+
+                def _batch_progress(current, total, url, stage):
+                    _b_progress.progress(current / total)
+                    _b_status.info(f"[{current}/{total}] {stage.upper()} — {url}")
+
+                def _generate_for_url(url: str):
+                    _b_status.info(f"Downloading: {url}")
+                    if HIKER_KEY:
+                        video_url = hiker_get_video_url(url)
+                    elif APIFY_KEY:
+                        video_url = apify_get_video_url(url)
+                    else:
+                        raise RuntimeError("No download API key configured")
+                    vpath = download_video_url(video_url)
+                    _dur = get_duration(vpath)
+                    frame_b64 = extract_frame(vpath, _dur / 2)
+                    _creators = (
+                        [("SOFIA",  st.session_state["creator_bytes"]),
+                         ("MELINA", st.session_state["creator2_bytes"])]
+                        if _batch_creator == "SOFIA + MELINA"
+                        else [("SOFIA",  st.session_state["creator_bytes"])]
+                        if _batch_creator == "SOFIA"
+                        else [("MELINA", st.session_state["creator2_bytes"])]
+                    )
+                    output_paths = []
+                    for cname, cbytes in _creators:
+                        _b_status.info(f"Faceswap {cname}…")
+                        swap_url = ws_poll(
+                            ws_submit("wavespeed-ai/qwen-image-2.0-pro/edit",
+                                      {"images": [to_b64(cbytes), frame_b64],
+                                       "prompt": DEFAULT_FACE_SWAP_PROMPT, "seed": -1}),
+                            _b_progress,
+                        )
+                        _b_status.info(f"Video {cname}…")
+                        with open(vpath, "rb") as _f:
+                            vb64 = to_b64(_f.read(), mime="video/mp4")
+                        vid_url = ws_poll(
+                            ws_submit("kwaivgi/kling-v3.0-pro/motion-control",
+                                      {"image": swap_url, "video": vb64,
+                                       "prompt": DEFAULT_VIDEO_PROMPT,
+                                       "duration": 5, "aspect_ratio": "9:16",
+                                       "cfg_scale": 0.5, "seed": -1}),
+                            _b_progress,
+                        )
+                        output_paths.append(download_video_url(vid_url))
+                    return output_paths
+
+                _result = _run_batch(
+                    _parsed_urls,
+                    generate_fn=_generate_for_url,
+                    progress_cb=_batch_progress,
+                )
+                _b_progress.empty()
+                _b_status.empty()
+
+                _s = _result["summary"]
+                st.success(f"Batch complete — {_s['successful']}/{_s['total']} succeeded")
+                for entry in _result["successful_urls"]:
+                    st.write(f"✅ `{entry['url']}`")
+                    for p in entry["output_paths"]:
+                        if os.path.exists(p):
+                            with open(p, "rb") as _f:
+                                st.download_button(
+                                    f"⬇ {os.path.basename(p)}", _f,
+                                    file_name=os.path.basename(p), mime="video/mp4",
+                                )
+                for entry in _result["failed_urls"]:
+                    st.error(f"✗ `{entry['url']}` — [{entry['stage']}] {entry['reason']}")
 
     # ──────────────────────────────────────────────────────────
     # STEP 2 — REVIEW & FRAME SELECTION
