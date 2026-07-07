@@ -755,7 +755,9 @@ else:  # app_state == "idle"
                         raise RuntimeError("No download API key configured")
                     vpath = download_video_url(video_url)
                     _dur = get_duration(vpath)
-                    frame_b64 = extract_frame(vpath, _dur / 2)
+                    _frame_path = extract_frame(vpath, _dur / 2)
+                    with open(_frame_path, "rb") as _fp:
+                        frame_b64 = to_b64(_fp.read())
                     _creators = (
                         [("SOFIA",  st.session_state["creator_bytes"]),
                          ("MELINA", st.session_state["creator2_bytes"])]
