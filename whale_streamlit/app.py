@@ -469,16 +469,23 @@ with st.sidebar:
 
 if _batch_mode:
     st.subheader("Batch Processing")
-    _uploaded = st.file_uploader(
-        "Upload URL list (.txt or .csv — one URL per line)",
-        type=["txt", "csv"],
+    _pasted_urls = st.text_area(
+        "Paste URLs (one per line)",
+        placeholder="https://www.instagram.com/reel/ABC123/\nhttps://www.instagram.com/reel/DEF456/",
+        height=200,
+        key="batch_url_text",
     )
     _batch_creator = st.radio(
         "Creator mode", ["SOFIA", "MELINA", "SOFIA + MELINA"],
         horizontal=True, key="batch_creator_mode",
     )
-    if _uploaded and st.button("▶ Run Batch", type="primary", key="run_batch_btn"):
-        from queue_manager import run_batch
+    _url_list = []
+    if _pasted_urls and _pasted_urls.strip():
+        from queue_manager import parse_url_text
+        _url_list = parse_url_text(_pasted_urls)
+        st.caption(f"{len(_url_list)} URL(s) detected")
+    if _url_list and st.button("▶ Run Batch", type="primary", key="run_batch_btn"):
+        from queue_manager import run_batch as _run_batch
 
         _b_status   = st.empty()
         _b_progress = st.progress(0)
@@ -531,8 +538,8 @@ if _batch_mode:
                 output_paths.append(download_video_url(vid_url))
             return output_paths
 
-        _result = run_batch(
-            _uploaded,
+        _result = _run_batch(
+            _url_list,
             generate_fn=_generate_for_url,
             progress_cb=_batch_progress,
         )
