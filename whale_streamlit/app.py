@@ -462,6 +462,97 @@ if st.session_state.get("_gen_pred_id"):
 st.title("🐋 Whale Pipeline")
 st.caption("AI Video Generation · Cloud · Wavespeed + HikerAPI")
 
+# ── BATCH MODE (sidebar toggle) ────────────────────────────────────────────
+with st.sidebar:
+    st.divider()
+    _batch_mode = st.toggle("Batch Mode", value=False, key="batch_mode")
+
+if _batch_mode:
+    st.subheader("Batch Processing")
+    _uploaded = st.file_uploader(
+        "Upload URL list (.txt or .csv — one URL per line)",
+        type=["txt", "csv"],
+    )
+    _batch_creator = st.radio(
+        "Creator mode", ["SOFIA", "MELINA", "SOFIA + MELINA"],
+        horizontal=True, key="batch_creator_mode",
+    )
+    if _uploaded and st.button("▶ Run Batch", type="primary", key="run_batch_btn"):
+        from queue_manager import run_batch
+
+        _b_status   = st.empty()
+        _b_progress = st.progress(0)
+
+        def _batch_progress(current, total, url, stage):
+            _b_progress.progress(current / total)
+            _b_status.info(f"[{current}/{total}] {stage.upper()} — {url}")
+
+        def _generate_for_url(url: str):
+            _b_status.info(f"Downloading: {url}")
+            if HIKER_KEY:
+                video_url = hiker_get_video_url(url)
+            elif APIFY_KEY:
+                video_url = apify_get_video_url(url)
+            else:
+                raise RuntimeError("No download API key configured")
+            vpath = download_video_url(video_url)
+            import av
+            with av.open(vpath) as _c:
+                _dur = float(_c.duration / av.time_base) if _c.duration else 5.0
+            frame_b64 = extract_frame(vpath, _dur / 2)
+            _creators = (
+                [("SOFIA",  st.session_state["creator_bytes"]),
+                 ("MELINA", st.session_state["creator2_bytes"])]
+                if _batch_creator == "SOFIA + MELINA"
+                else [("SOFIA",  st.session_state["creator_bytes"])]
+                if _batch_creator == "SOFIA"
+                else [("MELINA", st.session_state["creator2_bytes"])]
+            )
+            output_paths = []
+            for cname, cbytes in _creators:
+                _b_status.info(f"Faceswap {cname}…")
+                swap_url = ws_poll(
+                    ws_submit("wavespeed-ai/qwen-image-2.0-pro/edit",
+                              {"images": [to_b64(cbytes), frame_b64],
+                               "prompt": DEFAULT_FACE_SWAP_PROMPT, "seed": -1}),
+                    _b_progress,
+                )
+                _b_status.info(f"Video {cname}…")
+                with open(vpath, "rb") as _f:
+                    vb64 = to_b64(_f.read(), mime="video/mp4")
+                vid_url = ws_poll(
+                    ws_submit("kwaivgi/kling-v3.0-pro/motion-control",
+                              {"image": swap_url, "video": vb64,
+                               "prompt": DEFAULT_VIDEO_PROMPT,
+                               "duration": 5, "aspect_ratio": "9:16",
+                               "cfg_scale": 0.5, "seed": -1}),
+                    _b_progress,
+                )
+                output_paths.append(download_video_url(vid_url))
+            return output_paths
+
+        _result = run_batch(
+            _uploaded,
+            generate_fn=_generate_for_url,
+            progress_cb=_batch_progress,
+        )
+        _b_progress.empty()
+        _b_status.empty()
+
+        _s = _result["summary"]
+        st.success(f"Batch complete — {_s['successful']}/{_s['total']} succeeded")
+        for entry in _result["successful_urls"]:
+            st.write(f"✅ `{entry['url']}`")
+            for p in entry["output_paths"]:
+                if os.path.exists(p):
+                    with open(p, "rb") as _f:
+                        st.download_button(f"⬇ {os.path.basename(p)}", _f,
+                                           file_name=os.path.basename(p), mime="video/mp4")
+        for entry in _result["failed_urls"]:
+            st.error(f"✗ `{entry['url']}` — [{entry['stage']}] {entry['reason']}")
+    st.stop()
+
+# ── SINGLE URL MODE (existing pipeline) ───────────────────────────────────
 steps = ["Download", "Frame & Prompt", "Video"]
 cols = st.columns(len(steps))
 for i, (col, name) in enumerate(zip(cols, steps)):
