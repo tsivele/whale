@@ -471,8 +471,8 @@ if _batch_mode:
     st.subheader("Batch Processing")
     _pasted_urls = st.text_area(
         "Paste URLs (one per line)",
-        placeholder="https://www.instagram.com/reel/ABC123/\nhttps://www.instagram.com/reel/DEF456/",
-        height=200,
+        placeholder="https://www.instagram.com/reel/ABC123/\nhttps://www.instagram.com/reel/DEF456/\nhttps://www.instagram.com/reel/GHI789/\n...",
+        height=350,
         key="batch_url_text",
     )
     _batch_creator = st.radio(
@@ -503,9 +503,7 @@ if _batch_mode:
             else:
                 raise RuntimeError("No download API key configured")
             vpath = download_video_url(video_url)
-            import av
-            with av.open(vpath) as _c:
-                _dur = float(_c.duration / av.time_base) if _c.duration else 5.0
+            _dur = get_duration(vpath)
             frame_b64 = extract_frame(vpath, _dur / 2)
             _creators = (
                 [("SOFIA",  st.session_state["creator_bytes"]),
