@@ -1,8 +1,9 @@
 """
 queue_manager.py — T-WHALES Batch Orchestrator
 
-Reads a .txt / .csv file of Instagram URLs and runs every URL through
-the full pipeline: Generation → Scrub (processor.py) → Verify (safety_filter.py).
+Accepts a multiline string of Instagram URLs (copy-paste from UI) and runs
+every URL through the full pipeline:
+  Generation → Scrub (processor.py) → Verify (safety_filter.py)
 
 Design principles
 -----------------
@@ -23,48 +24,58 @@ logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# File Parsing
+# URL Parsing
 # ─────────────────────────────────────────────────────────────────────────────
+
+def parse_url_text(raw_text: str) -> List[str]:
+    """
+    Parse a multiline string of URLs (from st.text_area copy-paste).
+
+    Rules applied to every line:
+      - Strip leading / trailing whitespace (tabs, spaces, \\r)
+      - Skip empty lines
+      - Skip comment lines starting with '#'
+
+    Example input
+    -------------
+        https://www.instagram.com/reel/ABC123/
+        https://www.instagram.com/reel/DEF456/
+
+        # this line is ignored
+        https://www.instagram.com/reel/GHI789/
+
+    Returns
+    -------
+    ["https://...ABC123/", "https://...DEF456/", "https://...GHI789/"]
+    """
+    urls: List[str] = []
+    for line in raw_text.splitlines():
+        url = line.strip()
+        if url and not url.startswith("#"):
+            urls.append(url)
+    log.info("Parsed %d URL(s) from text input", len(urls))
+    return urls
+
 
 def parse_url_file(file_source) -> List[str]:
     """
-    Parse a .txt or .csv file and return a clean list of URLs.
-
-    Accepts:
-      - A file path (str / Path)
-      - A file-like object (e.g. Streamlit UploadedFile — has a .read() method)
-
-    Rules:
-      - Strips leading/trailing whitespace from every line
-      - Skips empty lines
-      - Skips comment lines starting with '#'
-      - For .csv: takes the first column only (splits on comma)
+    Parse a .txt or .csv file — accepts a file path (str/Path) or a
+    file-like object (e.g. Streamlit UploadedFile).
+    Delegates to parse_url_text after reading the raw content.
     """
-    lines: List[str] = []
-
     if hasattr(file_source, "read"):
-        # Streamlit UploadedFile or any file-like object
         raw = file_source.read()
         if isinstance(raw, bytes):
             raw = raw.decode("utf-8", errors="replace")
-        lines = raw.splitlines()
     else:
         with open(str(file_source), "r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
+            raw = f.read()
 
-    urls: List[str] = []
-    for line in lines:
-        url = line.strip()
-        if not url or url.startswith("#"):
-            continue
-        # CSV: take first column
-        if "," in url:
-            url = url.split(",", 1)[0].strip()
-        if url:
-            urls.append(url)
-
-    log.info("Parsed %d URL(s) from file", len(urls))
-    return urls
+    # CSV: keep only the first column of every line
+    lines = []
+    for line in raw.splitlines():
+        lines.append(line.split(",", 1)[0] if "," in line else line)
+    return parse_url_text("\n".join(lines))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -72,56 +83,49 @@ def parse_url_file(file_source) -> List[str]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_batch(
-    url_file,
+    urls: List[str],
     generate_fn: Callable[[str], List[str]],
     quarantine_dir: str = "quarantine",
     progress_cb: Optional[Callable[[int, int, str, str], None]] = None,
 ) -> Dict:
     """
-    Process a list of URLs through the full T-WHALES pipeline.
+    Process a pre-parsed list of URLs through the full T-WHALES pipeline.
 
     Parameters
     ----------
-    url_file : str | Path | UploadedFile
-        A .txt or .csv file with one Instagram URL per line.
+    urls : list[str]
+        Clean list of Instagram URLs — use parse_url_text() or
+        parse_url_file() to produce this from raw input.
     generate_fn : callable(url: str) -> list[str]
         YOUR generation function. Receives one URL, returns a list of local
         MP4 file paths (1 path for single-creator, 2 for SOFIA+MELINA).
-        Must raise an exception on failure — return value is trusted.
+        Must raise an exception on any failure — return value is trusted.
     quarantine_dir : str
         Folder where safety_filter moves files that fail verification.
     progress_cb : callable(current, total, url, stage) | None
-        Optional hook for live Streamlit progress updates.
+        Optional hook for Streamlit progress updates.
         stage ∈ {"generating", "scrubbing", "verifying", "done", "failed"}
 
     Returns
     -------
     {
-        "successful_urls": [
-            {"url": str, "output_paths": list[str]},
-            ...
-        ],
-        "failed_urls": [
-            {"url": str, "stage": str, "reason": str},
-            ...
-        ],
-        "summary": {
-            "total":      int,
-            "successful": int,
-            "failed":     int,
-        }
+        "successful_urls": [{"url": str, "output_paths": list[str]}, ...],
+        "failed_urls":     [{"url": str, "stage": str, "reason": str}, ...],
+        "summary":         {"total": int, "successful": int, "failed": int}
     }
     """
     from processor import VideoProcessor
     from safety_filter import verify_batch
 
-    urls  = parse_url_file(url_file)
     total = len(urls)
 
     if total == 0:
-        log.warning("No URLs found in file — nothing to process.")
-        return {"successful_urls": [], "failed_urls": [],
-                "summary": {"total": 0, "successful": 0, "failed": 0}}
+        log.warning("run_batch called with an empty URL list — nothing to process.")
+        return {
+            "successful_urls": [],
+            "failed_urls":     [],
+            "summary": {"total": 0, "successful": 0, "failed": 0},
+        }
 
     log.info("═" * 60)
     log.info("T-WHALES BATCH — %d URL(s) queued", total)
@@ -163,21 +167,21 @@ def run_batch(
         # ── Stage 3: Safety Verification ─────────────────────────────────
         _notify(progress_cb, i, total, url, "verifying")
         try:
-            result = verify_batch(scrubbed, quarantine_dir=quarantine_dir)
+            verify_result = verify_batch(scrubbed, quarantine_dir=quarantine_dir)
         except Exception as exc:
             _fail(failed, url, "verify", exc, i, total)
             _notify(progress_cb, i, total, url, "failed")
             continue
 
-        if result["quarantined"]:
+        if verify_result["quarantined"]:
             details = "; ".join(
                 "{}: [{}]".format(
                     os.path.basename(e["original_path"]),
                     ", ".join(e["violations"].keys()),
                 )
-                for e in result["quarantined"]
+                for e in verify_result["quarantined"]
             )
-            reason = f"{len(result['quarantined'])} file(s) quarantined — {details}"
+            reason = f"{len(verify_result['quarantined'])} file(s) quarantined — {details}"
             _fail(failed, url, "verify", reason, i, total)
             _notify(progress_cb, i, total, url, "failed")
             continue
@@ -185,17 +189,21 @@ def run_batch(
         # ── All stages passed ─────────────────────────────────────────────
         log.info("  [verify]     ✓  all clean")
         log.info("  ✅ [%d/%d] SUCCESS — %s", i, total, url)
-        successful.append({"url": url, "output_paths": result["approved"]})
+        successful.append({"url": url, "output_paths": verify_result["approved"]})
         _notify(progress_cb, i, total, url, "done")
 
-    # ── Final Report ──────────────────────────────────────────────────────────
+    # ── Final report ──────────────────────────────────────────────────────────
     log.info("═" * 60)
-    log.info("BATCH COMPLETE — %d/%d successful  |  %d/%d failed",
-             len(successful), total, len(failed), total)
+    log.info(
+        "BATCH COMPLETE — %d/%d successful  |  %d/%d failed",
+        len(successful), total, len(failed), total,
+    )
     if failed:
         log.warning("Failed URLs:")
         for entry in failed:
-            log.warning("  [%s] %s — %s", entry["stage"], entry["url"], entry["reason"])
+            log.warning(
+                "  [%s] %s — %s", entry["stage"], entry["url"], entry["reason"]
+            )
     log.info("═" * 60)
 
     return {
