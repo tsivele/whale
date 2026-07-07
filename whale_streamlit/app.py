@@ -659,6 +659,9 @@ if st.session_state.app_state == "generating":
                     if _vi_next < _n_vids:
                         st.session_state["_batch_gen_vidx"] = _vi_next
                         st.session_state["_gen_pred_id"] = _submit_faceswap_for(_vi_next, 0)
+                    else:
+                        # All videos' faceswaps done → go to review step
+                        st.session_state.step = 3
 
         else:  # video
             progress.progress(1.0, text=f"⬇️ Κατεβάζω video {_vi+1}/{_n_vids}...")
