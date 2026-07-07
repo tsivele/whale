@@ -138,6 +138,8 @@ defaults = {
     "_approved_final_paths": None,
     "_approved_faceswaps": None,
     "_gen_single_creator": False,
+    "_url_queue": [],
+    "_url_queue_idx": 0,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -760,12 +762,35 @@ else:  # app_state == "idle"
     # STEP 1 — DOWNLOAD
     # ──────────────────────────────────────────────────────────
     if st.session_state.step == 1:
-        st.subheader("Βήμα 1 — Κατέβασμα Instagram Video")
-        ig_url = st.text_input("Instagram Reel URL", value=st.session_state.ig_url,
-                                placeholder="https://www.instagram.com/reel/...")
-        st.session_state.ig_url = ig_url
+        _queue     = st.session_state.get("_url_queue") or []
+        _queue_idx = st.session_state.get("_url_queue_idx", 0)
 
-        if st.button("⬇ Download", type="primary", disabled=not ig_url):
+        st.subheader("Βήμα 1 — Κατέβασμα Instagram Video")
+
+        if not _queue:
+            # ── No queue yet — show text_area for one or many URLs ───────
+            _raw = st.text_area(
+                "Instagram Reel URL(s) — ένα ανά γραμμή",
+                placeholder=(
+                    "https://www.instagram.com/reel/ABC123/\n"
+                    "https://www.instagram.com/reel/DEF456/\n"
+                    "https://www.instagram.com/reel/GHI789/"
+                ),
+                height=130,
+                key="step1_url_input",
+            )
+            from queue_manager import parse_url_text as _pu
+            _parsed = _pu(_raw or "")
+            if _parsed:
+                st.caption(f"{len(_parsed)} URL(s) ανιχνεύθηκαν")
+            ig_url = _parsed[0] if len(_parsed) == 1 else (_parsed[0] if _parsed else "")
+        else:
+            # ── Queue active — show which URL we're on ────────────────────
+            ig_url  = _queue[_queue_idx]
+            _parsed = _queue
+            st.info(f"🔗 URL {_queue_idx + 1} / {len(_queue)}: `{ig_url}`")
+
+        if st.button("⬇ Download", type="primary", disabled=not (ig_url if not _queue else True)):
             status = st.empty()
             try:
                 video_url = None
@@ -801,6 +826,10 @@ else:  # app_state == "idle"
                         st.session_state.frame_b64 = to_b64(f.read())
 
                     status.empty()
+                    # Save queue on first download (when _parsed has the full list)
+                    if not st.session_state.get("_url_queue"):
+                        st.session_state["_url_queue"]     = _parsed
+                        st.session_state["_url_queue_idx"] = 0
                     st.session_state.step = 2
                     st.rerun()
             except Exception as e:
@@ -1103,16 +1132,37 @@ else:  # app_state == "idle"
                 else:
                     st.error("⚠️ Το επεξεργασμένο video δεν βρέθηκε στο δίσκο.")
 
-            if st.button("🔄 Νέο Video"):
-                for k in ["video_path", "video_dur", "frame_options", "frame_b64",
-                          "swapped_url", "gen_url", "final_path", "post_processed_path",
-                          "ig_url", "motion_video_path",
-                          "swapped_results", "gen_urls", "final_paths", "post_processed_paths",
-                          "_approved_final_paths", "_approved_faceswaps", "_gen_single_creator"]:
-                    st.session_state[k] = defaults.get(k)
-                st.session_state["_gen_creator_idx"] = 0
-                st.session_state.step = 1
-                st.rerun()
+            _q     = st.session_state.get("_url_queue") or []
+            _q_idx = st.session_state.get("_url_queue_idx", 0)
+            _has_next = len(_q) > 1 and _q_idx + 1 < len(_q)
+
+            _reset_keys = ["video_path", "video_dur", "frame_options", "frame_b64",
+                           "swapped_url", "gen_url", "final_path", "post_processed_path",
+                           "ig_url", "motion_video_path",
+                           "swapped_results", "gen_urls", "final_paths", "post_processed_paths",
+                           "_approved_final_paths", "_approved_faceswaps", "_gen_single_creator"]
+
+            if _has_next:
+                _next_idx = _q_idx + 1
+                if st.button(f"▶ Επόμενο URL ({_next_idx + 1}/{len(_q)})", type="primary"):
+                    for k in _reset_keys:
+                        st.session_state[k] = defaults.get(k)
+                    st.session_state["_gen_creator_idx"]  = 0
+                    st.session_state["_url_queue_idx"]    = _next_idx
+                    st.session_state["ig_url"]            = _q[_next_idx]
+                    st.session_state.step = 1
+                    st.rerun()
+            else:
+                if len(_q) > 1:
+                    st.success(f"✅ Όλα τα {len(_q)} URLs ολοκληρώθηκαν!")
+                if st.button("🔄 Νέο Batch"):
+                    for k in _reset_keys:
+                        st.session_state[k] = defaults.get(k)
+                    st.session_state["_gen_creator_idx"] = 0
+                    st.session_state["_url_queue"]       = []
+                    st.session_state["_url_queue_idx"]   = 0
+                    st.session_state.step = 1
+                    st.rerun()
 
         if st.button("← Πίσω"):
             st.session_state.step = 2
