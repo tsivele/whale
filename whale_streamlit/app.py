@@ -6,6 +6,8 @@ import os
 import shutil
 import time
 import base64
+import threading
+import queue as _stdlib_queue
 
 def _find_bin(name):
     import shutil as _sh
@@ -283,6 +285,38 @@ def ws_poll(pred_id, progress_bar):
     raise TimeoutError("Wavespeed timeout (10 λεπτά)")
 
 
+def ws_poll_bg(pred_id: str) -> str:
+    """Identical to ws_poll but thread-safe — zero Streamlit calls."""
+    _base = WS_API if WS_API.startswith("http") else "https://api.wavespeed.ai/api/v3"
+    for _ in range(150):
+        time.sleep(4)
+        r = requests.get(
+            f"{_base}/predictions/{pred_id}/result",
+            headers={"Authorization": f"Bearer {WS_KEY}"},
+            timeout=30,
+        )
+        d = r.json().get("data", {})
+        status = d.get("status", "running")
+        if status == "completed":
+            outputs = d.get("outputs", [])
+            return outputs[0] if outputs else d.get("output", "")
+        if status == "failed":
+            raise RuntimeError(d.get("error", "Wavespeed generation failed"))
+    raise TimeoutError("Wavespeed timeout (10 λεπτά)")
+
+
+def _launch_parallel_polls(jobs: list, result_q: _stdlib_queue.Queue) -> None:
+    """Spawn one daemon thread per job; each puts its result into result_q."""
+    def _worker(job):
+        try:
+            result = ws_poll_bg(job["pred_id"])
+            result_q.put({"idx": job["idx"], "result": result, "error": None})
+        except Exception as exc:
+            result_q.put({"idx": job["idx"], "result": None, "error": str(exc)})
+    for job in jobs:
+        threading.Thread(target=_worker, args=(job,), daemon=True).start()
+
+
 import os
 import tempfile
 import requests
@@ -455,10 +489,152 @@ def strip_metadata(in_path):
 
 
 # ──────────────────────────────────────────────────────────
+# PARALLEL POLLING FRAGMENT
+# ──────────────────────────────────────────────────────────
+@st.fragment(run_every=2)
+def _poll_fragment():
+    jobs       = st.session_state.get("_batch_jobs") or []
+    q          = st.session_state.get("_result_queue")
+    batch      = st.session_state.get("_batch_data") or []
+    poll_type  = st.session_state.get("_poll_type", "faceswap")
+    _cmode_p   = st.session_state.get("_gen_creator_mode", "SOFIA")
+    _dual_p    = _cmode_p == "SOFIA + MELINA"
+    _cnames_p  = (["SOFIA", "MELINA"] if _dual_p
+                  else ["SOFIA"] if _cmode_p == "SOFIA" else ["MELINA"])
+
+    # Drain completed results from background threads
+    if q:
+        _changed = False
+        while True:
+            try:
+                item = q.get_nowait()
+                jobs[item["idx"]].update({
+                    "status": "done" if item["result"] else "error",
+                    "result": item["result"],
+                    "error":  item["error"],
+                })
+                _changed = True
+            except _stdlib_queue.Empty:
+                break
+        if _changed:
+            st.session_state["_batch_jobs"] = jobs
+
+    _done  = sum(1 for j in jobs if j["status"] in ("done", "error"))
+    _total = len(jobs)
+    _ptype_label = "Faceswap" if poll_type == "faceswap" else "Video"
+
+    st.progress(
+        _done / max(_total, 1),
+        text=f"⏳ {_done}/{_total} {_ptype_label}s ολοκληρώθηκαν — παράλληλη επεξεργασία...",
+    )
+
+    # Render each job as it arrives
+    for _job in jobs:
+        _vi_j  = _job["vi"]
+        _ci_j  = _job["ci"]
+        _cname_j = _cnames_p[min(_ci_j, len(_cnames_p) - 1)]
+        _lbl_j = f"Video {_vi_j + 1} — {_cname_j}"
+
+        if _job["status"] == "done" and _job["result"]:
+            if poll_type == "faceswap":
+                _appr_j = dict((batch[_vi_j].get("approved_faceswaps") or {}))
+                if _ci_j in _appr_j:
+                    st.success(f"✅ {_lbl_j} — Approved")
+                else:
+                    _c1, _c2, _c3 = st.columns([3, 1, 1])
+                    with _c1:
+                        st.image(_job["result"], caption=_lbl_j, width=220)
+                    with _c2:
+                        if st.button("✅ Approve", key=f"p_a_{_job['idx']}", type="primary"):
+                            _appr_j[_ci_j] = _job["result"]
+                            batch[_vi_j]["approved_faceswaps"] = _appr_j
+                            st.session_state["_batch_data"] = batch
+                            st.rerun()
+                    with _c3:
+                        if st.button("🔄 Recreate", key=f"p_r_{_job['idx']}"):
+                            try:
+                                _cb_r = (st.session_state["creator_bytes"] if _ci_j == 0
+                                         else st.session_state["creator2_bytes"])
+                                _new_pid = ws_submit("wavespeed-ai/qwen-image-2.0-pro/edit", {
+                                    "images": [to_b64(_cb_r), batch[_vi_j]["frame_b64"]],
+                                    "prompt": st.session_state.get("_gen_prompt", DEFAULT_FACE_SWAP_PROMPT),
+                                    "seed": -1,
+                                })
+                                _job.update({"pred_id": _new_pid, "status": "pending",
+                                             "result": None, "error": None})
+                                st.session_state["_batch_jobs"] = jobs
+                                _launch_parallel_polls([{"idx": _job["idx"], "pred_id": _new_pid}], q)
+                                st.rerun()
+                            except Exception as _re:
+                                st.error(str(_re))
+            else:  # video
+                _apfp_j = dict((batch[_vi_j].get("approved_final_paths") or {}))
+                if _ci_j in _apfp_j:
+                    st.success(f"✅ {_lbl_j} — Approved")
+                else:
+                    _c1, _c2, _c3 = st.columns([3, 1, 1])
+                    with _c1:
+                        st.video(_job["result"])
+                        st.caption(_lbl_j)
+                    with _c2:
+                        if st.button("✅ Approve", key=f"p_a_{_job['idx']}", type="primary"):
+                            _local_v = download_video_url(_job["result"])
+                            _apfp_j[_ci_j] = _local_v
+                            batch[_vi_j]["approved_final_paths"] = _apfp_j
+                            _gu = list(batch[_vi_j].get("gen_urls") or [None, None])
+                            _gu[_ci_j] = _job["result"]
+                            batch[_vi_j]["gen_urls"] = _gu
+                            st.session_state["_batch_data"] = batch
+                            st.rerun()
+                    with _c3:
+                        if st.button("🔄 Recreate", key=f"p_r_{_job['idx']}"):
+                            try:
+                                _mk_r    = st.session_state.get("_gen_model", "kling")
+                                _appr_url = (batch[_vi_j].get("approved_faceswaps") or {}).get(_ci_j)
+                                _vpath_r  = batch[_vi_j]["video_path"]
+                                if _mk_r == "seedance":
+                                    _new_pid = ws_submit("bytedance/seedance-2.0/image-to-video",
+                                                         {"image": _appr_url, "prompt": DEFAULT_VIDEO_PROMPT,
+                                                          "duration": 5, "resolution": "1080p", "seed": -1})
+                                elif _mk_r == "wan":
+                                    _new_pid = ws_submit("alibaba/wan-2.7/image-to-video",
+                                                         {"image": _appr_url, "prompt": DEFAULT_VIDEO_PROMPT,
+                                                          "duration": 5, "resolution": "1080p", "seed": -1})
+                                else:
+                                    with open(_vpath_r, "rb") as _fv:
+                                        _new_pid = ws_submit("kwaivgi/kling-v3.0-pro/motion-control",
+                                                             {"image": _appr_url,
+                                                              "video": to_b64(_fv.read(), mime="video/mp4"),
+                                                              "prompt": DEFAULT_VIDEO_PROMPT,
+                                                              "duration": 5, "aspect_ratio": "9:16",
+                                                              "cfg_scale": 0.5, "seed": -1})
+                                _job.update({"pred_id": _new_pid, "status": "pending",
+                                             "result": None, "error": None})
+                                st.session_state["_batch_jobs"] = jobs
+                                _launch_parallel_polls([{"idx": _job["idx"], "pred_id": _new_pid}], q)
+                                st.rerun()
+                            except Exception as _re:
+                                st.error(str(_re))
+
+        elif _job["status"] == "error":
+            st.error(f"❌ {_lbl_j}: {_job['error']}")
+        else:
+            st.info(f"⏳ {_lbl_j} — generating...")
+
+    # All jobs finished → transition
+    if _done == _total and _total > 0:
+        st.session_state.app_state = "idle"
+        if poll_type == "faceswap":
+            st.session_state.step = 3
+        st.rerun()
+
+
+# ──────────────────────────────────────────────────────────
 # UI — STEP BAR
 # ──────────────────────────────────────────────────────────
-# If a prediction is already in flight, keep generating state alive across reruns
-if st.session_state.get("_gen_pred_id"):
+# If a sequential prediction is in flight, restore generating state
+if (st.session_state.get("_gen_pred_id")
+        and st.session_state.app_state != "parallel_polling"):
     st.session_state.app_state = "generating"
 
 st.title("🐋 Whale Pipeline")
@@ -576,7 +752,14 @@ st.divider()
 
 
 # ──────────────────────────────────────────────────────────
-# STATE MACHINE
+# PARALLEL POLLING STATE
+# ──────────────────────────────────────────────────────────
+if st.session_state.app_state == "parallel_polling":
+    _poll_fragment()
+    st.stop()
+
+# ──────────────────────────────────────────────────────────
+# STATE MACHINE (sequential — used for single recreates only)
 # ──────────────────────────────────────────────────────────
 if st.session_state.app_state == "generating":
     _gen_type = st.session_state.get("_gen_type", "")
@@ -844,23 +1027,51 @@ else:  # app_state == "idle"
             _fp = DEFAULT_FACE_SWAP_PROMPT
             if _cust_fp.strip():
                 _fp = f"{DEFAULT_FACE_SWAP_PROMPT} {_cust_fp.strip()}"
-            # Reset faceswap state for all videos
             for _v in _batch:
-                _v["faceswap_urls"]      = [None, None]
-                _v["approved_faceswaps"] = {}
-                _v["gen_urls"]           = [None, None]
-                _v["final_paths"]        = [None, None]
+                _v["faceswap_urls"]       = [None, None]
+                _v["approved_faceswaps"]  = {}
+                _v["gen_urls"]            = [None, None]
+                _v["final_paths"]         = [None, None]
                 _v["approved_final_paths"] = {}
-                _v["processed_paths"]    = []
-            st.session_state["_batch_data"]     = _batch
-            st.session_state["_batch_gen_vidx"] = 0
-            st.session_state["_gen_creator_mode"] = _creator_mode2
-            st.session_state["_gen_creator_idx"]  = 0
-            st.session_state["_gen_type"]          = "faceswap"
-            st.session_state["_gen_prompt"]        = _fp
-            st.session_state["_gen_single_creator"] = False
-            st.session_state.app_state = "generating"
-            st.rerun()
+                _v["processed_paths"]     = []
+            _dual_btn = _creator_mode2 == "SOFIA + MELINA"
+            _n_c_btn  = 2 if _dual_btn else 1
+            _jobs_btn = []
+            _err_btn  = None
+            with st.spinner(f"Στέλνω {len(_batch) * _n_c_btn} requests παράλληλα..."):
+                for _vi_b, _v_b in enumerate(_batch):
+                    for _ci_b in range(_n_c_btn):
+                        try:
+                            _cb_b = (st.session_state["creator_bytes"] if _ci_b == 0
+                                     else st.session_state["creator2_bytes"])
+                            _pid_b = ws_submit("wavespeed-ai/qwen-image-2.0-pro/edit", {
+                                "images": [to_b64(_cb_b), _v_b["frame_b64"]],
+                                "prompt": _fp,
+                                "seed": -1,
+                            })
+                            _jobs_btn.append({
+                                "idx": len(_jobs_btn), "vi": _vi_b, "ci": _ci_b,
+                                "pred_id": _pid_b, "status": "pending",
+                                "result": None, "error": None,
+                            })
+                        except Exception as _e_b:
+                            _err_btn = str(_e_b)
+                            break
+                    if _err_btn:
+                        break
+            if _err_btn:
+                st.error(_err_btn)
+            else:
+                _rq_btn = _stdlib_queue.Queue()
+                st.session_state["_batch_data"]      = _batch
+                st.session_state["_batch_jobs"]      = _jobs_btn
+                st.session_state["_result_queue"]    = _rq_btn
+                st.session_state["_poll_type"]       = "faceswap"
+                st.session_state["_gen_creator_mode"] = _creator_mode2
+                st.session_state["_gen_prompt"]      = _fp
+                st.session_state.app_state           = "parallel_polling"
+                _launch_parallel_polls(_jobs_btn, _rq_btn)
+                st.rerun()
 
         if st.button("← Πίσω"):
             st.session_state.step = 1
@@ -972,14 +1183,56 @@ else:  # app_state == "idle"
                     _v3["final_paths"]          = [None, None]
                     _v3["approved_final_paths"] = {}
                     _v3["processed_paths"]      = []
-                st.session_state["_batch_data"]         = _batch3
-                st.session_state["_batch_gen_vidx"]     = 0
-                st.session_state["_gen_creator_idx"]    = 0
-                st.session_state["_gen_type"]           = "video"
-                st.session_state["_gen_model"]          = MODELS[_ml3]
-                st.session_state["_gen_single_creator"] = False
-                st.session_state.app_state              = "generating"
-                st.rerun()
+                _mk3      = MODELS[_ml3]
+                _cmode3v  = st.session_state.get("_gen_creator_mode", "SOFIA")
+                _dual3v   = _cmode3v == "SOFIA + MELINA"
+                _n_c3v    = 2 if _dual3v else 1
+                _jobs3    = []
+                _err3     = None
+                with st.spinner(f"Στέλνω {len(_batch3) * _n_c3v} video requests παράλληλα..."):
+                    for _vi3v, _v3v in enumerate(_batch3):
+                        for _ci3v in range(_n_c3v):
+                            try:
+                                _appr3v = (_v3v.get("approved_faceswaps") or {}).get(_ci3v)
+                                _vpath3 = _v3v["video_path"]
+                                if _mk3 == "seedance":
+                                    _pid3 = ws_submit("bytedance/seedance-2.0/image-to-video",
+                                                      {"image": _appr3v, "prompt": DEFAULT_VIDEO_PROMPT,
+                                                       "duration": 5, "resolution": "1080p", "seed": -1})
+                                elif _mk3 == "wan":
+                                    _pid3 = ws_submit("alibaba/wan-2.7/image-to-video",
+                                                      {"image": _appr3v, "prompt": DEFAULT_VIDEO_PROMPT,
+                                                       "duration": 5, "resolution": "1080p", "seed": -1})
+                                else:
+                                    with open(_vpath3, "rb") as _fv3:
+                                        _pid3 = ws_submit("kwaivgi/kling-v3.0-pro/motion-control",
+                                                          {"image": _appr3v,
+                                                           "video": to_b64(_fv3.read(), mime="video/mp4"),
+                                                           "prompt": DEFAULT_VIDEO_PROMPT,
+                                                           "duration": 5, "aspect_ratio": "9:16",
+                                                           "cfg_scale": 0.5, "seed": -1})
+                                _jobs3.append({
+                                    "idx": len(_jobs3), "vi": _vi3v, "ci": _ci3v,
+                                    "pred_id": _pid3, "status": "pending",
+                                    "result": None, "error": None,
+                                })
+                            except Exception as _e3:
+                                _err3 = str(_e3)
+                                break
+                        if _err3:
+                            break
+                if _err3:
+                    st.error(_err3)
+                else:
+                    _rq3 = _stdlib_queue.Queue()
+                    st.session_state["_batch_data"]   = _batch3
+                    st.session_state["_batch_jobs"]   = _jobs3
+                    st.session_state["_result_queue"] = _rq3
+                    st.session_state["_poll_type"]    = "video"
+                    st.session_state["_gen_model"]    = _mk3
+                    st.session_state.app_state        = "parallel_polling"
+                    _launch_parallel_polls(_jobs3, _rq3)
+                    st.rerun()
 
         # ── SUB-STEP B: VIDEO REVIEW + FINALIZE ─────────────────────────
         elif not _all_processed:
