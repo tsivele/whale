@@ -2,3 +2,4 @@ imageio-ffmpeg
 av
 opencv-python
 requests
+streamlit-option-menu
