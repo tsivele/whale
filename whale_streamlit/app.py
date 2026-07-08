@@ -142,6 +142,7 @@ defaults = {
     "_gen_single_creator": False,
     "_batch_data": None,
     "_batch_gen_vidx": 0,
+    "_audit_jobs": [],
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -315,6 +316,19 @@ def _launch_parallel_polls(jobs: list, result_q: _stdlib_queue.Queue) -> None:
             result_q.put({"idx": job["idx"], "result": None, "error": str(exc)})
     for job in jobs:
         threading.Thread(target=_worker, args=(job,), daemon=True).start()
+
+
+def _launch_audit_scrub(audit_job: dict, audit_q: _stdlib_queue.Queue) -> None:
+    """Scrub one video in a daemon thread; puts result into audit_q."""
+    def _worker(job):
+        try:
+            from processor import VideoProcessor
+            results = VideoProcessor.process([job["in_path"]])
+            out = results[0] if isinstance(results, list) else results
+            audit_q.put({"idx": job["idx"], "out_path": out, "error": None})
+        except Exception as exc:
+            audit_q.put({"idx": job["idx"], "out_path": None, "error": str(exc)})
+    threading.Thread(target=_worker, args=(audit_job,), daemon=True).start()
 
 
 import os
@@ -493,195 +507,259 @@ def strip_metadata(in_path):
 # ──────────────────────────────────────────────────────────
 @st.fragment(run_every=2)
 def _poll_fragment():
-    """
-    Unified event-driven fragment.
-    Stage 1 (faceswap jobs): arrive → Approve triggers Stage 2 immediately.
-    Stage 2 (video jobs):    arrive → Approve downloads and stores.
-    Both stages run concurrently; each asset is independently actionable.
-    """
-    jobs      = list(st.session_state.get("_batch_jobs") or [])
-    q         = st.session_state.get("_result_queue")
-    batch     = st.session_state.get("_batch_data") or []
-    _cmode_p  = st.session_state.get("_gen_creator_mode", "SOFIA")
-    _dual_p   = _cmode_p == "SOFIA + MELINA"
-    _cnames_p = (["SOFIA", "MELINA"] if _dual_p
-                 else ["SOFIA"] if _cmode_p == "SOFIA" else ["MELINA"])
-    _n_c_p    = 2 if _dual_p else 1
+    jobs       = list(st.session_state.get("_batch_jobs") or [])
+    q          = st.session_state.get("_result_queue")
+    batch      = st.session_state.get("_batch_data") or []
+    audit_jobs = list(st.session_state.get("_audit_jobs") or [])
+    audit_q    = st.session_state.get("_audit_queue")
+    _cmode_p   = st.session_state.get("_gen_creator_mode", "SOFIA")
+    _dual_p    = _cmode_p == "SOFIA + MELINA"
+    _cnames_p  = (["SOFIA", "MELINA"] if _dual_p
+                  else ["SOFIA"] if _cmode_p == "SOFIA" else ["MELINA"])
+    _n_c_p     = 2 if _dual_p else 1
+    _nav       = st.session_state.get("poll_nav", "⚡ Generate")
 
-    # ── Drain completed results from background threads ──────────────
+    # ── Drain generation results ──────────────────────────────────────
     if q:
-        _changed = False
+        _chg = False
         while True:
             try:
-                item = q.get_nowait()
-                jobs[item["idx"]].update({
-                    "status": "done" if item["result"] else "error",
-                    "result": item["result"],
-                    "error":  item["error"],
+                _it = q.get_nowait()
+                jobs[_it["idx"]].update({
+                    "status": "done" if _it["result"] else "error",
+                    "result": _it["result"], "error": _it["error"],
                 })
-                _changed = True
+                _chg = True
             except _stdlib_queue.Empty:
                 break
-        if _changed:
+        if _chg:
             st.session_state["_batch_jobs"] = jobs
 
-    # ── Progress bars ─────────────────────────────────────────────────
-    fs_jobs  = [j for j in jobs if j["type"] == "faceswap"]
-    vid_jobs = [j for j in jobs if j["type"] == "video"]
+    # ── Drain audit (scrub) results ───────────────────────────────────
+    if audit_q:
+        _achg = False
+        while True:
+            try:
+                _ai = audit_q.get_nowait()
+                audit_jobs[_ai["idx"]].update({
+                    "status": "ready" if _ai["out_path"] else "audit_error",
+                    "out_path": _ai["out_path"], "error": _ai["error"],
+                })
+                _aj_ref = audit_jobs[_ai["idx"]]
+                if _ai["out_path"]:
+                    _pp = list(batch[_aj_ref["vi"]].get("processed_paths") or [])
+                    _pp.append(_ai["out_path"])
+                    batch[_aj_ref["vi"]]["processed_paths"] = _pp
+                    st.session_state["_batch_data"] = batch
+                _achg = True
+            except _stdlib_queue.Empty:
+                break
+        if _achg:
+            st.session_state["_audit_jobs"] = audit_jobs
+
+    # ── Derive sets ───────────────────────────────────────────────────
+    fs_jobs  = [j for j in jobs if j["type"] == "faceswap" and j["status"] != "cancelled"]
+    vid_jobs = [j for j in jobs if j["type"] == "video"    and j["status"] != "cancelled"]
     fs_done  = sum(1 for j in fs_jobs  if j["status"] in ("done", "error"))
     vid_done = sum(1 for j in vid_jobs if j["status"] in ("done", "error"))
-    if fs_jobs:
-        st.progress(fs_done / len(fs_jobs),
-                    text=f"📸 Faceswaps: {fs_done}/{len(fs_jobs)} ολοκληρώθηκαν")
-    if vid_jobs:
-        st.progress(vid_done / len(vid_jobs),
-                    text=f"🎬 Videos: {vid_done}/{len(vid_jobs)} ολοκληρώθηκαν")
-    if fs_jobs or vid_jobs:
-        st.divider()
 
-    # ── Render each job as it arrives ────────────────────────────────
-    for _job in jobs:
-        _vi_j    = _job["vi"]
-        _ci_j    = _job["ci"]
-        _cname_j = _cnames_p[min(_ci_j, len(_cnames_p) - 1)]
-        _lbl_j   = f"Video {_vi_j + 1} — {_cname_j}"
+    # ════════════════════════════════════════════════════════
+    # ⚡ GENERATE TAB
+    # ════════════════════════════════════════════════════════
+    if _nav == "⚡ Generate":
+        if fs_jobs:
+            st.progress(fs_done / len(fs_jobs), text=f"📸 Photos: {fs_done}/{len(fs_jobs)}")
+        if vid_jobs:
+            st.progress(vid_done / len(vid_jobs), text=f"🎬 Videos: {vid_done}/{len(vid_jobs)}")
 
-        if _job["status"] == "done" and _job["result"]:
-
-            # ── STAGE 1: FACESWAP ─────────────────────────────────────
-            if _job["type"] == "faceswap":
-                _appr_j = dict((batch[_vi_j].get("approved_faceswaps") or {}))
-                if _ci_j in _appr_j:
-                    st.success(f"✅ {_lbl_j} — Photo approved · video dispatched")
-                else:
+        # ── PHOTO CARDS ──────────────────────────────────────────────
+        if fs_jobs:
+            st.markdown("#### 📸 Photos")
+            _cols = st.columns(min(3, len(fs_jobs)), gap="small")
+            for _i, _job in enumerate(fs_jobs):
+                with _cols[_i % len(_cols)]:
                     with st.container(border=True):
-                        st.caption(f"📸 {_lbl_j} — Photo ready")
-                        _c1, _c2, _c3 = st.columns([3, 1, 1])
-                        with _c1:
-                            st.image(_job["result"], width=220)
-                        with _c2:
-                            # Approve = store photo + immediately fire video
-                            if st.button("✅ Approve\n→ Video", key=f"p_a_{_job['idx']}", type="primary"):
-                                _appr_j[_ci_j] = _job["result"]
-                                batch[_vi_j]["approved_faceswaps"] = _appr_j
-                                try:
-                                    _mk  = st.session_state.get("_gen_model", "kling")
-                                    _vp  = batch[_vi_j]["video_path"]
-                                    if _mk == "seedance":
-                                        _pvid = ws_submit("bytedance/seedance-2.0/image-to-video",
-                                                          {"image": _job["result"],
-                                                           "prompt": DEFAULT_VIDEO_PROMPT,
-                                                           "duration": 5, "resolution": "1080p", "seed": -1})
-                                    elif _mk == "wan":
-                                        _pvid = ws_submit("alibaba/wan-2.7/image-to-video",
-                                                          {"image": _job["result"],
-                                                           "prompt": DEFAULT_VIDEO_PROMPT,
-                                                           "duration": 5, "resolution": "1080p", "seed": -1})
-                                    else:
-                                        with open(_vp, "rb") as _fv:
-                                            _pvid = ws_submit("kwaivgi/kling-v3.0-pro/motion-control",
-                                                              {"image": _job["result"],
-                                                               "video": to_b64(_fv.read(), mime="video/mp4"),
-                                                               "prompt": DEFAULT_VIDEO_PROMPT,
-                                                               "duration": 5, "aspect_ratio": "9:16",
-                                                               "cfg_scale": 0.5, "seed": -1})
-                                    _vjob = {"idx": len(jobs), "vi": _vi_j, "ci": _ci_j,
-                                             "type": "video", "pred_id": _pvid,
-                                             "status": "pending", "result": None, "error": None}
-                                    jobs.append(_vjob)
-                                    st.session_state["_batch_jobs"] = jobs
-                                    st.session_state["_batch_data"] = batch
-                                    _launch_parallel_polls([{"idx": _vjob["idx"], "pred_id": _pvid}], q)
-                                    st.rerun()
-                                except Exception as _ve:
-                                    st.error(str(_ve))
-                        with _c3:
-                            if st.button("🔄 Recreate", key=f"p_r_{_job['idx']}"):
-                                try:
-                                    _cb_r = (st.session_state["creator_bytes"] if _ci_j == 0
-                                             else st.session_state["creator2_bytes"])
-                                    _npid = ws_submit("wavespeed-ai/qwen-image-2.0-pro/edit", {
-                                        "images": [to_b64(_cb_r), batch[_vi_j]["frame_b64"]],
-                                        "prompt": st.session_state.get("_gen_prompt", DEFAULT_FACE_SWAP_PROMPT),
-                                        "seed": -1,
-                                    })
-                                    _job.update({"pred_id": _npid, "status": "pending",
-                                                 "result": None, "error": None})
-                                    st.session_state["_batch_jobs"] = jobs
-                                    _launch_parallel_polls([{"idx": _job["idx"], "pred_id": _npid}], q)
-                                    st.rerun()
-                                except Exception as _re:
-                                    st.error(str(_re))
+                        _vi_j    = _job["vi"]
+                        _ci_j    = _job["ci"]
+                        _cname_j = _cnames_p[min(_ci_j, len(_cnames_p)-1)]
+                        _lbl_j   = f"V{_vi_j+1} · {_cname_j}"
+                        if _job["status"] == "done" and _job["result"]:
+                            _appr_j = dict(batch[_vi_j].get("approved_faceswaps") or {})
+                            if _ci_j in _appr_j:
+                                st.markdown("<span style='color:#10b981;font-size:12px;font-weight:600'>✅ Approved · video dispatched</span>", unsafe_allow_html=True)
+                                st.image(_appr_j[_ci_j], use_container_width=True)
+                            else:
+                                st.markdown(f"<span style='color:#a78bfa;font-size:11px;font-weight:600'>📸 {_lbl_j}</span>", unsafe_allow_html=True)
+                                st.image(_job["result"], use_container_width=True)
+                                _b1, _b2, _b3 = st.columns(3)
+                                with _b1:
+                                    if st.button("✅", key=f"pa_{_job['idx']}", type="primary", help="Approve → dispatch video"):
+                                        _appr_j[_ci_j] = _job["result"]
+                                        batch[_vi_j]["approved_faceswaps"] = _appr_j
+                                        try:
+                                            _mk = st.session_state.get("_gen_model", "kling")
+                                            _vp = batch[_vi_j]["video_path"]
+                                            if _mk == "seedance":
+                                                _pvid = ws_submit("bytedance/seedance-2.0/image-to-video", {"image": _job["result"], "prompt": DEFAULT_VIDEO_PROMPT, "duration": 5, "resolution": "1080p", "seed": -1})
+                                            elif _mk == "wan":
+                                                _pvid = ws_submit("alibaba/wan-2.7/image-to-video", {"image": _job["result"], "prompt": DEFAULT_VIDEO_PROMPT, "duration": 5, "resolution": "1080p", "seed": -1})
+                                            else:
+                                                with open(_vp, "rb") as _fv:
+                                                    _pvid = ws_submit("kwaivgi/kling-v3.0-pro/motion-control", {"image": _job["result"], "video": to_b64(_fv.read(), mime="video/mp4"), "prompt": DEFAULT_VIDEO_PROMPT, "duration": 5, "aspect_ratio": "9:16", "cfg_scale": 0.5, "seed": -1})
+                                            _vjob = {"idx": len(jobs), "vi": _vi_j, "ci": _ci_j, "type": "video", "pred_id": _pvid, "status": "pending", "result": None, "error": None}
+                                            jobs.append(_vjob)
+                                            st.session_state["_batch_jobs"] = jobs
+                                            st.session_state["_batch_data"] = batch
+                                            _launch_parallel_polls([{"idx": _vjob["idx"], "pred_id": _pvid}], q)
+                                            st.rerun()
+                                        except Exception as _ve:
+                                            st.error(str(_ve))
+                                with _b2:
+                                    if st.button("🔄", key=f"pr_{_job['idx']}", help="Recreate"):
+                                        try:
+                                            _cb_r = (st.session_state["creator_bytes"] if _ci_j == 0 else st.session_state["creator2_bytes"])
+                                            _npid = ws_submit("wavespeed-ai/qwen-image-2.0-pro/edit", {"images": [to_b64(_cb_r), batch[_vi_j]["frame_b64"]], "prompt": st.session_state.get("_gen_prompt", DEFAULT_FACE_SWAP_PROMPT), "seed": -1})
+                                            _job.update({"pred_id": _npid, "status": "pending", "result": None, "error": None})
+                                            st.session_state["_batch_jobs"] = jobs
+                                            _launch_parallel_polls([{"idx": _job["idx"], "pred_id": _npid}], q)
+                                            st.rerun()
+                                        except Exception as _re:
+                                            st.error(str(_re))
+                                with _b3:
+                                    if st.button("✕", key=f"pc_{_job['idx']}", help="Cancel"):
+                                        _job["status"] = "cancelled"
+                                        st.session_state["_batch_jobs"] = jobs
+                                        st.rerun()
+                        elif _job["status"] == "error":
+                            st.markdown(f"<span style='color:#f87171;font-size:11px'>❌ {_lbl_j}</span>", unsafe_allow_html=True)
+                            st.caption((_job.get("error") or "")[:80])
+                        elif _job["status"] == "cancelled":
+                            st.markdown(f"<span style='color:#6b7280;font-size:11px'>✕ {_lbl_j} cancelled</span>", unsafe_allow_html=True)
+                        else:
+                            st.markdown(f"<span style='color:#67e8f9;font-size:11px'>⏳ {_lbl_j}</span>", unsafe_allow_html=True)
+                            st.progress(0.0, text="generating...")
 
-            # ── STAGE 2: VIDEO ────────────────────────────────────────
-            else:
-                _apfp_j = dict((batch[_vi_j].get("approved_final_paths") or {}))
-                if _ci_j in _apfp_j:
-                    st.success(f"✅ {_lbl_j} — Video approved")
-                else:
+        # ── VIDEO CARDS ───────────────────────────────────────────────
+        if vid_jobs:
+            st.markdown("#### 🎬 Videos")
+            _vcols = st.columns(min(3, len(vid_jobs)), gap="small")
+            for _i, _job in enumerate(vid_jobs):
+                with _vcols[_i % len(_vcols)]:
                     with st.container(border=True):
-                        st.caption(f"🎬 {_lbl_j} — Video ready")
-                        _c1, _c2, _c3 = st.columns([3, 1, 1])
-                        with _c1:
-                            st.video(_job["result"])
-                        with _c2:
-                            if st.button("✅ Approve", key=f"p_a_{_job['idx']}", type="primary"):
-                                _local_v = download_video_url(_job["result"])
-                                _apfp_j[_ci_j] = _local_v
-                                batch[_vi_j]["approved_final_paths"] = _apfp_j
-                                _gu = list(batch[_vi_j].get("gen_urls") or [None, None])
-                                _gu[_ci_j] = _job["result"]
-                                batch[_vi_j]["gen_urls"] = _gu
-                                _fp2 = list(batch[_vi_j].get("final_paths") or [None, None])
-                                _fp2[_ci_j] = _local_v
-                                batch[_vi_j]["final_paths"] = _fp2
-                                st.session_state["_batch_data"] = batch
-                                st.rerun()
-                        with _c3:
-                            if st.button("🔄 Recreate", key=f"p_r_{_job['idx']}"):
-                                try:
-                                    _mk_r    = st.session_state.get("_gen_model", "kling")
-                                    _appr_url = (batch[_vi_j].get("approved_faceswaps") or {}).get(_ci_j)
-                                    _vpath_r  = batch[_vi_j]["video_path"]
-                                    if _mk_r == "seedance":
-                                        _npid = ws_submit("bytedance/seedance-2.0/image-to-video",
-                                                          {"image": _appr_url, "prompt": DEFAULT_VIDEO_PROMPT,
-                                                           "duration": 5, "resolution": "1080p", "seed": -1})
-                                    elif _mk_r == "wan":
-                                        _npid = ws_submit("alibaba/wan-2.7/image-to-video",
-                                                          {"image": _appr_url, "prompt": DEFAULT_VIDEO_PROMPT,
-                                                           "duration": 5, "resolution": "1080p", "seed": -1})
-                                    else:
-                                        with open(_vpath_r, "rb") as _fv:
-                                            _npid = ws_submit("kwaivgi/kling-v3.0-pro/motion-control",
-                                                              {"image": _appr_url,
-                                                               "video": to_b64(_fv.read(), mime="video/mp4"),
-                                                               "prompt": DEFAULT_VIDEO_PROMPT,
-                                                               "duration": 5, "aspect_ratio": "9:16",
-                                                               "cfg_scale": 0.5, "seed": -1})
-                                    _job.update({"pred_id": _npid, "status": "pending",
-                                                 "result": None, "error": None})
-                                    st.session_state["_batch_jobs"] = jobs
-                                    _launch_parallel_polls([{"idx": _job["idx"], "pred_id": _npid}], q)
-                                    st.rerun()
-                                except Exception as _re:
-                                    st.error(str(_re))
+                        _vi_j    = _job["vi"]
+                        _ci_j    = _job["ci"]
+                        _cname_j = _cnames_p[min(_ci_j, len(_cnames_p)-1)]
+                        _lbl_j   = f"V{_vi_j+1} · {_cname_j}"
+                        if _job["status"] == "done" and _job["result"]:
+                            _apfp_j = dict(batch[_vi_j].get("approved_final_paths") or {})
+                            if _ci_j in _apfp_j:
+                                st.markdown("<span style='color:#10b981;font-size:12px;font-weight:600'>✅ Approved · scrubbing in Audit</span>", unsafe_allow_html=True)
+                                st.video(_job["result"])
+                            else:
+                                st.markdown(f"<span style='color:#a78bfa;font-size:11px;font-weight:600'>🎬 {_lbl_j}</span>", unsafe_allow_html=True)
+                                st.video(_job["result"])
+                                _b1, _b2, _b3 = st.columns(3)
+                                with _b1:
+                                    if st.button("✅", key=f"pa_{_job['idx']}", type="primary", help="Approve → start scrub"):
+                                        _local_v = download_video_url(_job["result"])
+                                        _apfp_j[_ci_j] = _local_v
+                                        batch[_vi_j]["approved_final_paths"] = _apfp_j
+                                        _gu = list(batch[_vi_j].get("gen_urls") or [None, None])
+                                        _gu[_ci_j] = _job["result"]
+                                        batch[_vi_j]["gen_urls"] = _gu
+                                        _fp2 = list(batch[_vi_j].get("final_paths") or [None, None])
+                                        _fp2[_ci_j] = _local_v
+                                        batch[_vi_j]["final_paths"] = _fp2
+                                        st.session_state["_batch_data"] = batch
+                                        if audit_q is None:
+                                            audit_q = _stdlib_queue.Queue()
+                                            st.session_state["_audit_queue"] = audit_q
+                                        _new_aj = {"idx": len(audit_jobs), "vi": _vi_j, "ci": _ci_j, "in_path": _local_v, "label": _lbl_j, "status": "auditing", "out_path": None, "error": None}
+                                        audit_jobs.append(_new_aj)
+                                        st.session_state["_audit_jobs"] = audit_jobs
+                                        _launch_audit_scrub(_new_aj, audit_q)
+                                        st.rerun()
+                                with _b2:
+                                    if st.button("🔄", key=f"pr_{_job['idx']}", help="Recreate"):
+                                        try:
+                                            _mk_r    = st.session_state.get("_gen_model", "kling")
+                                            _appr_url = (batch[_vi_j].get("approved_faceswaps") or {}).get(_ci_j)
+                                            _vpath_r  = batch[_vi_j]["video_path"]
+                                            if _mk_r == "seedance":
+                                                _npid = ws_submit("bytedance/seedance-2.0/image-to-video", {"image": _appr_url, "prompt": DEFAULT_VIDEO_PROMPT, "duration": 5, "resolution": "1080p", "seed": -1})
+                                            elif _mk_r == "wan":
+                                                _npid = ws_submit("alibaba/wan-2.7/image-to-video", {"image": _appr_url, "prompt": DEFAULT_VIDEO_PROMPT, "duration": 5, "resolution": "1080p", "seed": -1})
+                                            else:
+                                                with open(_vpath_r, "rb") as _fv:
+                                                    _npid = ws_submit("kwaivgi/kling-v3.0-pro/motion-control", {"image": _appr_url, "video": to_b64(_fv.read(), mime="video/mp4"), "prompt": DEFAULT_VIDEO_PROMPT, "duration": 5, "aspect_ratio": "9:16", "cfg_scale": 0.5, "seed": -1})
+                                            _job.update({"pred_id": _npid, "status": "pending", "result": None, "error": None})
+                                            st.session_state["_batch_jobs"] = jobs
+                                            _launch_parallel_polls([{"idx": _job["idx"], "pred_id": _npid}], q)
+                                            st.rerun()
+                                        except Exception as _re:
+                                            st.error(str(_re))
+                                with _b3:
+                                    if st.button("✕", key=f"pc_{_job['idx']}", help="Cancel"):
+                                        _job["status"] = "cancelled"
+                                        st.session_state["_batch_jobs"] = jobs
+                                        st.rerun()
+                        elif _job["status"] == "error":
+                            st.markdown(f"<span style='color:#f87171;font-size:11px'>❌ {_lbl_j}</span>", unsafe_allow_html=True)
+                            st.caption((_job.get("error") or "")[:80])
+                        elif _job["status"] == "cancelled":
+                            st.markdown(f"<span style='color:#6b7280;font-size:11px'>✕ {_lbl_j} cancelled</span>", unsafe_allow_html=True)
+                        else:
+                            st.markdown(f"<span style='color:#67e8f9;font-size:11px'>⏳ {_lbl_j}</span>", unsafe_allow_html=True)
+                            st.progress(0.0, text="generating...")
 
-        elif _job["status"] == "error":
-            st.error(f"❌ {_lbl_j} ({_job['type']}): {_job['error']}")
-        elif _job["type"] == "faceswap":
-            st.info(f"⏳ {_lbl_j} — generating faceswap...")
+    # ════════════════════════════════════════════════════════
+    # 🔍 AUDIT TAB
+    # ════════════════════════════════════════════════════════
+    else:
+        if not audit_jobs:
+            st.info("Approve a video in ⚡ Generate to start scrubbing.")
         else:
-            st.info(f"⏳ {_lbl_j} — generating video...")
+            _audit_ready   = [j for j in audit_jobs if j["status"] == "ready"]
+            _audit_running = [j for j in audit_jobs if j["status"] == "auditing"]
+            if _audit_running:
+                st.progress(len(_audit_ready) / len(audit_jobs), text=f"⚙️ Scrubbing {len(_audit_running)} video(s)...")
+            if _audit_ready:
+                st.success(f"✅ {len(_audit_ready)}/{len(audit_jobs)} ready to download")
+            st.markdown("---")
+            _acols = st.columns(min(3, len(audit_jobs)), gap="small")
+            for _i, _aj in enumerate(audit_jobs):
+                with _acols[_i % len(_acols)]:
+                    with st.container(border=True):
+                        if _aj["status"] == "auditing":
+                            st.markdown(f"<span style='color:#fbbf24;font-size:12px;font-weight:600'>⚙️ {_aj['label']} — scrubbing...</span>", unsafe_allow_html=True)
+                            st.progress(0.5, text="Anti-detection pass running...")
+                        elif _aj["status"] == "ready":
+                            st.markdown(f"<span style='color:#10b981;font-size:12px;font-weight:600'>✅ {_aj['label']} — Clean</span>", unsafe_allow_html=True)
+                            if _aj["out_path"] and os.path.exists(_aj["out_path"]):
+                                st.video(_aj["out_path"])
+                                with open(_aj["out_path"], "rb") as _fd:
+                                    st.download_button("⬇ Download", _fd, key=f"dl_audit_{_aj['idx']}", file_name=f"whale_{_aj['label'].replace(' ','_')}.mp4", mime="video/mp4")
+                        else:
+                            st.markdown(f"<span style='color:#f87171;font-size:12px'>❌ {_aj['label']} — scrub failed</span>", unsafe_allow_html=True)
+                            st.caption((_aj.get("error") or "")[:100])
+                            if st.button("🔄 Retry", key=f"retry_audit_{_aj['idx']}"):
+                                _aj.update({"status": "auditing", "out_path": None, "error": None})
+                                st.session_state["_audit_jobs"] = audit_jobs
+                                if audit_q is None:
+                                    audit_q = _stdlib_queue.Queue()
+                                    st.session_state["_audit_queue"] = audit_q
+                                _launch_audit_scrub(_aj, audit_q)
+                                st.rerun()
 
-    # ── All videos approved → exit to finalize step ───────────────────
-    _n_total_vids = len(batch) * _n_c_p
-    _n_vid_appr   = sum(
-        1 for _vi_c, _v_c in enumerate(batch)
-        for _ci_c in range(_n_c_p)
-        if _ci_c in (_v_c.get("approved_final_paths") or {})
+    # ── Check completion ──────────────────────────────────────────────
+    _fs_active  = [j for j in fs_jobs  if j["status"] != "cancelled"]
+    _vid_active = [j for j in vid_jobs if j["status"] != "cancelled"]
+    _n_exp_vids = len(_fs_active)
+    _n_vid_appr = sum(
+        1 for j in _vid_active
+        if j["ci"] in (batch[j["vi"]].get("approved_final_paths") or {})
     )
-    if len(vid_jobs) == _n_total_vids and _n_vid_appr == _n_total_vids:
+    if _n_exp_vids > 0 and len(_vid_active) == _n_exp_vids and _n_vid_appr == _n_exp_vids:
         st.session_state.app_state = "idle"
         st.session_state.step = 3
         st.rerun()
@@ -694,6 +772,35 @@ def _poll_fragment():
 if (st.session_state.get("_gen_pred_id")
         and st.session_state.app_state != "parallel_polling"):
     st.session_state.app_state = "generating"
+
+st.markdown("""<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+*,*::before,*::after{font-family:'Inter',sans-serif!important}
+#MainMenu,footer,.stDeployButton{visibility:hidden}
+.stApp,.stMain{background:#07070f!important}
+section[data-testid="stSidebar"]{background:linear-gradient(180deg,#0d0b1a 0%,#090716 100%)!important;border-right:1px solid rgba(109,40,217,.3)!important}
+section[data-testid="stSidebar"] *{color:#9b8dc4!important}
+h1,h2,h3,h4{color:#e2e8f0!important}
+.stMarkdown p,.stCaption,label,.stText{color:#7c6fa8!important}
+.stButton>button{background:rgba(109,40,217,.12)!important;border:1px solid rgba(109,40,217,.4)!important;color:#a78bfa!important;border-radius:8px!important;font-weight:500!important;font-size:13px!important;transition:all .2s!important}
+.stButton>button:hover{background:rgba(109,40,217,.28)!important;border-color:#7c3aed!important;box-shadow:0 0 18px rgba(124,58,237,.35)!important;transform:translateY(-1px)!important}
+.stButton>button[kind="primary"]{background:linear-gradient(135deg,#6d28d9 0%,#4f46e5 100%)!important;border:none!important;color:#fff!important;box-shadow:0 4px 15px rgba(109,40,217,.45)!important}
+.stButton>button[kind="primary"]:hover{box-shadow:0 6px 24px rgba(109,40,217,.65)!important}
+.stTextInput input,.stTextArea textarea{background:rgba(13,11,26,.9)!important;border:1px solid rgba(109,40,217,.3)!important;color:#e2e8f0!important;border-radius:8px!important}
+.stTextInput input:focus,.stTextArea textarea:focus{border-color:#7c3aed!important;box-shadow:0 0 0 3px rgba(109,40,217,.15)!important}
+[data-testid="stSelectbox"]>div>div{background:rgba(13,11,26,.9)!important;border:1px solid rgba(109,40,217,.3)!important;border-radius:8px!important;color:#e2e8f0!important}
+[data-testid="stProgressBar"]>div{background:rgba(109,40,217,.15)!important;border-radius:99px!important}
+[data-testid="stProgressBar"]>div>div{background:linear-gradient(90deg,#6d28d9,#4f46e5,#0891b2)!important;border-radius:99px!important;box-shadow:0 0 8px rgba(109,40,217,.5)!important}
+.stSuccess{background:rgba(16,185,129,.08)!important;border:1px solid rgba(16,185,129,.25)!important;border-radius:8px!important}
+.stInfo{background:rgba(8,145,178,.08)!important;border:1px solid rgba(8,145,178,.25)!important;border-radius:8px!important}
+.stWarning{background:rgba(245,158,11,.08)!important;border:1px solid rgba(245,158,11,.25)!important;border-radius:8px!important}
+.stError{background:rgba(220,38,38,.08)!important;border:1px solid rgba(220,38,38,.25)!important;border-radius:8px!important}
+[data-testid="stVerticalBlockBorderWrapper"]{background:rgba(18,15,36,.85)!important;border:1px solid rgba(109,40,217,.22)!important;border-radius:14px!important;box-shadow:0 4px 24px rgba(0,0,0,.4)!important;transition:box-shadow .25s!important}
+[data-testid="stVerticalBlockBorderWrapper"]:hover{box-shadow:0 6px 28px rgba(0,0,0,.5),0 0 20px rgba(109,40,217,.18)!important}
+[data-testid="stExpander"]>div:first-child{background:rgba(13,11,26,.8)!important;border:1px solid rgba(109,40,217,.2)!important;border-radius:10px!important}
+[data-testid="stExpander"] summary{color:#9b8dc4!important}
+hr{border-color:rgba(109,40,217,.18)!important}
+</style>""", unsafe_allow_html=True)
 
 st.title("🐋 Whale Pipeline")
 st.caption("AI Video Generation · Cloud · Wavespeed + HikerAPI")
@@ -813,6 +920,20 @@ st.divider()
 # PARALLEL POLLING STATE
 # ──────────────────────────────────────────────────────────
 if st.session_state.app_state == "parallel_polling":
+    with st.sidebar:
+        st.divider()
+        st.markdown("**T-WHALES Studio**")
+        _poll_nav = st.radio(
+            "nav", ["⚡ Generate", "🔍 Audit"],
+            label_visibility="collapsed", key="poll_nav",
+        )
+        _audit_jobs_sb = st.session_state.get("_audit_jobs") or []
+        _ready_sb = sum(1 for j in _audit_jobs_sb if j["status"] == "ready")
+        _auditing_sb = sum(1 for j in _audit_jobs_sb if j["status"] == "auditing")
+        if _auditing_sb:
+            st.caption(f"⚙️ Scrubbing {_auditing_sb} video(s)...")
+        if _ready_sb:
+            st.caption(f"✅ {_ready_sb} ready to download")
     _poll_fragment()
     st.stop()
 
