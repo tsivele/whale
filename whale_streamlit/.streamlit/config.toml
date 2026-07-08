@@ -1,0 +1,9 @@
+📁 (root του repo)
+├── app.py                    ← αντικατέστησε το παλιό
+├── requirements.txt          ← αντικατέστησε το παλιό
+├── processor.py              ← άφσε το ίδιο
+├── queue_manager.py          ← άφσε το ίδιο
+├── safety_filter.py          ← άφσε το ίδιο
+├── packages.txt              ← άφσε το ίδιο
+└── 📁 .streamlit/
+    └── config.toml           ← νέο αρχείο (δημιούργησε τον φάκελο)
