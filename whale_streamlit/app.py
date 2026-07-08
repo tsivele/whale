@@ -9,6 +9,8 @@ import base64
 import threading
 import queue as _stdlib_queue
 from streamlit_option_menu import option_menu
+import memory_manager as mm
+mm.init_db()
 
 def _find_bin(name):
     import shutil as _sh
@@ -167,8 +169,8 @@ with st.sidebar:
         st.session_state["_nav"] = st.session_state.pop("_nav_pending")
     _nav = option_menu(
         None,
-        ["Workflow", "Generate", "Audit"],
-        icons=["diagram-3", "lightning-charge-fill", "shield-check"],
+        ["Workflow", "Generate", "Audit", "Memory"],
+        icons=["diagram-3", "lightning-charge-fill", "shield-check", "archive-fill"],
         default_index=0,
         key="_nav",
         styles={
@@ -587,6 +589,8 @@ def _poll_fragment():
                     _pp.append(_ai["out_path"])
                     batch[_aj_ref["vi"]]["processed_paths"] = _pp
                     st.session_state["_batch_data"] = batch
+                    if _aj_ref.get("asset_id"):
+                        mm.update_asset_status(_aj_ref["asset_id"], "scrubbed", file_path=_ai["out_path"])
                 _achg = True
             except _stdlib_queue.Empty:
                 break
@@ -632,6 +636,13 @@ def _poll_fragment():
                                     if st.button("✅", key=f"pa_{_job['idx']}", type="primary", help="Approve → dispatch video"):
                                         _appr_j[_ci_j] = _job["result"]
                                         batch[_vi_j]["approved_faceswaps"] = _appr_j
+                                        _photo_aid = mm.save_asset(
+                                            creator=_cname_j, asset_type="photo",
+                                            status="approved_photo",
+                                            source_url=_job["result"],
+                                            ig_url=batch[_vi_j].get("url",""),
+                                        )
+                                        _job["asset_id"] = _photo_aid
                                         try:
                                             _mk = st.session_state.get("_gen_model", "kling")
                                             _vp = batch[_vi_j]["video_path"]
@@ -642,8 +653,9 @@ def _poll_fragment():
                                             else:
                                                 with open(_vp, "rb") as _fv:
                                                     _pvid = ws_submit("kwaivgi/kling-v3.0-pro/motion-control", {"image": _job["result"], "video": to_b64(_fv.read(), mime="video/mp4"), "prompt": DEFAULT_VIDEO_PROMPT, "duration": 5, "aspect_ratio": "9:16", "cfg_scale": 0.5, "seed": -1})
-                                            _vjob = {"idx": len(jobs), "vi": _vi_j, "ci": _ci_j, "type": "video", "pred_id": _pvid, "status": "pending", "result": None, "error": None}
+                                            _vjob = {"idx": len(jobs), "vi": _vi_j, "ci": _ci_j, "type": "video", "pred_id": _pvid, "status": "pending", "result": None, "error": None, "asset_id": None}
                                             jobs.append(_vjob)
+                                            mm.update_asset_status(_photo_aid, "pending_video")
                                             st.session_state["_batch_jobs"] = jobs
                                             st.session_state["_batch_data"] = batch
                                             _launch_parallel_polls([{"idx": _vjob["idx"], "pred_id": _pvid}], q)
@@ -664,6 +676,7 @@ def _poll_fragment():
                                 with _b3:
                                     if st.button("✕", key=f"pc_{_job['idx']}", help="Cancel"):
                                         _job["status"] = "cancelled"
+                                        if _job.get("asset_id"): mm.purge_asset(_job["asset_id"])
                                         st.session_state["_batch_jobs"] = jobs
                                         st.rerun()
                         elif _job["status"] == "error":
@@ -698,6 +711,14 @@ def _poll_fragment():
                                 with _b1:
                                     if st.button("✅", key=f"pa_{_job['idx']}", type="primary", help="Approve → start scrub"):
                                         _local_v = download_video_url(_job["result"])
+                                        _vid_aid = mm.save_asset(
+                                            creator=_cname_j, asset_type="video",
+                                            status="approved_video",
+                                            source_url=_job["result"],
+                                            file_path=_local_v,
+                                            ig_url=batch[_vi_j].get("url",""),
+                                        )
+                                        _job["asset_id"] = _vid_aid
                                         _apfp_j[_ci_j] = _local_v
                                         batch[_vi_j]["approved_final_paths"] = _apfp_j
                                         _gu = list(batch[_vi_j].get("gen_urls") or [None, None])
@@ -710,7 +731,7 @@ def _poll_fragment():
                                         if audit_q is None:
                                             audit_q = _stdlib_queue.Queue()
                                             st.session_state["_audit_queue"] = audit_q
-                                        _new_aj = {"idx": len(audit_jobs), "vi": _vi_j, "ci": _ci_j, "in_path": _local_v, "label": _lbl_j, "status": "auditing", "out_path": None, "error": None}
+                                        _new_aj = {"idx": len(audit_jobs), "vi": _vi_j, "ci": _ci_j, "in_path": _local_v, "label": _lbl_j, "status": "auditing", "out_path": None, "error": None, "asset_id": _vid_aid}
                                         audit_jobs.append(_new_aj)
                                         st.session_state["_audit_jobs"] = audit_jobs
                                         st.session_state["_nav_pending"] = "Audit"
@@ -738,6 +759,7 @@ def _poll_fragment():
                                 with _b3:
                                     if st.button("✕", key=f"pc_{_job['idx']}", help="Cancel"):
                                         _job["status"] = "cancelled"
+                                        if _job.get("asset_id"): mm.purge_asset(_job["asset_id"])
                                         st.session_state["_batch_jobs"] = jobs
                                         st.rerun()
                         elif _job["status"] == "error":
@@ -1102,6 +1124,175 @@ else:  # app_state == "idle"
 
     if st.session_state.get("_gen_error"):
         st.error(f"Σφάλμα: {st.session_state.pop('_gen_error', '')}")
+
+    _main_nav = st.session_state.get("_nav", "Workflow")
+
+    # ══════════════════════════════════════════════════════════
+    # MEMORY VAULT TAB
+    # ══════════════════════════════════════════════════════════
+    if _main_nav == "Memory":
+        st.markdown(
+            "<div style='font-size:1.15rem;font-weight:700;color:#c4b5fd;"
+            "letter-spacing:.05em;margin-bottom:1rem'>🗄 Asset Vault</div>",
+            unsafe_allow_html=True,
+        )
+        _mem_tab_ph, _mem_tab_vid = st.tabs(["📸 Photos", "🎬 Videos"])
+
+        # ── PHOTOS ──────────────────────────────────────────────────
+        with _mem_tab_ph:
+            _vault_photos = mm.get_all_assets(asset_type="photo")
+            if not _vault_photos:
+                st.info("Δεν υπάρχουν αποθηκευμένες φωτογραφίες ακόμα.")
+            else:
+                _vp_n = len(_vault_photos)
+                _vp_cols = st.columns(min(3, _vp_n), gap="small")
+                for _vpi, _vpa in enumerate(_vault_photos):
+                    with _vp_cols[_vpi % min(3, _vp_n)]:
+                        with st.container(border=True):
+                            st.markdown(
+                                f"<div style='font-size:11px;color:#a78bfa;font-weight:600;"
+                                f"margin-bottom:4px'>{_vpa['creator']}</div>",
+                                unsafe_allow_html=True,
+                            )
+                            if _vpa.get("source_url"):
+                                try:
+                                    st.image(_vpa["source_url"], use_container_width=True)
+                                except Exception:
+                                    st.caption("(εικόνα μη διαθέσιμη)")
+                            st.markdown(
+                                f"<div style='font-size:10px;color:#6b7280;margin-top:4px'>"
+                                f"{_vpa['status']} · {str(_vpa['created_at'])[:10]}</div>",
+                                unsafe_allow_html=True,
+                            )
+                            _vp_c1, _vp_c2 = st.columns([3, 1])
+                            with _vp_c1:
+                                if st.button("▶ Send to Video", key=f"stv_{_vpa['id']}",
+                                             use_container_width=True, type="primary"):
+                                    _q_stv = st.session_state.get("_result_queue") or _stdlib_queue.Queue()
+                                    st.session_state["_result_queue"] = _q_stv
+                                    _stv_prompt = st.session_state.get("_custom_prompt",
+                                                                        DEFAULT_VIDEO_PROMPT)
+                                    _stv_mk = st.session_state.get("_gen_model", "seedance")
+                                    try:
+                                        if _stv_mk == "wan":
+                                            _stv_pred = ws_submit(
+                                                "alibaba/wan-2.7/image-to-video",
+                                                {"image": _vpa["source_url"],
+                                                 "prompt": _stv_prompt,
+                                                 "duration": 5, "resolution": "1080p", "seed": -1},
+                                            )
+                                        else:
+                                            _stv_pred = ws_submit(
+                                                "bytedance/seedance-2.0/image-to-video",
+                                                {"image": _vpa["source_url"],
+                                                 "prompt": _stv_prompt,
+                                                 "duration": 5, "resolution": "1080p", "seed": -1},
+                                            )
+                                    except Exception as _stv_err:
+                                        st.error(f"Σφάλμα: {_stv_err}")
+                                        st.stop()
+                                    _stv_batch = list(st.session_state.get("_batch_data") or [])
+                                    _stv_jobs  = list(st.session_state.get("_batch_jobs") or [])
+                                    _stv_vi    = len(_stv_batch)
+                                    _stv_entry = {
+                                        "url": _vpa.get("ig_url", ""),
+                                        "video_path": None, "video_dur": 0,
+                                        "frame_options": [], "frame_b64": None,
+                                        "faceswap_urls": [None, None],
+                                        "approved_faceswaps": {},
+                                        "gen_urls": [None, None], "final_paths": [None, None],
+                                        "approved_final_paths": {}, "processed_paths": [],
+                                    }
+                                    _stv_job = {
+                                        "idx": len(_stv_jobs), "vi": _stv_vi, "ci": 0,
+                                        "type": "video", "pred_id": _stv_pred,
+                                        "status": "pending", "result": None,
+                                        "error": None, "asset_id": _vpa["id"],
+                                    }
+                                    _stv_jobs.append(_stv_job)
+                                    _stv_batch.append(_stv_entry)
+                                    st.session_state["_batch_jobs"] = _stv_jobs
+                                    st.session_state["_batch_data"] = _stv_batch
+                                    st.session_state.setdefault("_audit_jobs", [])
+                                    _launch_parallel_polls(
+                                        [{"idx": _stv_job["idx"], "pred_id": _stv_pred}], _q_stv
+                                    )
+                                    st.session_state.app_state = "parallel_polling"
+                                    st.session_state["_nav_pending"] = "Generate"
+                                    st.rerun()
+                            with _vp_c2:
+                                if st.button("🗑", key=f"del_ph_{_vpa['id']}",
+                                             use_container_width=True, help="Διαγραφή"):
+                                    mm.purge_asset(_vpa["id"])
+                                    st.rerun()
+
+        # ── VIDEOS ──────────────────────────────────────────────────
+        with _mem_tab_vid:
+            _vault_vids = mm.get_all_assets(asset_type="video")
+            if not _vault_vids:
+                st.info("Δεν υπάρχουν αποθηκευμένα videos ακόμα.")
+            else:
+                _vv_n = len(_vault_vids)
+                _vv_cols = st.columns(min(3, _vv_n), gap="small")
+                for _vvi, _vva in enumerate(_vault_vids):
+                    with _vv_cols[_vvi % min(3, _vv_n)]:
+                        with st.container(border=True):
+                            st.markdown(
+                                f"<div style='font-size:11px;color:#a78bfa;font-weight:600;"
+                                f"margin-bottom:4px'>{_vva['creator']}</div>",
+                                unsafe_allow_html=True,
+                            )
+                            _vva_fp = _vva.get("file_path")
+                            if _vva_fp and os.path.exists(_vva_fp):
+                                st.video(_vva_fp)
+                            else:
+                                st.caption("(αρχείο δεν βρέθηκε στο δίσκο)")
+                            st.markdown(
+                                f"<div style='font-size:10px;color:#6b7280;margin-top:4px'>"
+                                f"{_vva['status']} · {str(_vva['created_at'])[:10]}</div>",
+                                unsafe_allow_html=True,
+                            )
+                            _vv_c1, _vv_c2, _vv_c3 = st.columns(3)
+                            with _vv_c1:
+                                if _vva_fp and os.path.exists(_vva_fp):
+                                    with open(_vva_fp, "rb") as _vvf:
+                                        st.download_button(
+                                            "⬇", _vvf,
+                                            file_name=f"vault_{_vva['creator']}_{_vva['id']}.mp4",
+                                            mime="video/mp4",
+                                            key=f"dlv_{_vva['id']}",
+                                            use_container_width=True,
+                                        )
+                            with _vv_c2:
+                                if st.button("🔁", key=f"rscrub_{_vva['id']}",
+                                             use_container_width=True, help="Re-Scrub"):
+                                    if _vva_fp and os.path.exists(_vva_fp):
+                                        _aq_rs = (st.session_state.get("_audit_queue")
+                                                  or _stdlib_queue.Queue())
+                                        st.session_state["_audit_queue"] = _aq_rs
+                                        _ajs_rs = list(st.session_state.get("_audit_jobs") or [])
+                                        _rs_aj = {
+                                            "idx": len(_ajs_rs), "vi": 0, "ci": 0,
+                                            "in_path": _vva_fp,
+                                            "label": f"{_vva['creator']} vault #{_vva['id']}",
+                                            "status": "auditing", "out_path": None,
+                                            "error": None, "asset_id": _vva["id"],
+                                        }
+                                        _ajs_rs.append(_rs_aj)
+                                        st.session_state["_audit_jobs"] = _ajs_rs
+                                        mm.update_asset_status(_vva["id"], "scrubbing")
+                                        _launch_audit_scrub(_rs_aj, _aq_rs)
+                                        st.session_state.app_state = "parallel_polling"
+                                        st.session_state["_nav_pending"] = "Audit"
+                                        st.rerun()
+                                    else:
+                                        st.error("Αρχείο δεν βρέθηκε.")
+                            with _vv_c3:
+                                if st.button("🗑", key=f"del_v_{_vva['id']}",
+                                             use_container_width=True, help="Διαγραφή"):
+                                    mm.purge_asset(_vva["id"])
+                                    st.rerun()
+        st.stop()
 
     # ──────────────────────────────────────────────────────────
     # STEP 1 — DOWNLOAD ALL
