@@ -1106,7 +1106,7 @@ else:  # app_state == "idle"
     # ──────────────────────────────────────────────────────────
     if st.session_state.step == 1:
         with st.container(border=True):
-            st.markdown("<div style='font-size:11px;color:#6b5fa5;font-weight:600;text-transform:uppercase;letter-spacing:.1em;margin-bottom:6px'>⬇ Instagram Reel URLs</div>", unsafe_allow_html=True)
+            st.markdown("<div style='font-size:11px;color:#6b5fa5;font-weight:600;text-transform:uppercase;letter-spacing:.1em;margin-bottom:8px'>⬇ Instagram Reel URLs</div>", unsafe_allow_html=True)
             _raw = st.text_area(
                 "URLs",
                 placeholder=(
@@ -1123,64 +1123,62 @@ else:  # app_state == "idle"
             _n_urls = len(_parsed_urls)
             if _n_urls:
                 st.caption(f"✓ {_n_urls} URL{'s' if _n_urls > 1 else ''} ανιχνεύθηκαν")
+            _btn_lbl = f"⬇ Download All ({_n_urls} URLs)" if _n_urls else "⬇ Download All"
+            if st.button(_btn_lbl, type="primary", disabled=(_n_urls == 0),
+                         use_container_width=True, key="dl_all_btn"):
+                _status = st.empty()
+                _prog   = st.progress(0)
+                try:
+                    _batch_new = []
+                    for _ui, _url in enumerate(_parsed_urls):
+                        _status.info(f"[{_ui+1}/{_n_urls}] Κατεβάζω: {_url}")
+                        _prog.progress((_ui) / _n_urls)
+                        _vurl = None
+                        if HIKER_KEY:
+                            try:
+                                _vurl = hiker_get_video_url(_url)
+                            except Exception:
+                                pass
+                        if not _vurl and APIFY_KEY:
+                            _vurl = apify_get_video_url(_url)
+                        if not _vurl:
+                            st.warning(f"Δεν βρέθηκε video για: {_url}")
+                            continue
+                        _vpath = download_video_url(_vurl)
+                        _dur   = get_duration(_vpath)
+                        _times = [max(0.3, p * _dur) for p in [0.05, 0.2, 0.4, 0.6, 0.8]]
+                        _status.info(f"[{_ui+1}/{_n_urls}] Εξάγω frames...")
+                        _fopts = [(t, extract_frame(_vpath, min(t, _dur - 0.2))) for t in _times]
+                        _dfp   = extract_frame(_vpath, 0.0)
+                        with open(_dfp, "rb") as _f:
+                            _fb64 = to_b64(_f.read())
+                        _batch_new.append({
+                            "url":                _url,
+                            "video_path":         _vpath,
+                            "video_dur":          _dur,
+                            "frame_options":      _fopts,
+                            "frame_b64":          _fb64,
+                            "faceswap_urls":      [None, None],
+                            "approved_faceswaps": {},
+                            "gen_urls":           [None, None],
+                            "final_paths":        [None, None],
+                            "approved_final_paths": {},
+                            "processed_paths":    [],
+                        })
+                    _prog.progress(1.0)
+                    _status.empty()
+                    _prog.empty()
+                    if _batch_new:
+                        st.session_state["_batch_data"]     = _batch_new
+                        st.session_state["_batch_gen_vidx"] = 0
+                        st.session_state.video_path = _batch_new[0]["video_path"]
+                        st.session_state.step = 2
+                        st.rerun()
+                    else:
+                        st.error("Κανένα video δεν κατέβηκε. Έλεγξε τα links και τα API keys.")
+                except Exception as e:
+                    st.error(f"Σφάλμα: {e}")
 
-        if _n_urls and st.button("⬇ Download All", type="primary"):
-            _status = st.empty()
-            _prog   = st.progress(0)
-            try:
-                _batch_new = []
-                for _ui, _url in enumerate(_parsed_urls):
-                    _status.info(f"[{_ui+1}/{_n_urls}] Κατεβάζω: {_url}")
-                    _prog.progress((_ui) / _n_urls)
-                    _vurl = None
-                    if HIKER_KEY:
-                        try:
-                            _vurl = hiker_get_video_url(_url)
-                        except Exception:
-                            pass
-                    if not _vurl and APIFY_KEY:
-                        _vurl = apify_get_video_url(_url)
-                    if not _vurl:
-                        st.warning(f"Δεν βρέθηκε video για: {_url}")
-                        continue
-                    _vpath = download_video_url(_vurl)
-                    _dur   = get_duration(_vpath)
-                    _times = [max(0.3, p * _dur) for p in [0.05, 0.2, 0.4, 0.6, 0.8]]
-                    _status.info(f"[{_ui+1}/{_n_urls}] Εξάγω frames...")
-                    _fopts = [(t, extract_frame(_vpath, min(t, _dur - 0.2))) for t in _times]
-                    _dfp   = extract_frame(_vpath, 0.0)
-                    with open(_dfp, "rb") as _f:
-                        _fb64 = to_b64(_f.read())
-                    _batch_new.append({
-                        "url":               _url,
-                        "video_path":        _vpath,
-                        "video_dur":         _dur,
-                        "frame_options":     _fopts,
-                        "frame_b64":         _fb64,
-                        "faceswap_urls":     [None, None],
-                        "approved_faceswaps":{},
-                        "gen_urls":          [None, None],
-                        "final_paths":       [None, None],
-                        "approved_final_paths": {},
-                        "processed_paths":   [],
-                    })
-                _prog.progress(1.0)
-                _status.empty()
-                _prog.empty()
-                if _batch_new:
-                    st.session_state["_batch_data"]     = _batch_new
-                    st.session_state["_batch_gen_vidx"] = 0
-                    st.session_state.video_path = _batch_new[0]["video_path"]
-                    st.session_state.step = 2
-                    st.rerun()
-                else:
-                    st.error("Κανένα video δεν κατέβηκε. Έλεγξε τα links και τα API keys.")
-            except Exception as e:
-                st.error(f"Σφάλμα: {e}")
-
-    # ──────────────────────────────────────────────────────────
-    # STEP 2 — FRAME SELECTION (all videos at once)
-    # ──────────────────────────────────────────────────────────
     elif st.session_state.step == 2:
         _batch = st.session_state.get("_batch_data") or []
         st.subheader(f"Βήμα 2 — Επιλογή Frame ({len(_batch)} video{'s' if len(_batch)>1 else ''})")
