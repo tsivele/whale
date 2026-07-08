@@ -956,26 +956,30 @@ else:  # app_state == "idle"
                         else:
                             st.info("⏳ Generating...")
 
-            # "Generate All Videos" — only shown when all faceswaps approved
-            if _all_fs_approved:
-                st.divider()
-                _ml3 = st.selectbox("Μοντέλο video", list(MODELS.keys()),
-                                    index=list(MODELS.keys()).index(st.session_state.model))
-                st.session_state.model = _ml3
-                if st.button("🎬 Generate All Videos", type="primary"):
-                    for _v3 in _batch3:
-                        _v3["gen_urls"]            = [None, None]
-                        _v3["final_paths"]         = [None, None]
-                        _v3["approved_final_paths"] = {}
-                        _v3["processed_paths"]     = []
-                    st.session_state["_batch_data"]     = _batch3
-                    st.session_state["_batch_gen_vidx"] = 0
-                    st.session_state["_gen_creator_idx"]  = 0
-                    st.session_state["_gen_type"]         = "video"
-                    st.session_state["_gen_model"]        = MODELS[_ml3]
-                    st.session_state["_gen_single_creator"] = False
-                    st.session_state.app_state = "generating"
-                    st.rerun()
+        # ── TRANSITION: all faceswaps approved → generate videos ────────
+        elif _all_fs_approved and not any(
+            any(p for p in (v.get("final_paths") or []))
+            for v in _batch3
+        ):
+            st.divider()
+            st.success("✅ Όλα τα faceswaps εγκρίθηκαν!")
+            _ml3 = st.selectbox("Μοντέλο video", list(MODELS.keys()),
+                                index=list(MODELS.keys()).index(st.session_state.model))
+            st.session_state.model = _ml3
+            if st.button("🎬 Generate All Videos", type="primary"):
+                for _v3 in _batch3:
+                    _v3["gen_urls"]             = [None, None]
+                    _v3["final_paths"]          = [None, None]
+                    _v3["approved_final_paths"] = {}
+                    _v3["processed_paths"]      = []
+                st.session_state["_batch_data"]         = _batch3
+                st.session_state["_batch_gen_vidx"]     = 0
+                st.session_state["_gen_creator_idx"]    = 0
+                st.session_state["_gen_type"]           = "video"
+                st.session_state["_gen_model"]          = MODELS[_ml3]
+                st.session_state["_gen_single_creator"] = False
+                st.session_state.app_state              = "generating"
+                st.rerun()
 
         # ── SUB-STEP B: VIDEO REVIEW + FINALIZE ─────────────────────────
         elif not _all_processed:
