@@ -1114,6 +1114,7 @@ else:  # app_state == "idle"
                             })
                             _jobs_btn.append({
                                 "idx": len(_jobs_btn), "vi": _vi_b, "ci": _ci_b,
+                                "type": "faceswap",
                                 "pred_id": _pid_b, "status": "pending",
                                 "result": None, "error": None,
                             })
