@@ -8,6 +8,7 @@ import time
 import base64
 import threading
 import queue as _stdlib_queue
+from streamlit_option_menu import option_menu
 
 def _find_bin(name):
     import shutil as _sh
@@ -152,86 +153,119 @@ if "creator_bytes" not in st.session_state:
     st.session_state["creator_bytes"] = _CREATOR_BYTES_DEFAULT
 if "creator2_bytes" not in st.session_state or st.session_state["creator2_bytes"] is None:
     st.session_state["creator2_bytes"] = _MELINA_BYTES_DEFAULT
-
-
 # ──────────────────────────────────────────────────────────
-# KEYS — από Streamlit Secrets (Settings → Secrets στο Cloud)
+# SIDEBAR — Navigation + Settings
 # ──────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("### ⚙️ Settings")
-    st.markdown("**API Keys** — βάλε μία φορά, κρατάνε αυτόματα")
-    
-    WS_KEY     = st.text_input("Wavespeed API Key", type="password",
-                                                                    value=st.secrets.get("WAVESPEED_KEY", st.session_state.get("_wk","")),
-                                                                   
-                                placeholder="wsk_live_...")
-    HIKER_KEY  = st.text_input("HikerAPI Access Key",  type="password",
-                                                                    value=st.secrets.get("HIKER_KEY", st.session_state.get("_hk","")),
-                                                                   
-                                placeholder="zw9us00t8...")
-    APIFY_KEY  = st.text_input("Apify API Key (backup)", type="password",
-                                                                    value=st.secrets.get("APIFY_KEY", st.session_state.get("_ak","")),
-                                                                   
-                                placeholder="apify_api_...")
-    
-    if WS_KEY:    st.session_state["_wk"] = WS_KEY
-    if HIKER_KEY: st.session_state["_hk"] = HIKER_KEY
-    if APIFY_KEY: st.session_state["_ak"] = APIFY_KEY
+    st.markdown("""<div style='text-align:center;padding:1.4rem 0 .9rem'>
+        <div style='font-size:2.4rem;line-height:1'>🐋</div>
+        <div style='color:#e2e8f0;font-weight:700;font-size:.95rem;letter-spacing:.1em;margin-top:.4rem'>T-WHALES</div>
+        <div style='color:#6b5fa5;font-size:.65rem;letter-spacing:.15em;margin-top:.1rem'>AI VIDEO PIPELINE</div>
+    </div>""", unsafe_allow_html=True)
 
-    if st.button("🔗 Test HikerAPI Key"):
-        if not HIKER_KEY:
-            st.error("Βάλε HikerAPI key πρώτα")
-        else:
-            try:
-                r = requests.get(
-                    "https://api.hikerapi.com/v1/user/by/username",
-                    params={"username": "instagram"},
-                    headers={"x-access-key": HIKER_KEY, "accept": "application/json"},
-                    timeout=15
-                )
-                if r.status_code == 200:
-                    st.success("✅ HikerAPI key λειτουργεί!")
-                elif r.status_code == 401:
-                    st.error(f"❌ 401 - λάθος key: {r.text[:150]}")
+    _nav = option_menu(
+        None,
+        ["Workflow", "Generate", "Audit"],
+        icons=["diagram-3", "lightning-charge-fill", "shield-check"],
+        default_index=0,
+        key="_nav",
+        styles={
+            "container":         {"padding": "0!important", "background-color": "transparent"},
+            "icon":              {"color": "#6b5fa5", "font-size": "13px"},
+            "nav-link":          {
+                "font-size": "13px", "color": "#9b8dc4", "padding": "8px 12px",
+                "border-radius": "8px", "margin": "2px 0",
+                "--hover-color": "rgba(109,40,217,.15)",
+            },
+            "nav-link-selected": {
+                "background-color": "rgba(109,40,217,.28)",
+                "color": "#c4b5fd", "font-weight": "600",
+            },
+        },
+    )
+
+    # Live status badges
+    _jobs_sb  = st.session_state.get("_batch_jobs") or []
+    _audit_sb = st.session_state.get("_audit_jobs") or []
+    _n_pend   = sum(1 for j in _jobs_sb  if j.get("status") == "pending")
+    _n_scrub  = sum(1 for j in _audit_sb if j.get("status") == "auditing")
+    _n_ready  = sum(1 for j in _audit_sb if j.get("status") == "ready")
+    if _n_pend or _n_scrub or _n_ready:
+        st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
+    if _n_pend:
+        st.markdown(f"<div style='background:rgba(109,40,217,.18);border:1px solid rgba(109,40,217,.3);border-radius:6px;padding:4px 10px;font-size:11px;color:#a78bfa;margin:2px 0'>⚡ {_n_pend} generating</div>", unsafe_allow_html=True)
+    if _n_scrub:
+        st.markdown(f"<div style='background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.25);border-radius:6px;padding:4px 10px;font-size:11px;color:#fbbf24;margin:2px 0'>⚙️ {_n_scrub} scrubbing</div>", unsafe_allow_html=True)
+    if _n_ready:
+        st.markdown(f"<div style='background:rgba(16,185,129,.1);border:1px solid rgba(16,185,129,.25);border-radius:6px;padding:4px 10px;font-size:11px;color:#10b981;margin:2px 0'>✅ {_n_ready} ready</div>", unsafe_allow_html=True)
+
+    st.markdown("<hr style='border-color:rgba(109,40,217,.18);margin:14px 0'>", unsafe_allow_html=True)
+
+    _keys_set = bool(st.session_state.get("_wk")) and bool(st.session_state.get("_hk"))
+    with st.expander("🔑 API Keys", expanded=not _keys_set):
+        WS_KEY    = st.text_input("Wavespeed", type="password",
+                                   value=st.secrets.get("WAVESPEED_KEY", st.session_state.get("_wk", "")),
+                                   placeholder="wsk_live_...")
+        HIKER_KEY = st.text_input("HikerAPI", type="password",
+                                   value=st.secrets.get("HIKER_KEY", st.session_state.get("_hk", "")),
+                                   placeholder="zw9us00t8...")
+        APIFY_KEY = st.text_input("Apify (backup)", type="password",
+                                   value=st.secrets.get("APIFY_KEY", st.session_state.get("_ak", "")),
+                                   placeholder="apify_api_...")
+        if WS_KEY:    st.session_state["_wk"] = WS_KEY
+        if HIKER_KEY: st.session_state["_hk"] = HIKER_KEY
+        if APIFY_KEY: st.session_state["_ak"] = APIFY_KEY
+        _tc1, _tc2 = st.columns(2)
+        with _tc1:
+            if st.button("⚡ Test WS", use_container_width=True, key="test_ws_btn"):
+                if not WS_KEY:
+                    st.error("Βάλε key")
                 else:
-                    st.warning(f"HTTP {r.status_code}: {r.text[:150]}")
-            except Exception as e:
-                st.error(str(e))
-
-    if st.button("⚡ Test Wavespeed Key"):
-        if not WS_KEY:
-            st.error("Βάλε Wavespeed key πρώτα")
-        else:
-            try:
-                _base = WS_API if WS_API.startswith("http") else "https://api.wavespeed.ai/api/v3"
-                r = requests.get(
-                    f"{_base}/models",
-                    headers={"Authorization": f"Bearer {WS_KEY}"},
-                    timeout=15,
-                )
-                if r.status_code == 200:
-                    st.success("✅ Wavespeed key λειτουργεί!")
-                elif r.status_code == 401:
-                    st.error(f"❌ 401 Unauthorized — λάθος ή expired key: {r.text[:200]}")
+                    try:
+                        _base = WS_API if WS_API.startswith("http") else "https://api.wavespeed.ai/api/v3"
+                        _r = requests.get(f"{_base}/models", headers={"Authorization": f"Bearer {WS_KEY}"}, timeout=15)
+                        if _r.status_code == 200:   st.success("✅ OK")
+                        elif _r.status_code == 401: st.error("❌ 401")
+                        else:                       st.warning(f"HTTP {_r.status_code}")
+                    except Exception as _e: st.error(str(_e))
+        with _tc2:
+            if st.button("🔗 Test HK", use_container_width=True, key="test_hk_btn"):
+                if not HIKER_KEY:
+                    st.error("Βάλε key")
                 else:
-                    st.warning(f"HTTP {r.status_code}: {r.text[:200]}")
-            except Exception as e:
-                st.error(str(e))
+                    try:
+                        _r = requests.get(
+                            "https://api.hikerapi.com/v1/user/by/username",
+                            params={"username": "instagram"},
+                            headers={"x-access-key": HIKER_KEY, "accept": "application/json"},
+                            timeout=15,
+                        )
+                        if _r.status_code == 200:   st.success("✅ OK")
+                        elif _r.status_code == 401: st.error("❌ 401")
+                        else:                       st.warning(f"HTTP {_r.status_code}")
+                    except Exception as _e: st.error(str(_e))
 
-    st.markdown("---")
-    st.markdown("**SOFIA (Creator 1)**")
-    creator_file = st.file_uploader("Upload φωτό SOFIA", type=["jpg","jpeg","png"], key="creator_upload")
-    if creator_file:
-        st.session_state["creator_bytes"] = creator_file.read()
-        st.image(st.session_state["creator_bytes"], width=120)
-    elif "creator_bytes" in st.session_state:
-        st.image(st.session_state["creator_bytes"], width=120)
-        st.caption("✓ SOFIA loaded")
+    st.markdown("<div style='font-size:11px;color:#6b5fa5;font-weight:600;margin:12px 0 6px;text-transform:uppercase;letter-spacing:.1em'>Creators</div>", unsafe_allow_html=True)
+    _cr1, _cr2 = st.columns(2)
+    with _cr1:
+        _sf = st.file_uploader("SOFIA", type=["jpg","jpeg","png"], key="creator_upload", label_visibility="collapsed")
+        if _sf:
+            st.session_state["creator_bytes"] = _sf.read()
+        if st.session_state.get("creator_bytes"):
+            st.image(st.session_state["creator_bytes"], use_container_width=True)
+            st.caption("SOFIA")
+    with _cr2:
+        _mf = st.file_uploader("MELINA", type=["jpg","jpeg","png"], key="creator2_upload", label_visibility="collapsed")
+        if _mf:
+            st.session_state["creator2_bytes"] = _mf.read()
+        if st.session_state.get("creator2_bytes"):
+            st.image(st.session_state["creator2_bytes"], use_container_width=True)
+            st.caption("MELINA")
 
-    st.markdown("---")
-    if st.button("🔄 Restart pipeline"):
+    st.markdown("<hr style='border-color:rgba(109,40,217,.18);margin:14px 0'>", unsafe_allow_html=True)
+    if st.button("🔄 Restart", use_container_width=True, key="restart_btn"):
         for k in list(st.session_state.keys()):
-            if k not in ("creator_bytes","_wk","_hk","_ak"):
+            if k not in ("creator_bytes", "creator2_bytes", "_wk", "_hk", "_ak"):
                 del st.session_state[k]
         st.rerun()
 
@@ -517,7 +551,7 @@ def _poll_fragment():
     _cnames_p  = (["SOFIA", "MELINA"] if _dual_p
                   else ["SOFIA"] if _cmode_p == "SOFIA" else ["MELINA"])
     _n_c_p     = 2 if _dual_p else 1
-    _nav       = st.session_state.get("poll_nav", "⚡ Generate")
+    _nav       = "Generate" if st.session_state.get("_nav", "Generate") != "Audit" else "Audit"
 
     # ── Drain generation results ──────────────────────────────────────
     if q:
@@ -566,7 +600,7 @@ def _poll_fragment():
     # ════════════════════════════════════════════════════════
     # ⚡ GENERATE TAB
     # ════════════════════════════════════════════════════════
-    if _nav == "⚡ Generate":
+    if _nav == "Generate":
         if fs_jobs:
             st.progress(fs_done / len(fs_jobs), text=f"📸 Photos: {fs_done}/{len(fs_jobs)}")
         if vid_jobs:
@@ -677,6 +711,7 @@ def _poll_fragment():
                                         _new_aj = {"idx": len(audit_jobs), "vi": _vi_j, "ci": _ci_j, "in_path": _local_v, "label": _lbl_j, "status": "auditing", "out_path": None, "error": None}
                                         audit_jobs.append(_new_aj)
                                         st.session_state["_audit_jobs"] = audit_jobs
+                                        st.session_state["_nav"] = "Audit"
                                         _launch_audit_scrub(_new_aj, audit_q)
                                         st.rerun()
                                 with _b2:
@@ -748,6 +783,7 @@ def _poll_fragment():
                                 if audit_q is None:
                                     audit_q = _stdlib_queue.Queue()
                                     st.session_state["_audit_queue"] = audit_q
+                                st.session_state["_nav"] = "Audit"
                                 _launch_audit_scrub(_aj, audit_q)
                                 st.rerun()
 
@@ -761,6 +797,7 @@ def _poll_fragment():
     )
     if _n_exp_vids > 0 and len(_vid_active) == _n_exp_vids and _n_vid_appr == _n_exp_vids:
         st.session_state.app_state = "idle"
+        st.session_state["_nav"] = "Workflow"
         st.session_state.step = 3
         st.rerun()
 
@@ -774,168 +811,157 @@ if (st.session_state.get("_gen_pred_id")
     st.session_state.app_state = "generating"
 
 st.markdown("""<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
-*,*::before,*::after{font-family:'Inter',sans-serif!important}
-#MainMenu,footer,.stDeployButton{visibility:hidden}
-.stApp,.stMain{background:#07070f!important}
-section[data-testid="stSidebar"]{background:linear-gradient(180deg,#0d0b1a 0%,#090716 100%)!important;border-right:1px solid rgba(109,40,217,.3)!important}
-section[data-testid="stSidebar"] *{color:#9b8dc4!important}
-h1,h2,h3,h4{color:#e2e8f0!important}
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+*,*::before,*::after{font-family:'Inter',sans-serif!important;box-sizing:border-box}
+#MainMenu,footer,.stDeployButton,[data-testid="collapsedControl"]{visibility:hidden!important}
+.stApp,.stMain,[data-testid="stAppViewContainer"]{background:#05040e!important}
+[data-testid="stHeader"]{background:transparent!important;backdrop-filter:blur(0)!important}
+/* ── Sidebar ── */
+section[data-testid="stSidebar"]{background:linear-gradient(180deg,#0b0918 0%,#07060f 100%)!important;border-right:1px solid rgba(109,40,217,.25)!important;min-width:220px!important}
+section[data-testid="stSidebar"] .stMarkdown p,
+section[data-testid="stSidebar"] label,
+section[data-testid="stSidebar"] .stCaption{color:#7c6fa8!important}
+section[data-testid="stSidebar"] h1,
+section[data-testid="stSidebar"] h2,
+section[data-testid="stSidebar"] h3{color:#e2e8f0!important}
+/* ── Typography ── */
+h1{color:#f0eaf8!important;font-weight:800!important;font-size:1.6rem!important;letter-spacing:-.01em!important}
+h2,h3,h4{color:#e2e8f0!important;font-weight:700!important}
 .stMarkdown p,.stCaption,label,.stText{color:#7c6fa8!important}
-.stButton>button{background:rgba(109,40,217,.12)!important;border:1px solid rgba(109,40,217,.4)!important;color:#a78bfa!important;border-radius:8px!important;font-weight:500!important;font-size:13px!important;transition:all .2s!important}
-.stButton>button:hover{background:rgba(109,40,217,.28)!important;border-color:#7c3aed!important;box-shadow:0 0 18px rgba(124,58,237,.35)!important;transform:translateY(-1px)!important}
-.stButton>button[kind="primary"]{background:linear-gradient(135deg,#6d28d9 0%,#4f46e5 100%)!important;border:none!important;color:#fff!important;box-shadow:0 4px 15px rgba(109,40,217,.45)!important}
-.stButton>button[kind="primary"]:hover{box-shadow:0 6px 24px rgba(109,40,217,.65)!important}
-.stTextInput input,.stTextArea textarea{background:rgba(13,11,26,.9)!important;border:1px solid rgba(109,40,217,.3)!important;color:#e2e8f0!important;border-radius:8px!important}
-.stTextInput input:focus,.stTextArea textarea:focus{border-color:#7c3aed!important;box-shadow:0 0 0 3px rgba(109,40,217,.15)!important}
-[data-testid="stSelectbox"]>div>div{background:rgba(13,11,26,.9)!important;border:1px solid rgba(109,40,217,.3)!important;border-radius:8px!important;color:#e2e8f0!important}
-[data-testid="stProgressBar"]>div{background:rgba(109,40,217,.15)!important;border-radius:99px!important}
-[data-testid="stProgressBar"]>div>div{background:linear-gradient(90deg,#6d28d9,#4f46e5,#0891b2)!important;border-radius:99px!important;box-shadow:0 0 8px rgba(109,40,217,.5)!important}
-.stSuccess{background:rgba(16,185,129,.08)!important;border:1px solid rgba(16,185,129,.25)!important;border-radius:8px!important}
-.stInfo{background:rgba(8,145,178,.08)!important;border:1px solid rgba(8,145,178,.25)!important;border-radius:8px!important}
-.stWarning{background:rgba(245,158,11,.08)!important;border:1px solid rgba(245,158,11,.25)!important;border-radius:8px!important}
-.stError{background:rgba(220,38,38,.08)!important;border:1px solid rgba(220,38,38,.25)!important;border-radius:8px!important}
-[data-testid="stVerticalBlockBorderWrapper"]{background:rgba(18,15,36,.85)!important;border:1px solid rgba(109,40,217,.22)!important;border-radius:14px!important;box-shadow:0 4px 24px rgba(0,0,0,.4)!important;transition:box-shadow .25s!important}
-[data-testid="stVerticalBlockBorderWrapper"]:hover{box-shadow:0 6px 28px rgba(0,0,0,.5),0 0 20px rgba(109,40,217,.18)!important}
-[data-testid="stExpander"]>div:first-child{background:rgba(13,11,26,.8)!important;border:1px solid rgba(109,40,217,.2)!important;border-radius:10px!important}
+/* ── Buttons ── */
+.stButton>button{
+    background:rgba(109,40,217,.1)!important;
+    border:1px solid rgba(109,40,217,.35)!important;
+    color:#a78bfa!important;border-radius:8px!important;
+    font-weight:500!important;font-size:13px!important;
+    transition:all .2s ease!important;letter-spacing:.01em!important
+}
+.stButton>button:hover{
+    background:rgba(109,40,217,.25)!important;
+    border-color:#7c3aed!important;
+    box-shadow:0 0 18px rgba(124,58,237,.3),0 2px 8px rgba(0,0,0,.4)!important;
+    transform:translateY(-1px)!important
+}
+.stButton>button[kind="primary"]{
+    background:linear-gradient(135deg,#6d28d9 0%,#4f46e5 100%)!important;
+    border:none!important;color:#fff!important;font-weight:600!important;
+    box-shadow:0 4px 15px rgba(109,40,217,.4),0 1px 3px rgba(0,0,0,.3)!important
+}
+.stButton>button[kind="primary"]:hover{
+    box-shadow:0 6px 24px rgba(109,40,217,.6),0 2px 8px rgba(0,0,0,.4)!important;
+    transform:translateY(-2px)!important
+}
+/* ── Inputs ── */
+.stTextInput input,.stTextArea textarea{
+    background:rgba(11,9,24,.9)!important;
+    border:1px solid rgba(109,40,217,.28)!important;
+    color:#e2e8f0!important;border-radius:8px!important;
+    font-size:13px!important
+}
+.stTextInput input:focus,.stTextArea textarea:focus{
+    border-color:#7c3aed!important;
+    box-shadow:0 0 0 3px rgba(109,40,217,.12)!important
+}
+/* ── Selectbox ── */
+[data-testid="stSelectbox"]>div>div{
+    background:rgba(11,9,24,.9)!important;
+    border:1px solid rgba(109,40,217,.28)!important;
+    border-radius:8px!important;color:#e2e8f0!important
+}
+/* ── Metrics ── */
+[data-testid="stMetric"]{
+    background:rgba(13,11,26,.85)!important;
+    border:1px solid rgba(109,40,217,.2)!important;
+    border-radius:12px!important;padding:12px 16px!important
+}
+[data-testid="stMetricLabel"]{color:#6b5fa5!important;font-size:11px!important;font-weight:600!important;text-transform:uppercase!important;letter-spacing:.08em!important}
+[data-testid="stMetricValue"]{color:#e2e8f0!important;font-weight:700!important;font-size:1.5rem!important}
+/* ── Progress ── */
+[data-testid="stProgressBar"]>div{
+    background:rgba(109,40,217,.12)!important;border-radius:99px!important
+}
+[data-testid="stProgressBar"]>div>div{
+    background:linear-gradient(90deg,#6d28d9,#4f46e5,#0891b2)!important;
+    border-radius:99px!important;box-shadow:0 0 8px rgba(109,40,217,.5)!important
+}
+/* ── Alerts ── */
+.stSuccess{background:rgba(16,185,129,.07)!important;border:1px solid rgba(16,185,129,.22)!important;border-radius:8px!important}
+.stInfo{background:rgba(8,145,178,.07)!important;border:1px solid rgba(8,145,178,.22)!important;border-radius:8px!important}
+.stWarning{background:rgba(245,158,11,.07)!important;border:1px solid rgba(245,158,11,.22)!important;border-radius:8px!important}
+.stError{background:rgba(220,38,38,.07)!important;border:1px solid rgba(220,38,38,.22)!important;border-radius:8px!important}
+/* ── Cards ── */
+[data-testid="stVerticalBlockBorderWrapper"]{
+    background:rgba(15,12,30,.9)!important;
+    border:1px solid rgba(109,40,217,.2)!important;
+    border-radius:14px!important;
+    box-shadow:0 4px 24px rgba(0,0,0,.4),0 1px 4px rgba(0,0,0,.2)!important;
+    transition:box-shadow .25s ease,border-color .25s ease!important
+}
+[data-testid="stVerticalBlockBorderWrapper"]:hover{
+    box-shadow:0 8px 32px rgba(0,0,0,.5),0 0 20px rgba(109,40,217,.15)!important;
+    border-color:rgba(109,40,217,.32)!important
+}
+/* ── Expanders ── */
+[data-testid="stExpander"]>div:first-child{
+    background:rgba(11,9,24,.85)!important;
+    border:1px solid rgba(109,40,217,.18)!important;
+    border-radius:10px!important
+}
 [data-testid="stExpander"] summary{color:#9b8dc4!important}
-hr{border-color:rgba(109,40,217,.18)!important}
+/* ── Divider / HR ── */
+hr{border-color:rgba(109,40,217,.15)!important}
+/* ── Scrollbar ── */
+::-webkit-scrollbar{width:5px;height:5px}
+::-webkit-scrollbar-track{background:rgba(109,40,217,.05)}
+::-webkit-scrollbar-thumb{background:rgba(109,40,217,.35);border-radius:99px}
+::-webkit-scrollbar-thumb:hover{background:rgba(109,40,217,.55)}
+/* ── Tabs (option_menu) ── */
+.nav-link{border-radius:8px!important}
 </style>""", unsafe_allow_html=True)
 
-st.title("🐋 Whale Pipeline")
-st.caption("AI Video Generation · Cloud · Wavespeed + HikerAPI")
+# ── DASHBOARD HEADER ──────────────────────────────────────
+st.markdown("""<div style='display:flex;align-items:center;gap:12px;margin-bottom:4px'>
+    <span style='font-size:2rem;line-height:1'>🐋</span>
+    <div>
+        <div style='color:#f0eaf8;font-size:1.4rem;font-weight:800;letter-spacing:-.01em;line-height:1.1'>T-WHALES Studio</div>
+        <div style='color:#6b5fa5;font-size:.75rem;margin-top:2px'>AI Video Pipeline · Wavespeed + HikerAPI</div>
+    </div>
+</div>""", unsafe_allow_html=True)
 
-# ── BATCH MODE (sidebar toggle) ────────────────────────────────────────────
-with st.sidebar:
-    st.divider()
-    _batch_mode = st.toggle("Batch Mode", value=False, key="batch_mode")
+# ── METRICS ROW ───────────────────────────────────────────
+_b_m   = st.session_state.get("_batch_data")  or []
+_j_m   = st.session_state.get("_batch_jobs")  or []
+_aud_m = st.session_state.get("_audit_jobs")  or []
+_m1, _m2, _m3, _m4 = st.columns(4, gap="small")
+with _m1: st.metric("Queued Videos",  len(_b_m))
+with _m2: st.metric("Active Jobs",    sum(1 for j in _j_m  if j.get("status") == "pending"))
+with _m3: st.metric("Scrubbing",      sum(1 for j in _aud_m if j.get("status") == "auditing"))
+with _m4: st.metric("Ready",          sum(1 for j in _aud_m if j.get("status") == "ready"))
+st.markdown("<hr style='border-color:rgba(109,40,217,.15);margin:10px 0 16px'>", unsafe_allow_html=True)
 
-if _batch_mode:
-    st.subheader("Batch Processing")
-    _pasted_urls = st.text_area(
-        "Paste URLs (one per line)",
-        placeholder="https://www.instagram.com/reel/ABC123/\nhttps://www.instagram.com/reel/DEF456/\nhttps://www.instagram.com/reel/GHI789/\n...",
-        height=350,
-        key="batch_url_text",
-    )
-    _batch_creator = st.radio(
-        "Creator mode", ["SOFIA", "MELINA", "SOFIA + MELINA"],
-        horizontal=True, key="batch_creator_mode",
-    )
-    _url_list = []
-    if _pasted_urls and _pasted_urls.strip():
-        from queue_manager import parse_url_text
-        _url_list = parse_url_text(_pasted_urls)
-        st.caption(f"{len(_url_list)} URL(s) detected")
-    if _url_list and st.button("▶ Run Batch", type="primary", key="run_batch_btn"):
-        from queue_manager import run_batch as _run_batch
 
-        _b_status   = st.empty()
-        _b_progress = st.progress(0)
 
-        def _batch_progress(current, total, url, stage):
-            _b_progress.progress(current / total)
-            _b_status.info(f"[{current}/{total}] {stage.upper()} — {url}")
-
-        def _generate_for_url(url: str):
-            _b_status.info(f"Downloading: {url}")
-            if HIKER_KEY:
-                video_url = hiker_get_video_url(url)
-            elif APIFY_KEY:
-                video_url = apify_get_video_url(url)
-            else:
-                raise RuntimeError("No download API key configured")
-            vpath = download_video_url(video_url)
-            _dur = get_duration(vpath)
-            _frame_path = extract_frame(vpath, _dur / 2)
-            with open(_frame_path, "rb") as _fp:
-                frame_b64 = to_b64(_fp.read())
-            _creators = (
-                [("SOFIA",  st.session_state["creator_bytes"]),
-                 ("MELINA", st.session_state["creator2_bytes"])]
-                if _batch_creator == "SOFIA + MELINA"
-                else [("SOFIA",  st.session_state["creator_bytes"])]
-                if _batch_creator == "SOFIA"
-                else [("MELINA", st.session_state["creator2_bytes"])]
-            )
-            output_paths = []
-            for cname, cbytes in _creators:
-                _b_status.info(f"Faceswap {cname}…")
-                swap_url = ws_poll(
-                    ws_submit("wavespeed-ai/qwen-image-2.0-pro/edit",
-                              {"images": [to_b64(cbytes), frame_b64],
-                               "prompt": DEFAULT_FACE_SWAP_PROMPT, "seed": -1}),
-                    _b_progress,
-                )
-                _b_status.info(f"Video {cname}…")
-                with open(vpath, "rb") as _f:
-                    vb64 = to_b64(_f.read(), mime="video/mp4")
-                vid_url = ws_poll(
-                    ws_submit("kwaivgi/kling-v3.0-pro/motion-control",
-                              {"image": swap_url, "video": vb64,
-                               "prompt": DEFAULT_VIDEO_PROMPT,
-                               "duration": 5, "aspect_ratio": "9:16",
-                               "cfg_scale": 0.5, "seed": -1}),
-                    _b_progress,
-                )
-                output_paths.append(download_video_url(vid_url))
-            return output_paths
-
-        _result = _run_batch(
-            _url_list,
-            generate_fn=_generate_for_url,
-            progress_cb=_batch_progress,
-        )
-        _b_progress.empty()
-        _b_status.empty()
-
-        _s = _result["summary"]
-        st.success(f"Batch complete — {_s['successful']}/{_s['total']} succeeded")
-        for entry in _result["successful_urls"]:
-            st.write(f"✅ `{entry['url']}`")
-            for p in entry["output_paths"]:
-                if os.path.exists(p):
-                    with open(p, "rb") as _f:
-                        st.download_button(f"⬇ {os.path.basename(p)}", _f,
-                                           file_name=os.path.basename(p), mime="video/mp4")
-        for entry in _result["failed_urls"]:
-            st.error(f"✗ `{entry['url']}` — [{entry['stage']}] {entry['reason']}")
-    st.stop()
-
-# ── SINGLE URL MODE (existing pipeline) ───────────────────────────────────
-steps = ["Download", "Frame & Prompt", "Video"]
-cols = st.columns(len(steps))
-for i, (col, name) in enumerate(zip(cols, steps)):
-    with col:
-        if i + 1 < st.session_state.step:
-            st.markdown(f"✅ **{name}**")
-        elif i + 1 == st.session_state.step:
-            st.markdown(f"🔵 **{name}**")
-        else:
-            st.markdown(f"⚪ {name}")
-st.divider()
-
+# ── STEP PROGRESS BAR ─────────────────────────────────────────────────────
+_steps_labels = ["⬇ Download", "🎭 Frame & Swap", "🎬 Video"]
+_cur_s = st.session_state.step
+_sbar_parts = []
+for _si, _sn in enumerate(_steps_labels):
+    _si1 = _si + 1
+    if _si1 < _cur_s:
+        _sbar_parts.append(f"<div style='flex:1;text-align:center;padding:9px 4px;background:rgba(16,185,129,.08);border:1px solid rgba(16,185,129,.28);border-radius:10px;font-size:12px;color:#10b981;font-weight:600'>✅ {_sn}</div>")
+    elif _si1 == _cur_s:
+        _sbar_parts.append(f"<div style='flex:1;text-align:center;padding:9px 4px;background:linear-gradient(135deg,rgba(109,40,217,.22),rgba(79,70,229,.18));border:1px solid rgba(109,40,217,.55);border-radius:10px;font-size:12px;color:#c4b5fd;font-weight:700;box-shadow:0 0 14px rgba(109,40,217,.18)'>◉ {_sn}</div>")
+    else:
+        _sbar_parts.append(f"<div style='flex:1;text-align:center;padding:9px 4px;background:rgba(11,9,24,.7);border:1px solid rgba(109,40,217,.1);border-radius:10px;font-size:12px;color:#3d3558'>○ {_sn}</div>")
+st.markdown(f"<div style='display:flex;gap:8px;margin-bottom:18px'>{''.join(_sbar_parts)}</div>", unsafe_allow_html=True)
 
 # ──────────────────────────────────────────────────────────
 # PARALLEL POLLING STATE
 # ──────────────────────────────────────────────────────────
 if st.session_state.app_state == "parallel_polling":
-    with st.sidebar:
-        st.divider()
-        st.markdown("**T-WHALES Studio**")
-        _poll_nav = st.radio(
-            "nav", ["⚡ Generate", "🔍 Audit"],
-            label_visibility="collapsed", key="poll_nav",
-        )
-        _audit_jobs_sb = st.session_state.get("_audit_jobs") or []
-        _ready_sb = sum(1 for j in _audit_jobs_sb if j["status"] == "ready")
-        _auditing_sb = sum(1 for j in _audit_jobs_sb if j["status"] == "auditing")
-        if _auditing_sb:
-            st.caption(f"⚙️ Scrubbing {_auditing_sb} video(s)...")
-        if _ready_sb:
-            st.caption(f"✅ {_ready_sb} ready to download")
     _poll_fragment()
     st.stop()
+
 
 # ──────────────────────────────────────────────────────────
 # STATE MACHINE (sequential — used for single recreates only)
@@ -1079,23 +1105,24 @@ else:  # app_state == "idle"
     # STEP 1 — DOWNLOAD ALL
     # ──────────────────────────────────────────────────────────
     if st.session_state.step == 1:
-        st.subheader("Βήμα 1 — Κατέβασμα Instagram Video(s)")
-
-        _raw = st.text_area(
-            "Instagram Reel URL(s) — ένα ή πολλά, ένα ανά γραμμή",
-            placeholder=(
-                "https://www.instagram.com/reel/ABC123/\n"
-                "https://www.instagram.com/reel/DEF456/\n"
-                "https://www.instagram.com/reel/GHI789/"
-            ),
-            height=130,
-            key="step1_url_input",
-        )
-        from queue_manager import parse_url_text as _pu
-        _parsed_urls = _pu(_raw or "")
-        _n_urls = len(_parsed_urls)
-        if _n_urls:
-            st.caption(f"{_n_urls} URL{'s' if _n_urls > 1 else ''} ανιχνεύθηκαν")
+        with st.container(border=True):
+            st.markdown("<div style='font-size:11px;color:#6b5fa5;font-weight:600;text-transform:uppercase;letter-spacing:.1em;margin-bottom:6px'>⬇ Instagram Reel URLs</div>", unsafe_allow_html=True)
+            _raw = st.text_area(
+                "URLs",
+                placeholder=(
+                    "https://www.instagram.com/reel/ABC123/\n"
+                    "https://www.instagram.com/reel/DEF456/\n"
+                    "https://www.instagram.com/reel/GHI789/"
+                ),
+                height=130,
+                key="step1_url_input",
+                label_visibility="collapsed",
+            )
+            from queue_manager import parse_url_text as _pu
+            _parsed_urls = _pu(_raw or "")
+            _n_urls = len(_parsed_urls)
+            if _n_urls:
+                st.caption(f"✓ {_n_urls} URL{'s' if _n_urls > 1 else ''} ανιχνεύθηκαν")
 
         if _n_urls and st.button("⬇ Download All", type="primary"):
             _status = st.empty()
@@ -1255,6 +1282,7 @@ else:  # app_state == "idle"
                 st.session_state["_gen_prompt"]       = _fp
                 st.session_state["_gen_model"]        = MODELS[_ml2]
                 st.session_state.app_state            = "parallel_polling"
+                st.session_state["_nav"]            = "Generate"
                 _launch_parallel_polls(_jobs_btn, _rq_btn)
                 st.rerun()
 
