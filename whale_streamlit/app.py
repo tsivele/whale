@@ -1184,48 +1184,36 @@ else:  # app_state == "idle"
     elif st.session_state.step == 2:
         _batch = st.session_state.get("_batch_data") or []
 
-        # ── Video selector ────────────────────────────────────────────
-        if len(_batch) > 1:
-            _vi2 = st.selectbox(
-                "🎬 Επιλογή Video",
-                range(len(_batch)),
-                format_func=lambda i: f"Video {i+1}  —  ...{_batch[i]['url'][-40:]}",
-                key="step2_video_sel",
-            )
-        else:
-            _vi2 = 0
-
-        _vdata = _batch[_vi2]
-
-        # ── Frame preview + change ────────────────────────────────────
-        with st.container(border=True):
-            _fco1, _fco2 = st.columns([1, 3])
-            with _fco1:
-                st.image(_vdata["frame_b64"], use_container_width=True,
-                         caption=f"Τρέχον frame (V{_vi2+1})")
-            with _fco2:
-                st.markdown("<div style='color:#a78bfa;font-size:12px;font-weight:600;margin-bottom:6px'>ΕΠΙΛΟΓΗ FRAME</div>", unsafe_allow_html=True)
-                _fcols = st.columns(5)
-                for _fi, (_ft, _ffp) in enumerate(_vdata["frame_options"]):
-                    with _fcols[_fi]:
-                        st.image(_ffp, use_container_width=True, caption=f"{_ft:.1f}s")
-                        if st.button("✓", key=f"frame_{_vi2}_{_fi}", use_container_width=True):
-                            with open(_ffp, "rb") as _ff:
-                                _batch[_vi2]["frame_b64"] = to_b64(_ff.read())
-                            st.session_state["_batch_data"] = _batch
-                            st.rerun()
-                _ct = st.slider("Custom timestamp (s)", 0.0, float(_vdata["video_dur"]),
-                                1.0, 0.1, key=f"slider_{_vi2}")
-                if st.button("📸 Capture αυτό το frame", key=f"cap_{_vi2}"):
-                    _cfp = extract_frame(_vdata["video_path"], _ct)
-                    with open(_cfp, "rb") as _ff:
-                        _batch[_vi2]["frame_b64"] = to_b64(_ff.read())
-                    st.session_state["_batch_data"] = _batch
-                    st.rerun()
+        # ── Video cards — side by side grid ──────────────────────────
+        _n_v = len(_batch)
+        _vcols = st.columns(min(3, _n_v), gap="small")
+        for _vi2, _vdata in enumerate(_batch):
+            with _vcols[_vi2 % min(3, _n_v)]:
+                with st.container(border=True):
+                    st.markdown(f"<div style='font-size:11px;color:#a78bfa;font-weight:600;margin-bottom:4px'>VIDEO {_vi2+1}</div>", unsafe_allow_html=True)
+                    st.image(_vdata["frame_b64"], use_container_width=True, caption="Τρέχον frame")
+                    st.markdown("<div style='font-size:10px;color:#6b5fa5;margin:6px 0 3px'>Επίλεξε άλλο frame:</div>", unsafe_allow_html=True)
+                    _th_cols = st.columns(5)
+                    for _fi, (_ft, _ffp) in enumerate(_vdata["frame_options"]):
+                        with _th_cols[_fi]:
+                            st.image(_ffp, use_container_width=True)
+                            if st.button(f"{_ft:.1f}s", key=f"frame_{_vi2}_{_fi}", use_container_width=True):
+                                with open(_ffp, "rb") as _ff:
+                                    _batch[_vi2]["frame_b64"] = to_b64(_ff.read())
+                                st.session_state["_batch_data"] = _batch
+                                st.rerun()
+                    _ct = st.slider("", 0.0, float(_vdata["video_dur"]), 1.0, 0.1,
+                                    key=f"slider_{_vi2}", label_visibility="collapsed")
+                    if st.button("📸 Capture", key=f"cap_{_vi2}", use_container_width=True):
+                        _cfp = extract_frame(_vdata["video_path"], _ct)
+                        with open(_cfp, "rb") as _ff:
+                            _batch[_vi2]["frame_b64"] = to_b64(_ff.read())
+                        st.session_state["_batch_data"] = _batch
+                        st.rerun()
 
         st.divider()
 
-        # ── Creator mode + prompt ─────────────────────────────────────
+        # ── Creator mode ──────────────────────────────────────────────
         _creator_mode2 = st.radio("👥 Creator", ["SOFIA", "MELINA", "SOFIA + MELINA"],
                                    horizontal=True, key="creator_mode")
         if _creator_mode2 == "SOFIA":
@@ -1239,17 +1227,19 @@ else:  # app_state == "idle"
             with _cc2:
                 st.image(st.session_state["creator2_bytes"], width=100); st.caption("✓ MELINA")
 
-        with st.expander("⚙️ Default prompt (advanced)"):
-            st.caption(DEFAULT_FACE_SWAP_PROMPT)
-        _cust_fp = st.text_input("Custom Prompt", key="custom_face_swap_prompt",
-                                  placeholder="Προαιρετικό — προστίθεται στο τέλος")
+        # ── Model + custom prompt in a card ───────────────────────────
+        with st.container(border=True):
+            _ml2 = st.selectbox("🎬 Μοντέλο video", list(MODELS.keys()),
+                                 index=list(MODELS.keys()).index(st.session_state.model),
+                                 key="step2_model")
+            st.session_state.model = _ml2
+            with st.expander("⚙️ Default prompt (advanced)"):
+                st.caption(DEFAULT_FACE_SWAP_PROMPT)
+            _cust_fp = st.text_input("✏️ Custom Prompt (προαιρετικό)",
+                                      key="custom_face_swap_prompt",
+                                      placeholder="Προστίθεται στο τέλος του default prompt...")
 
-        _ml2 = st.selectbox("🎬 Μοντέλο video", list(MODELS.keys()),
-                             index=list(MODELS.keys()).index(st.session_state.model),
-                             key="step2_model")
-        st.session_state.model = _ml2
-
-        if st.button("🎭 Generate All Faceswaps", type="primary"):
+        if st.button("🎭 Generate All Faceswaps", type="primary", use_container_width=True):
             _fp = DEFAULT_FACE_SWAP_PROMPT
             if _cust_fp.strip():
                 _fp = f"{DEFAULT_FACE_SWAP_PROMPT} {_cust_fp.strip()}"
@@ -1305,8 +1295,6 @@ else:  # app_state == "idle"
             st.session_state.step = 1
             st.rerun()
 
-
-    # ──────────────────────────────────────────────────────────
     # STEP 3 — FACESWAP REVIEW → VIDEO GENERATION → FINALIZE
     # ──────────────────────────────────────────────────────────
     elif st.session_state.step == 3:
