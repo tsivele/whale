@@ -163,6 +163,8 @@ with st.sidebar:
         <div style='color:#6b5fa5;font-size:.65rem;letter-spacing:.15em;margin-top:.1rem'>AI VIDEO PIPELINE</div>
     </div>""", unsafe_allow_html=True)
 
+    if "_nav_pending" in st.session_state:
+        st.session_state["_nav"] = st.session_state.pop("_nav_pending")
     _nav = option_menu(
         None,
         ["Workflow", "Generate", "Audit"],
@@ -711,7 +713,7 @@ def _poll_fragment():
                                         _new_aj = {"idx": len(audit_jobs), "vi": _vi_j, "ci": _ci_j, "in_path": _local_v, "label": _lbl_j, "status": "auditing", "out_path": None, "error": None}
                                         audit_jobs.append(_new_aj)
                                         st.session_state["_audit_jobs"] = audit_jobs
-                                        st.session_state["_nav"] = "Audit"
+                                        st.session_state["_nav_pending"] = "Audit"
                                         _launch_audit_scrub(_new_aj, audit_q)
                                         st.rerun()
                                 with _b2:
@@ -783,7 +785,7 @@ def _poll_fragment():
                                 if audit_q is None:
                                     audit_q = _stdlib_queue.Queue()
                                     st.session_state["_audit_queue"] = audit_q
-                                st.session_state["_nav"] = "Audit"
+                                st.session_state["_nav_pending"] = "Audit"
                                 _launch_audit_scrub(_aj, audit_q)
                                 st.rerun()
 
@@ -797,7 +799,7 @@ def _poll_fragment():
     )
     if _n_exp_vids > 0 and len(_vid_active) == _n_exp_vids and _n_vid_appr == _n_exp_vids:
         st.session_state.app_state = "idle"
-        st.session_state["_nav"] = "Workflow"
+        st.session_state["_nav_pending"] = "Workflow"
         st.session_state.step = 3
         st.rerun()
 
@@ -1181,34 +1183,49 @@ else:  # app_state == "idle"
 
     elif st.session_state.step == 2:
         _batch = st.session_state.get("_batch_data") or []
-        st.subheader(f"Βήμα 2 — Επιλογή Frame ({len(_batch)} video{'s' if len(_batch)>1 else ''})")
 
-        for _vi2, _vdata in enumerate(_batch):
-            with st.expander(f"🎬 Video {_vi2+1}: ...{_vdata['url'][-40:]}", expanded=True):
-                st.image(_vdata["frame_b64"], width=160, caption=f"Τρέχον frame (video {_vi2+1})")
-                _use_c = st.checkbox("🎯 Αλλαγή frame", key=f"use_custom_{_vi2}")
-                if _use_c:
-                    _fcols = st.columns(5)
-                    for _fi, (_ft, _ffp) in enumerate(_vdata["frame_options"]):
-                        with _fcols[_fi]:
-                            st.image(_ffp, caption=f"{_ft:.1f}s")
-                            if st.button("✓", key=f"frame_{_vi2}_{_fi}"):
-                                with open(_ffp, "rb") as _ff:
-                                    _batch[_vi2]["frame_b64"] = to_b64(_ff.read())
-                                st.session_state["_batch_data"] = _batch
-                                st.rerun()
-                    _ct = st.slider("Custom timestamp", 0.0, float(_vdata["video_dur"]), 1.0, 0.1,
-                                    key=f"slider_{_vi2}")
-                    if st.button("📸 Capture", key=f"cap_{_vi2}"):
-                        _cfp = extract_frame(_vdata["video_path"], _ct)
-                        with open(_cfp, "rb") as _ff:
-                            _batch[_vi2]["frame_b64"] = to_b64(_ff.read())
-                        st.session_state["_batch_data"] = _batch
-                        st.rerun()
+        # ── Video selector ────────────────────────────────────────────
+        if len(_batch) > 1:
+            _vi2 = st.selectbox(
+                "🎬 Επιλογή Video",
+                range(len(_batch)),
+                format_func=lambda i: f"Video {i+1}  —  ...{_batch[i]['url'][-40:]}",
+                key="step2_video_sel",
+            )
+        else:
+            _vi2 = 0
+
+        _vdata = _batch[_vi2]
+
+        # ── Frame preview + change ────────────────────────────────────
+        with st.container(border=True):
+            _fco1, _fco2 = st.columns([1, 3])
+            with _fco1:
+                st.image(_vdata["frame_b64"], use_container_width=True,
+                         caption=f"Τρέχον frame (V{_vi2+1})")
+            with _fco2:
+                st.markdown("<div style='color:#a78bfa;font-size:12px;font-weight:600;margin-bottom:6px'>ΕΠΙΛΟΓΗ FRAME</div>", unsafe_allow_html=True)
+                _fcols = st.columns(5)
+                for _fi, (_ft, _ffp) in enumerate(_vdata["frame_options"]):
+                    with _fcols[_fi]:
+                        st.image(_ffp, use_container_width=True, caption=f"{_ft:.1f}s")
+                        if st.button("✓", key=f"frame_{_vi2}_{_fi}", use_container_width=True):
+                            with open(_ffp, "rb") as _ff:
+                                _batch[_vi2]["frame_b64"] = to_b64(_ff.read())
+                            st.session_state["_batch_data"] = _batch
+                            st.rerun()
+                _ct = st.slider("Custom timestamp (s)", 0.0, float(_vdata["video_dur"]),
+                                1.0, 0.1, key=f"slider_{_vi2}")
+                if st.button("📸 Capture αυτό το frame", key=f"cap_{_vi2}"):
+                    _cfp = extract_frame(_vdata["video_path"], _ct)
+                    with open(_cfp, "rb") as _ff:
+                        _batch[_vi2]["frame_b64"] = to_b64(_ff.read())
+                    st.session_state["_batch_data"] = _batch
+                    st.rerun()
 
         st.divider()
 
-        # ── Creator mode + prompt (same for all videos) ────────────────
+        # ── Creator mode + prompt ─────────────────────────────────────
         _creator_mode2 = st.radio("👥 Creator", ["SOFIA", "MELINA", "SOFIA + MELINA"],
                                    horizontal=True, key="creator_mode")
         if _creator_mode2 == "SOFIA":
@@ -1237,12 +1254,12 @@ else:  # app_state == "idle"
             if _cust_fp.strip():
                 _fp = f"{DEFAULT_FACE_SWAP_PROMPT} {_cust_fp.strip()}"
             for _v in _batch:
-                _v["faceswap_urls"]       = [None, None]
-                _v["approved_faceswaps"]  = {}
-                _v["gen_urls"]            = [None, None]
-                _v["final_paths"]         = [None, None]
+                _v["faceswap_urls"]        = [None, None]
+                _v["approved_faceswaps"]   = {}
+                _v["gen_urls"]             = [None, None]
+                _v["final_paths"]          = [None, None]
                 _v["approved_final_paths"] = {}
-                _v["processed_paths"]     = []
+                _v["processed_paths"]      = []
             _dual_btn = _creator_mode2 == "SOFIA + MELINA"
             _n_c_btn  = 2 if _dual_btn else 1
             _jobs_btn = []
@@ -1280,13 +1297,14 @@ else:  # app_state == "idle"
                 st.session_state["_gen_prompt"]       = _fp
                 st.session_state["_gen_model"]        = MODELS[_ml2]
                 st.session_state.app_state            = "parallel_polling"
-                st.session_state["_nav"]            = "Generate"
+                st.session_state["_nav_pending"]      = "Generate"
                 _launch_parallel_polls(_jobs_btn, _rq_btn)
                 st.rerun()
 
         if st.button("← Πίσω"):
             st.session_state.step = 1
             st.rerun()
+
 
     # ──────────────────────────────────────────────────────────
     # STEP 3 — FACESWAP REVIEW → VIDEO GENERATION → FINALIZE
