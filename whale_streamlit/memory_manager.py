@@ -45,9 +45,13 @@ CREATE TABLE IF NOT EXISTS pipeline_items (
     updated_at      TEXT    NOT NULL
 );
 """
-# pipeline_items.status flow:
-#   downloaded → swapping → swapped → generating → generated → scrubbing → scrubbed
-#   any → error
+# pipeline_items.status flow (review-based — nothing advances without user action):
+#   downloaded → swapping → pending_photo_review
+#   pending_photo_review → (Approve) → approved_photo → generating → generated_pending_scrub
+#   pending_photo_review → (Recreate) → swapping
+#   generated_pending_scrub → (Send to Scrub) → scrubbing → scrubbed
+#   generated_pending_scrub → (Recreate Video) → generating
+#   any → error → (Retry) → back to appropriate stage
 
 
 def _conn():
@@ -181,23 +185,53 @@ def update_pipeline_item(item_id: int, **kwargs):
             c.execute(f"UPDATE pipeline_items SET {cols} WHERE id=?", vals)
 
 
+def claim_pipeline_item(item_id: int, from_status: str, to_status: str) -> bool:
+    """Atomic compare-and-swap status transition.
+
+    Returns True only if the item was in `from_status` and is now `to_status`.
+    This is the double-submit lock: two clicks (or two tabs) racing on the
+    same item — only ONE claim succeeds, the other gets False and must not
+    call any paid API.
+    """
+    now = datetime.utcnow().isoformat()
+    with _lock:
+        with _conn() as c:
+            cur = c.execute(
+                "UPDATE pipeline_items SET status=?, updated_at=? "
+                "WHERE id=? AND status=?",
+                (to_status, now, item_id, from_status),
+            )
+            return cur.rowcount == 1
+
+
 def delete_pipeline_item(item_id: int):
+    """Purge: delete DB row + remove local files not shared with other items."""
     with _lock:
         with _conn() as c:
             row = c.execute(
-                "SELECT video_path, gen_path, scrubbed_path FROM pipeline_items WHERE id=?",
+                "SELECT video_path, frame_path, gen_path, scrubbed_path "
+                "FROM pipeline_items WHERE id=?",
                 (item_id,),
             ).fetchone()
+            c.execute("DELETE FROM pipeline_items WHERE id=?", (item_id,))
             if row:
-                for fld in ("video_path", "gen_path", "scrubbed_path"):
+                for fld in ("video_path", "frame_path", "gen_path", "scrubbed_path"):
                     fp = row[fld]
-                    if fp:
+                    if not fp:
+                        continue
+                    # SOFIA+MELINA items share video/frame files — only remove
+                    # from disk when no surviving row still references the path
+                    still_used = c.execute(
+                        "SELECT COUNT(*) FROM pipeline_items "
+                        "WHERE video_path=? OR frame_path=? OR gen_path=? OR scrubbed_path=?",
+                        (fp, fp, fp, fp),
+                    ).fetchone()[0]
+                    if still_used == 0:
                         try:
                             if os.path.exists(fp):
                                 os.remove(fp)
                         except OSError:
                             pass
-            c.execute("DELETE FROM pipeline_items WHERE id=?", (item_id,))
 
 
 def get_active_preds() -> list[dict]:
