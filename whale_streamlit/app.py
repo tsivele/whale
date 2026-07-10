@@ -45,6 +45,20 @@ _MELINA_BYTES_DEFAULT = _b64.b64decode("/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAUDBAQE
 st.set_page_config(page_title="T-WHALES — AI Video Pipeline", page_icon="🐋",
                    layout="wide", initial_sidebar_state="expanded")
 
+# ── HIDE STREAMLIT BRANDING / GITHUB BANNERS ─────────────
+st.markdown("""
+<style>
+header {visibility: hidden;}
+footer {visibility: hidden;}
+#MainMenu {visibility: hidden;}
+.stAppDeployButton {display: none !important;}
+div[data-testid="stStatusWidget"] {visibility: hidden;}
+div[data-testid="stToolbar"] {visibility: hidden !important;}
+[data-testid="manage-app-button"] {display: none !important;}
+.viewerBadge_container__1QSob {display: none !important;}
+</style>
+""", unsafe_allow_html=True)
+
 # ── PREMIUM DARK THEME ────────────────────────────────────
 st.markdown("""
 <style>
