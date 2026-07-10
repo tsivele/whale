@@ -24,10 +24,30 @@ CREATE TABLE IF NOT EXISTS assets (
     created_at  TEXT    NOT NULL,
     updated_at  TEXT    NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS pipeline_items (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ig_url          TEXT    NOT NULL,
+    creator         TEXT    NOT NULL DEFAULT 'SOFIA',
+    status          TEXT    NOT NULL DEFAULT 'downloaded',
+    video_path      TEXT,
+    frame_path      TEXT,
+    faceswap_url    TEXT,
+    faceswap_pred   TEXT,
+    gen_url         TEXT,
+    gen_pred        TEXT,
+    gen_path        TEXT,
+    scrubbed_path   TEXT,
+    error_msg       TEXT,
+    model_key       TEXT    DEFAULT 'seedance',
+    prompt          TEXT,
+    created_at      TEXT    NOT NULL,
+    updated_at      TEXT    NOT NULL
+);
 """
-# asset_type : 'photo' | 'video'
-# status     : 'approved_photo' | 'pending_video' | 'approved_video'
-#              'scrubbing' | 'scrubbed'
+# pipeline_items.status flow:
+#   downloaded → swapping → swapped → generating → generated → scrubbing → scrubbed
+#   any → error
 
 
 def _conn():
@@ -106,3 +126,86 @@ def get_asset(asset_id: int) -> dict | None:
                 "SELECT * FROM assets WHERE id=?", (asset_id,)
             ).fetchone()
             return dict(row) if row else None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pipeline Items — 4-tab pipeline tracking
+# ─────────────────────────────────────────────────────────────────────────────
+
+def add_pipeline_item(ig_url: str, creator: str) -> int:
+    now = datetime.utcnow().isoformat()
+    with _lock:
+        with _conn() as c:
+            cur = c.execute(
+                "INSERT INTO pipeline_items (ig_url, creator, status, created_at, updated_at) "
+                "VALUES (?, ?, 'downloaded', ?, ?)",
+                (ig_url, creator, now, now),
+            )
+            return cur.lastrowid
+
+
+def get_pipeline_items(status=None, creator=None) -> list[dict]:
+    with _lock:
+        with _conn() as c:
+            q, p = "SELECT * FROM pipeline_items WHERE 1=1", []
+            if status is not None:
+                if isinstance(status, (list, tuple)):
+                    q += f" AND status IN ({','.join('?'*len(status))})"
+                    p.extend(status)
+                else:
+                    q += " AND status=?"; p.append(status)
+            if creator:
+                q += " AND creator=?"; p.append(creator)
+            q += " ORDER BY created_at ASC"
+            return [dict(r) for r in c.execute(q, p).fetchall()]
+
+
+def get_pipeline_item(item_id: int) -> "dict | None":
+    with _lock:
+        with _conn() as c:
+            row = c.execute(
+                "SELECT * FROM pipeline_items WHERE id=?", (item_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+
+def update_pipeline_item(item_id: int, **kwargs):
+    if not kwargs:
+        return
+    now = datetime.utcnow().isoformat()
+    kwargs["updated_at"] = now
+    cols = ", ".join(f"{k}=?" for k in kwargs)
+    vals = list(kwargs.values()) + [item_id]
+    with _lock:
+        with _conn() as c:
+            c.execute(f"UPDATE pipeline_items SET {cols} WHERE id=?", vals)
+
+
+def delete_pipeline_item(item_id: int):
+    with _lock:
+        with _conn() as c:
+            row = c.execute(
+                "SELECT video_path, gen_path, scrubbed_path FROM pipeline_items WHERE id=?",
+                (item_id,),
+            ).fetchone()
+            if row:
+                for fld in ("video_path", "gen_path", "scrubbed_path"):
+                    fp = row[fld]
+                    if fp:
+                        try:
+                            if os.path.exists(fp):
+                                os.remove(fp)
+                        except OSError:
+                            pass
+            c.execute("DELETE FROM pipeline_items WHERE id=?", (item_id,))
+
+
+def get_active_preds() -> list[dict]:
+    """Items with status 'swapping' or 'generating' that have a pred_id saved."""
+    with _lock:
+        with _conn() as c:
+            rows = c.execute(
+                "SELECT id, status, faceswap_pred, gen_pred FROM pipeline_items "
+                "WHERE status IN ('swapping','generating')"
+            ).fetchall()
+            return [dict(r) for r in rows]
