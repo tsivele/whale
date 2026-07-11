@@ -318,14 +318,18 @@ def ws_poll(pred_id, progress_bar):
     raise TimeoutError("Wavespeed timeout (10 λεπτά)")
 
 
-def ws_poll_bg(pred_id: str) -> str:
-    """Identical to ws_poll but thread-safe — zero Streamlit calls."""
+def ws_poll_bg(pred_id: str, api_key: str = "") -> str:
+    """Identical to ws_poll but thread-safe — zero Streamlit calls.
+
+    api_key is bound at thread-launch time (main thread); falls back to
+    the module global only if empty."""
+    _key = api_key or WS_KEY
     _base = WS_API if WS_API.startswith("http") else "https://api.wavespeed.ai/api/v3"
     for _ in range(150):
         time.sleep(4)
         r = requests.get(
             f"{_base}/predictions/{pred_id}/result",
-            headers={"Authorization": f"Bearer {WS_KEY}"},
+            headers={"Authorization": f"Bearer {_key}"},
             timeout=30,
         )
         d = r.json().get("data", {})
@@ -545,51 +549,59 @@ def strip_metadata(in_path):
 from datetime import datetime as _dt
 
 
+# THREAD DISCIPLINE: worker bodies must NEVER call st.* APIs — no
+# session_state, no widgets, no st.rerun. Streamlit is not thread-safe
+# ("missing ScriptRunContext" crashes). Everything a worker needs is
+# bound as a default argument in the MAIN thread at launch time; results
+# travel back exclusively through stdlib queues, drained by _bg_poller.
+
 def _launch_fs_poll(item_id: int, pred_id: str) -> None:
     """Poll faceswap result in background; puts into _fs_queue."""
-    q = st.session_state["_fs_queue"]
-    def _w():
+    _q  = st.session_state["_fs_queue"]      # captured in main thread
+    _wk = st.session_state.get("_wk", "")
+    def _w(q=_q, iid=item_id, pid=pred_id, wk=_wk):
         try:
-            r = ws_poll_bg(pred_id)
-            q.put({"item_id": item_id, "result": r, "error": None})
+            r = ws_poll_bg(pid, api_key=wk)
+            q.put({"item_id": iid, "result": r, "error": None})
         except Exception as e:
-            q.put({"item_id": item_id, "result": None, "error": str(e)})
+            q.put({"item_id": iid, "result": None, "error": str(e)})
     st.session_state["_active_threads"].add(f"fs_{item_id}")
     threading.Thread(target=_w, daemon=True).start()
 
 
 def _launch_gen_poll(item_id: int, pred_id: str) -> None:
     """Poll video generation + download locally, all in background."""
-    q = st.session_state["_gen_queue"]
-    def _w():
+    _q  = st.session_state["_gen_queue"]     # captured in main thread
+    _wk = st.session_state.get("_wk", "")
+    def _w(q=_q, iid=item_id, pid=pred_id, wk=_wk):
         try:
-            r = ws_poll_bg(pred_id)
-            local = download_video_url(r)          # download in worker → no UI freeze
-            q.put({"item_id": item_id, "result": r, "local": local, "error": None})
+            r = ws_poll_bg(pid, api_key=wk)
+            local = download_video_url(r)     # download in worker → no UI freeze
+            q.put({"item_id": iid, "result": r, "local": local, "error": None})
         except Exception as e:
-            q.put({"item_id": item_id, "result": None, "local": None, "error": str(e)})
+            q.put({"item_id": iid, "result": None, "local": None, "error": str(e)})
     st.session_state["_active_threads"].add(f"gen_{item_id}")
     threading.Thread(target=_w, daemon=True).start()
 
 
 def _launch_item_scrub(item_id: int, in_path: str) -> None:
     """Run VideoProcessor + safety_filter in background; puts into _audit_queue."""
-    q = st.session_state["_audit_queue"]
-    def _w():
+    _q = st.session_state["_audit_queue"]    # captured in main thread
+    def _w(q=_q, iid=item_id, src=in_path):
         try:
             from processor import VideoProcessor
             from safety_filter import verify_batch
-            results = VideoProcessor.process(in_path)
+            results = VideoProcessor.process(src)
             out = results[0] if isinstance(results, list) else results
             vr = verify_batch(out)
             approved = vr.get("approved", [])
             if not approved:
-                q.put({"item_id": item_id, "out_path": None,
+                q.put({"item_id": iid, "out_path": None,
                        "error": "Safety filter: το video μπήκε σε καραντίνα — βρέθηκαν metadata."})
             else:
-                q.put({"item_id": item_id, "out_path": approved[0], "error": None})
+                q.put({"item_id": iid, "out_path": approved[0], "error": None})
         except Exception as e:
-            q.put({"item_id": item_id, "out_path": None, "error": str(e)})
+            q.put({"item_id": iid, "out_path": None, "error": str(e)})
     st.session_state["_active_threads"].add(f"scrub_{item_id}")
     threading.Thread(target=_w, daemon=True).start()
 
@@ -1199,7 +1211,13 @@ with _t_audit:
                     _card_header(_ai, "#34d399")
                     _gfp = _ai.get("gen_path")
                     if _gfp and os.path.exists(_gfp):
-                        st.video(_gfp)
+                        # RAM saver: st.video loads the whole MP4 into server
+                        # memory per render — only load when the user asks
+                        if st.toggle("👁 Preview", key=f"prev_{_ai['id']}"):
+                            st.video(_gfp)
+                        else:
+                            _mb = os.path.getsize(_gfp) / 1e6
+                            st.caption(f"🎬 video έτοιμο ({_mb:.1f} MB) — άνοιξε το Preview για να το δεις")
                     elif _ai.get("gen_url"):
                         st.caption("(τοπικό αρχείο λείπει — υπάρχει μόνο URL)")
                     _ab1, _ab2, _ab3 = st.columns([2, 2, 1])
@@ -1278,7 +1296,12 @@ with _t_audit:
                     _card_header(_ad, "#4ade80")
                     _sfp = _ad.get("scrubbed_path")
                     if _sfp and os.path.exists(_sfp):
-                        st.video(_sfp)
+                        # RAM saver: preview on demand only
+                        if st.toggle("👁 Preview", key=f"prevd_{_ad['id']}"):
+                            st.video(_sfp)
+                        else:
+                            _mb = os.path.getsize(_sfp) / 1e6
+                            st.caption(f"✅ καθαρό video ({_mb:.1f} MB)")
                         with open(_sfp, "rb") as _svf:
                             st.download_button(
                                 "⬇ Download Clean MP4", _svf,
