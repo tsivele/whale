@@ -277,11 +277,14 @@ def to_b64(image_bytes, mime="image/jpeg"):
 # ──────────────────────────────────────────────────────────
 def ws_submit(endpoint, payload):
     _base = WS_API if WS_API.startswith("http") else "https://api.wavespeed.ai/api/v3"
+    # timeout=(connect, read): video-edit payloads carry the whole reel as
+    # base64 (10-30 MB) — a 30 s read window can kill the upload mid-flight.
+    # 300 s covers big uploads on slow links; connect stays snappy at 30 s.
     r = requests.post(
         f"{_base}/{endpoint}",
         headers={"Authorization": f"Bearer {WS_KEY}", "Content-Type": "application/json"},
         json=payload,
-        timeout=30,
+        timeout=(30, 300),
     )
     if r.status_code == 401:
         raise RuntimeError(f"Wavespeed 401 Unauthorized — το API key είναι λάθος ή έχει λήξει. Έλεγξε το key στο sidebar.\nResponse: {r.text[:300]}")
@@ -296,7 +299,7 @@ def ws_submit(endpoint, payload):
 
 def ws_poll(pred_id, progress_bar):
     _base = WS_API if WS_API.startswith("http") else "https://api.wavespeed.ai/api/v3"
-    max_iter = 150  # 150 × 4s = 10 min max
+    max_iter = 450  # 450 × 4s = 30 min max (v2v jobs are slow)
     for i in range(max_iter):
         time.sleep(4)
         r = requests.get(
@@ -318,28 +321,59 @@ def ws_poll(pred_id, progress_bar):
     raise TimeoutError("Wavespeed timeout (10 λεπτά)")
 
 
-def ws_poll_bg(pred_id: str, api_key: str = "") -> str:
-    """Identical to ws_poll but thread-safe — zero Streamlit calls.
+def ws_poll_bg(pred_id: str, api_key: str = "", max_wait: int = 1800) -> str:
+    """Submit-and-poll loop — thread-safe, zero Streamlit calls.
 
-    api_key is bound at thread-launch time (main thread); falls back to
-    the module global only if empty."""
+    The connection is NEVER held open: each poll is an independent 30 s GET
+    on predictions/{id}/result, so gateway 504s on long jobs are impossible
+    by design. What limits us is only this loop's own budget:
+
+      max_wait   hard deadline in seconds (default 1800 = 30 min, sized for
+                 heavy video-to-video jobs that exceed the old 10-min cap)
+      interval   adaptive: 4 s for the first minute (fast jobs return fast),
+                 then 15 s — gentle on the API for 30-minute marathons
+      resilience each poll is individually try/except-ed; up to 6
+                 CONSECUTIVE network failures are tolerated (a dropped poll
+                 must never kill a generation that is still running
+                 server-side). The 7th consecutive failure raises.
+
+    api_key is bound at thread-launch time (main thread); falls back to the
+    module global only if empty.
+    """
     _key = api_key or WS_KEY
     _base = WS_API if WS_API.startswith("http") else "https://api.wavespeed.ai/api/v3"
-    for _ in range(150):
-        time.sleep(4)
-        r = requests.get(
-            f"{_base}/predictions/{pred_id}/result",
-            headers={"Authorization": f"Bearer {_key}"},
-            timeout=30,
-        )
-        d = r.json().get("data", {})
+    _start = time.time()
+    _consec_fails = 0
+    while (time.time() - _start) < max_wait:
+        _elapsed = time.time() - _start
+        time.sleep(4 if _elapsed < 60 else 15)
+        try:
+            r = requests.get(
+                f"{_base}/predictions/{pred_id}/result",
+                headers={"Authorization": f"Bearer {_key}"},
+                timeout=30,
+            )
+            d = r.json().get("data", {})
+            _consec_fails = 0
+        except Exception as _pe:
+            # transient network hiccup — the job is still running remotely
+            _consec_fails += 1
+            if _consec_fails >= 6:
+                raise RuntimeError(
+                    f"Χάθηκε η επικοινωνία με το WaveSpeed "
+                    f"(6 συνεχόμενα αποτυχημένα polls): {_pe}"
+                )
+            continue
         status = d.get("status", "running")
-        if status == "completed":
+        if status in ("completed", "succeeded", "success"):
             outputs = d.get("outputs", [])
             return outputs[0] if outputs else d.get("output", "")
         if status == "failed":
             raise RuntimeError(d.get("error", "Wavespeed generation failed"))
-    raise TimeoutError("Wavespeed timeout (10 λεπτά)")
+    raise TimeoutError(
+        f"Server Timeout — το job δεν ολοκληρώθηκε σε {max_wait // 60} λεπτά. "
+        f"Πάτα 🔄 Recreate για να ξαναδοκιμάσεις."
+    )
 
 
 def _launch_parallel_polls(jobs: list, result_q: _stdlib_queue.Queue) -> None:
@@ -642,8 +676,12 @@ def _launch_fs_poll(item_id: int, pred_id: str) -> None:
     _wk = st.session_state.get("_wk", "")
     def _w(q=_q, iid=item_id, pid=pred_id, wk=_wk):
         try:
-            r = ws_poll_bg(pid, api_key=wk)
+            # photos are quick — 15 min budget is already generous
+            r = ws_poll_bg(pid, api_key=wk, max_wait=900)
             q.put({"item_id": iid, "result": r, "error": None})
+        except TimeoutError as e:
+            q.put({"item_id": iid, "result": None,
+                   "error": f"Faceswap Failed: Server Timeout — {e}"})
         except Exception as e:
             q.put({"item_id": iid, "result": None, "error": str(e)})
     st.session_state["_active_threads"].add(f"fs_{item_id}")
@@ -660,10 +698,16 @@ def _launch_gen_poll(item_id: int, pred_id: str, src_video=None) -> None:
     _wk = st.session_state.get("_wk", "")
     def _w(q=_q, iid=item_id, pid=pred_id, wk=_wk, src=src_video):
         try:
-            r = ws_poll_bg(pid, api_key=wk)
+            # video-to-video is compute-heavy: 30-minute polling budget
+            r = ws_poll_bg(pid, api_key=wk, max_wait=1800)
             local = download_video_url(r)     # download in worker → no UI freeze
             local = _ensure_audio(local, src) # original-audio fallback mux
             q.put({"item_id": iid, "result": r, "local": local, "error": None})
+        except TimeoutError as e:
+            # graceful: lands on the card as an error with Retry/Recreate —
+            # never crashes the batch or the UI
+            q.put({"item_id": iid, "result": None, "local": None,
+                   "error": f"Generation Failed: Server Timeout — {e}"})
         except Exception as e:
             q.put({"item_id": iid, "result": None, "local": None, "error": str(e)})
     st.session_state["_active_threads"].add(f"gen_{item_id}")
@@ -736,14 +780,23 @@ def _submit_video_edit(video_path: str, ref_img: str, prompt: str) -> str:
     """Submit to bytedance/seedance-2.0/video-edit with the approved
     faceswap photo as the reference image.
 
-    PRE-FLIGHT (credit protection): if the reference image is missing or
-    malformed, raise BEFORE any network call — zero credits burned, and the
-    API can never silently return an un-edited video.
+    PAYLOAD SCHEMA — per the official WaveSpeed API docs
+    (wavespeed.ai/docs/docs-api/bytedance/bytedance-seedance-2.0-video-edit):
+      video             (required) source video
+      prompt            (required) edit instruction
+      reference_images  (optional) up to 9 images guiding character identity
+      aspect_ratio      9:16 for reels
+      resolution        480p/720p/1080p/4k
+      generate_audio    default TRUE — we force False so the output comes
+                        back mute and _ensure_audio() muxes in the ORIGINAL
+                        reel audio deterministically
 
-    PAYLOAD MAPPING: multi-reference WaveSpeed models expect `images` (list);
-    single-image models expect `image`. We send `images=[ref]` first; if the
-    schema rejects it (HTTP 400), we retry ONCE with `image=ref`. A retry can
-    only happen when the first attempt created nothing, so no double-billing.
+    The old code sent `images` — the endpoint silently IGNORES unknown
+    fields (no 400), so the model never received the faceswap reference and
+    returned the video un-edited. `reference_images` is the correct key.
+
+    PRE-FLIGHT (credit protection): if the reference image is missing or
+    malformed, raise BEFORE any network call — zero credits burned.
     """
     if not _valid_ref_image(ref_img):
         raise RuntimeError(
@@ -754,20 +807,19 @@ def _submit_video_edit(video_path: str, ref_img: str, prompt: str) -> str:
         raise RuntimeError("Το αρχικό source video λείπει — δεν γίνεται video-edit.")
     with open(video_path, "rb") as _f:
         _vb64 = to_b64(_f.read(), mime="video/mp4")
-    _payload = {"video": _vb64, "prompt": prompt, "resolution": "1080p", "seed": -1}
-    try:
-        _pid = ws_submit("bytedance/seedance-2.0/video-edit",
-                         {**_payload, "images": [ref_img]})
-        print("[video-edit] submitted with images=[ref]")
-        return _pid
-    except RuntimeError as _e1:
-        if "400" in str(_e1):
-            print(f"[video-edit] 'images' schema rejected → retrying with 'image': {_e1}")
-            _pid = ws_submit("bytedance/seedance-2.0/video-edit",
-                             {**_payload, "image": ref_img})
-            print("[video-edit] submitted with image=ref")
-            return _pid
-        raise
+    _pid = ws_submit(
+        "bytedance/seedance-2.0/video-edit",
+        {
+            "video": _vb64,
+            "prompt": prompt,
+            "reference_images": [ref_img],
+            "aspect_ratio": "9:16",
+            "resolution": "1080p",
+            "generate_audio": False,
+        },
+    )
+    print(f"[video-edit] submitted — reference_images=[faceswap] ✓ (pred {_pid})")
+    return _pid
 
 
 # ──────────────────────────────────────────────────────────
@@ -966,7 +1018,9 @@ def _card_header(item, color):
 def _processing_card(item, label):
     _card_header(item, "#fbbf24")
     st.info(f"⏳ {label} — Please wait.")
-    st.caption(f"ξεκίνησε πριν {int(_age_seconds(item['updated_at']))}s")
+    _el = int(_age_seconds(item["updated_at"]))
+    _el_txt = f"{_el // 60}′{_el % 60:02d}″" if _el >= 60 else f"{_el}s"
+    st.caption(f"τρέχει εδώ και {_el_txt} · τα v2v jobs μπορεί να πάρουν έως ~30′")
 
 
 def _render_errors(stage_name):
