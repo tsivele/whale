@@ -584,26 +584,44 @@ def _launch_gen_poll(item_id: int, pred_id: str) -> None:
     threading.Thread(target=_w, daemon=True).start()
 
 
-def _launch_item_scrub(item_id: int, in_path: str) -> None:
-    """Run VideoProcessor + safety_filter in background; puts into _audit_queue."""
+def _launch_batch_scrub(batch: list) -> None:
+    """Scrub MANY items with ONE worker thread, strictly SEQUENTIALLY.
+
+    batch: list of (item_id, in_path) tuples, already claimed to 'scrubbing'.
+
+    Why sequential: each scrub = 2 ffmpeg passes + ffprobe. Launching one
+    thread per item (the old Scrub All) meant N simultaneous ffmpeg
+    processes on Streamlit Cloud's 1-vCPU/1GB container → CPU starvation
+    and OOM kill (the 'glitch/crash'). One worker, one ffmpeg at a time:
+    constant memory, stable UI, results stream in one-by-one via the queue.
+    """
     _q = st.session_state["_audit_queue"]    # captured in main thread
-    def _w(q=_q, iid=item_id, src=in_path):
-        try:
-            from processor import VideoProcessor
-            from safety_filter import verify_batch
-            results = VideoProcessor.process(src)
-            out = results[0] if isinstance(results, list) else results
-            vr = verify_batch(out)
-            approved = vr.get("approved", [])
-            if not approved:
-                q.put({"item_id": iid, "out_path": None,
-                       "error": "Safety filter: το video μπήκε σε καραντίνα — βρέθηκαν metadata."})
-            else:
-                q.put({"item_id": iid, "out_path": approved[0], "error": None})
-        except Exception as e:
-            q.put({"item_id": iid, "out_path": None, "error": str(e)})
-    st.session_state["_active_threads"].add(f"scrub_{item_id}")
+    def _w(q=_q, items=tuple(batch)):
+        from processor import VideoProcessor
+        from safety_filter import verify_batch
+        for iid, src in items:
+            try:
+                results = VideoProcessor.process(src)
+                out = results[0] if isinstance(results, list) else results
+                vr = verify_batch(out)
+                approved = vr.get("approved", [])
+                if not approved:
+                    q.put({"item_id": iid, "out_path": None,
+                           "error": "Safety filter: το video μπήκε σε καραντίνα — βρέθηκαν metadata."})
+                else:
+                    q.put({"item_id": iid, "out_path": approved[0], "error": None})
+            except Exception as e:
+                q.put({"item_id": iid, "out_path": None, "error": str(e)})
+    # Register ALL tags upfront so the poller's resume logic never
+    # double-launches items still waiting their turn in this worker
+    for _iid, _src in batch:
+        st.session_state["_active_threads"].add(f"scrub_{_iid}")
     threading.Thread(target=_w, daemon=True).start()
+
+
+def _launch_item_scrub(item_id: int, in_path: str) -> None:
+    """Single-item scrub — same sequential worker, batch of one."""
+    _launch_batch_scrub([(item_id, in_path)])
 
 
 def _age_seconds(iso_ts: str) -> float:
@@ -663,16 +681,20 @@ def _bg_poller():
                                     error_msg="Διακόπηκε πριν το submit — πάτα Retry.")
             _changed = True
 
-    # Resume scrub jobs whose thread died (server restart mid-scrub)
+    # Resume scrub jobs whose thread died (server restart mid-scrub) —
+    # collected into ONE sequential batch, never parallel relaunches
+    _resume_scrubs = []
     for _sc in mm.get_pipeline_items(status="scrubbing"):
         if f"scrub_{_sc['id']}" not in _threads and _age_seconds(_sc["updated_at"]) > 20:
             _src = _sc.get("gen_path")
             if _src and os.path.exists(_src):
-                _launch_item_scrub(_sc["id"], _src)
+                _resume_scrubs.append((_sc["id"], _src))
             else:
                 mm.update_pipeline_item(_sc["id"], status="error",
                                         error_msg="Το αρχείο χάθηκε κατά το scrub — κάνε Recreate Video.")
                 _changed = True
+    if _resume_scrubs:
+        _launch_batch_scrub(_resume_scrubs)
 
     # ── Drain faceswap queue → pending_photo_review ──────────────────
     _fsq = st.session_state["_fs_queue"]
@@ -831,8 +853,10 @@ def _render_errors(stage_name):
 
 
 def _grid(items):
-    n = len(items)
-    return st.columns(min(3, max(1, n)), gap="small"), min(3, max(1, n))
+    """ALWAYS a fixed 3-column grid — a single item lands in column 1 at
+    exactly 1/3 width, identical dimensions to a full 3-item row. Never
+    let Streamlit stretch a lone card across the whole page."""
+    return st.columns(3, gap="small"), 3
 
 
 # ════════════════════════════════════════════════════════
@@ -1196,13 +1220,32 @@ with _t_audit:
             if len(_au_pending) >= 2:
                 if st.button(f"🧹 Scrub All ({len(_au_pending)})", type="primary",
                               use_container_width=True, key="scrub_all_btn"):
-                    _n_claimed = 0
-                    for _bp in _au_pending:
+                    # Phase 1: claim everything atomically — NO thread launches,
+                    # NO reruns inside the loop. Items already claimed by a
+                    # racing click return False and are skipped silently.
+                    _batch_scrub = []
+                    _skipped     = 0
+                    _claim_prog  = st.progress(0, text="🧹 Κλειδώνω τα videos…")
+                    for _bi, _bp in enumerate(_au_pending):
                         _src = _bp.get("gen_path")
                         if _src and os.path.exists(_src):
                             if mm.claim_pipeline_item(_bp["id"], "generated_pending_scrub", "scrubbing"):
-                                _launch_item_scrub(_bp["id"], _src)
-                                _n_claimed += 1
+                                _batch_scrub.append((_bp["id"], _src))
+                            else:
+                                _skipped += 1
+                        else:
+                            _skipped += 1
+                        _claim_prog.progress((_bi + 1) / len(_au_pending),
+                                             text=f"🧹 Κλειδώνω… {_bi + 1}/{len(_au_pending)}")
+                    _claim_prog.empty()
+                    # Phase 2: ONE sequential worker for the whole batch,
+                    # then ONE rerun. The poller streams results back as
+                    # each video finishes.
+                    if _batch_scrub:
+                        _launch_batch_scrub(_batch_scrub)
+                        st.toast(f"🧹 {len(_batch_scrub)} videos στην ουρά — σειριακό scrub ξεκίνησε")
+                    if _skipped:
+                        st.toast(f"⚠️ {_skipped} παραλείφθηκαν (λείπει αρχείο ή ήδη τρέχουν)")
                     st.rerun()
         _ap_cols, _ap_w = _grid(_au_pending)
         for _api, _ai in enumerate(_au_pending):
