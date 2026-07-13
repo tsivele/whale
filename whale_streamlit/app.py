@@ -141,7 +141,7 @@ DEFAULT_VIDEO_PROMPT = (
 
 MODELS = {
     "Kling v3 Pro (motion control)": "kling",
-    "Seedance 2.0 (γρήγορο)": "seedance",
+    "Seedance 2.0 Video-Edit (v2v)": "seedance",
     "WAN 2.7 (υψηλή ποιότητα)": "wan",
 }
 
@@ -538,6 +538,87 @@ def strip_metadata(in_path):
     return out_path
 
 
+def _has_audio(path: str) -> bool:
+    """True if the file contains at least one audio stream (ffprobe)."""
+    try:
+        r = subprocess.run(
+            [FFPROBE_BIN or "ffprobe", "-v", "quiet",
+             "-select_streams", "a", "-show_entries", "stream=index",
+             "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=30,
+        )
+        return bool(r.stdout.strip())
+    except Exception:
+        return False
+
+
+def _ensure_audio(gen_path: str, source_video_path) -> str:
+    """AUDIO PRESERVATION FALLBACK for video-edit outputs.
+
+    AI video-edit endpoints often return MUTED videos. If `gen_path` has no
+    audio stream, extract the audio of the ORIGINAL source reel and mux it
+    into the generated video WITHOUT re-encoding the video stream:
+
+        ffmpeg -i gen -i source -map 0:v:0 -map 1:a:0
+               -c:v copy -c:a copy -shortest out.mp4
+
+    -c:v copy   → the AI-generated frames pass through untouched (lossless, fast)
+    -c:a copy   → original AAC track is byte-copied; if the container refuses,
+                  we retry once with -c:a aac re-encode
+    -shortest   → output ends with the shorter stream, so audio can never
+                  spill past the final video frame
+
+    Sync is inherent: video-edit regenerates the SAME timeline as the source
+    (frame 0 of the edit corresponds to t=0 of the reel), so pairing the
+    source audio from t=0 keeps lips/beats aligned.
+
+    Thread-safe: pure subprocess + module constants, zero Streamlit calls.
+    Never raises — on any failure the original gen_path is returned so the
+    pipeline continues (with a muted video, which the user can re-scrub).
+    """
+    try:
+        if not (source_video_path and os.path.exists(source_video_path)):
+            return gen_path                       # no source → nothing to mux
+        if _has_audio(gen_path):
+            return gen_path                       # already has sound
+        if not _has_audio(source_video_path):
+            return gen_path                       # source itself is mute
+
+        _ff = FFMPEG_BIN or "ffmpeg"
+        out_path = tempfile.NamedTemporaryFile(delete=False, suffix="_audio.mp4").name
+        _base_cmd = [
+            _ff, "-y",
+            "-i", gen_path,               # input 0: AI-edited video (mute)
+            "-i", source_video_path,      # input 1: original reel (has audio)
+            "-map", "0:v:0",              # video ← generated
+            "-map", "1:a:0",              # audio ← original
+            "-c:v", "copy",               # NEVER re-encode the video stream
+            "-shortest",
+        ]
+        # Attempt 1: lossless audio stream copy
+        r = subprocess.run(_base_cmd + ["-c:a", "copy", out_path],
+                           capture_output=True, text=True, timeout=120)
+        if r.returncode != 0 or not (os.path.exists(out_path) and os.path.getsize(out_path) > 1000):
+            # Attempt 2: re-encode audio to AAC (container compatibility)
+            r = subprocess.run(_base_cmd + ["-c:a", "aac", "-b:a", "128k", out_path],
+                               capture_output=True, text=True, timeout=120)
+        if r.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
+            try:
+                os.remove(gen_path)               # replace the mute file
+            except OSError:
+                pass
+            print(f"[audio-mux] ✓ original audio merged → {os.path.basename(out_path)}")
+            return out_path
+        print(f"[audio-mux] ffmpeg failed (exit {r.returncode}) — keeping mute video")
+        if os.path.exists(out_path):
+            try: os.remove(out_path)
+            except OSError: pass
+        return gen_path
+    except Exception as _mx:
+        print(f"[audio-mux] skipped: {_mx}")
+        return gen_path
+
+
 # ──────────────────────────────────────────────────────────
 # PARALLEL POLLING FRAGMENT
 # ──────────────────────────────────────────────────────────
@@ -569,14 +650,19 @@ def _launch_fs_poll(item_id: int, pred_id: str) -> None:
     threading.Thread(target=_w, daemon=True).start()
 
 
-def _launch_gen_poll(item_id: int, pred_id: str) -> None:
-    """Poll video generation + download locally, all in background."""
+def _launch_gen_poll(item_id: int, pred_id: str, src_video=None) -> None:
+    """Poll video generation + download + audio-mux fallback, all in background.
+
+    src_video: path of the ORIGINAL source reel. If the video-edit endpoint
+    returns a mute video, its audio track is muxed back in (see _ensure_audio).
+    """
     _q  = st.session_state["_gen_queue"]     # captured in main thread
     _wk = st.session_state.get("_wk", "")
-    def _w(q=_q, iid=item_id, pid=pred_id, wk=_wk):
+    def _w(q=_q, iid=item_id, pid=pred_id, wk=_wk, src=src_video):
         try:
             r = ws_poll_bg(pid, api_key=wk)
             local = download_video_url(r)     # download in worker → no UI freeze
+            local = _ensure_audio(local, src) # original-audio fallback mux
             q.put({"item_id": iid, "result": r, "local": local, "error": None})
         except Exception as e:
             q.put({"item_id": iid, "result": None, "local": None, "error": str(e)})
@@ -671,7 +757,9 @@ def _bg_poller():
                 _launch_fs_poll(_ap["id"], _ap["faceswap_pred"])
         elif _ap["status"] == "generating" and f"gen_{_ap['id']}" not in _threads:
             if _ap["gen_pred"]:
-                _launch_gen_poll(_ap["id"], _ap["gen_pred"])
+                _full_ap = mm.get_pipeline_item(_ap["id"]) or {}
+                _launch_gen_poll(_ap["id"], _ap["gen_pred"],
+                                 src_video=_full_ap.get("video_path"))
 
     # Unstick items claimed but never submitted (crash between claim & submit)
     for _stuck in mm.get_pipeline_items(status=["swapping", "generating"]):
@@ -1141,6 +1229,10 @@ with _t_gen:
                     _has_vid = bool(_gi.get("video_path") and os.path.exists(_gi.get("video_path") or ""))
                     if _mk == "kling" and not _has_vid:
                         st.warning("Το Kling θέλει το αρχικό video — λείπει. Διάλεξε Seedance/WAN.")
+                    if _mk == "seedance":
+                        st.caption("🎞 Video-Edit mode — πηγή: αρχικό reel + faceswap ως reference"
+                                   if _has_vid else
+                                   "🖼 Image-to-Video fallback — δεν υπάρχει source video")
                     _gb1, _gb2, _gb3 = st.columns([3, 1, 1])
                     with _gb1:
                         if st.button("🎬 Generate", key=f"gen_btn_{_gi['id']}",
@@ -1164,14 +1256,27 @@ with _t_gen:
                                             "alibaba/wan-2.7/image-to-video",
                                             {"image": _gi["faceswap_url"], "prompt": _gp,
                                              "duration": 5, "resolution": "1080p", "seed": -1})
+                                    elif _has_vid:
+                                        # VIDEO-EDIT (v2v): source reel + approved
+                                        # FACESWAP output as the reference image
+                                        with open(_gi["video_path"], "rb") as _gfv:
+                                            _gpid = ws_submit(
+                                                "bytedance/seedance-2.0/video-edit",
+                                                {"image": _gi["faceswap_url"],
+                                                 "video": to_b64(_gfv.read(), mime="video/mp4"),
+                                                 "prompt": _gp,
+                                                 "resolution": "1080p", "seed": -1})
                                     else:
+                                        # no source video (e.g. vault-only photo)
+                                        # → graceful i2v fallback
                                         _gpid = ws_submit(
                                             "bytedance/seedance-2.0/image-to-video",
                                             {"image": _gi["faceswap_url"], "prompt": _gp,
                                              "duration": 5, "resolution": "1080p", "seed": -1})
                                     mm.update_pipeline_item(_gi["id"], gen_pred=_gpid,
                                                             model_key=_mk, prompt=_gp)
-                                    _launch_gen_poll(_gi["id"], _gpid)
+                                    _launch_gen_poll(_gi["id"], _gpid,
+                                                     src_video=_gi.get("video_path"))
                                 except Exception as _ge:
                                     mm.update_pipeline_item(_gi["id"], status="error",
                                                             error_msg=str(_ge))
@@ -1296,6 +1401,15 @@ with _t_audit:
                                             "alibaba/wan-2.7/image-to-video",
                                             {"image": _ai["faceswap_url"], "prompt": _rgp,
                                              "duration": 5, "resolution": "1080p", "seed": -1})
+                                    elif _ai.get("video_path") and os.path.exists(_ai["video_path"]):
+                                        # VIDEO-EDIT (v2v): source reel + faceswap reference
+                                        with open(_ai["video_path"], "rb") as _rfv:
+                                            _rpid = ws_submit(
+                                                "bytedance/seedance-2.0/video-edit",
+                                                {"image": _ai["faceswap_url"],
+                                                 "video": to_b64(_rfv.read(), mime="video/mp4"),
+                                                 "prompt": _rgp,
+                                                 "resolution": "1080p", "seed": -1})
                                     else:
                                         _rpid = ws_submit(
                                             "bytedance/seedance-2.0/image-to-video",
@@ -1307,7 +1421,8 @@ with _t_audit:
                                         except OSError: pass
                                     mm.update_pipeline_item(_ai["id"], gen_pred=_rpid,
                                                             gen_url=None, gen_path=None)
-                                    _launch_gen_poll(_ai["id"], _rpid)
+                                    _launch_gen_poll(_ai["id"], _rpid,
+                                                     src_video=_ai.get("video_path"))
                                 except Exception as _rge:
                                     mm.update_pipeline_item(_ai["id"], status="error",
                                                             error_msg=str(_rge))
