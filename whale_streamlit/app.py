@@ -726,6 +726,50 @@ def _error_stage(item: dict):
     return "faceswap", "downloaded"
 
 
+def _valid_ref_image(url) -> bool:
+    """A usable reference image is a non-empty http(s) URL or data: URI."""
+    u = (url or "").strip()
+    return u.startswith("http") or u.startswith("data:")
+
+
+def _submit_video_edit(video_path: str, ref_img: str, prompt: str) -> str:
+    """Submit to bytedance/seedance-2.0/video-edit with the approved
+    faceswap photo as the reference image.
+
+    PRE-FLIGHT (credit protection): if the reference image is missing or
+    malformed, raise BEFORE any network call — zero credits burned, and the
+    API can never silently return an un-edited video.
+
+    PAYLOAD MAPPING: multi-reference WaveSpeed models expect `images` (list);
+    single-image models expect `image`. We send `images=[ref]` first; if the
+    schema rejects it (HTTP 400), we retry ONCE with `image=ref`. A retry can
+    only happen when the first attempt created nothing, so no double-billing.
+    """
+    if not _valid_ref_image(ref_img):
+        raise RuntimeError(
+            "Error: Missing reference image for video edit — "
+            "το approved faceswap δεν έχει έγκυρο URL. Το αίτημα ΔΕΝ στάλθηκε (0 credits)."
+        )
+    if not (video_path and os.path.exists(video_path)):
+        raise RuntimeError("Το αρχικό source video λείπει — δεν γίνεται video-edit.")
+    with open(video_path, "rb") as _f:
+        _vb64 = to_b64(_f.read(), mime="video/mp4")
+    _payload = {"video": _vb64, "prompt": prompt, "resolution": "1080p", "seed": -1}
+    try:
+        _pid = ws_submit("bytedance/seedance-2.0/video-edit",
+                         {**_payload, "images": [ref_img]})
+        print("[video-edit] submitted with images=[ref]")
+        return _pid
+    except RuntimeError as _e1:
+        if "400" in str(_e1):
+            print(f"[video-edit] 'images' schema rejected → retrying with 'image': {_e1}")
+            _pid = ws_submit("bytedance/seedance-2.0/video-edit",
+                             {**_payload, "image": ref_img})
+            print("[video-edit] submitted with image=ref")
+            return _pid
+        raise
+
+
 # ──────────────────────────────────────────────────────────
 # STATUS METADATA (single source of truth for colors/icons)
 # ──────────────────────────────────────────────────────────
@@ -790,11 +834,18 @@ def _bg_poller():
         _res = _fsq.get_nowait()
         _iid = _res["item_id"]
         st.session_state["_active_threads"].discard(f"fs_{_iid}")
+        _fs_url = (_res.get("result") or "").strip()
         if _res["error"]:
             mm.update_pipeline_item(_iid, status="error", error_msg=_res["error"])
+        elif not _valid_ref_image(_fs_url):
+            # STATE-BRIDGE GUARD: a "completed" swap with an empty/invalid URL
+            # must never become a reviewable photo — downstream it would send
+            # a blank reference to the video API and waste credits
+            mm.update_pipeline_item(_iid, status="error",
+                                    error_msg="Το faceswap ολοκληρώθηκε αλλά δεν επέστρεψε εικόνα (κενό URL) — κάνε Retry.")
         else:
             mm.update_pipeline_item(_iid, status="pending_photo_review",
-                                    faceswap_url=_res["result"], error_msg=None)
+                                    faceswap_url=_fs_url, error_msg=None)
         _changed = True
 
     # ── Drain generation queue → generated_pending_scrub ─────────────
@@ -1227,6 +1278,16 @@ with _t_gen:
                             st.caption("(εικόνα μη διαθέσιμη)")
                     _mk = st.session_state["_gen_model"]
                     _has_vid = bool(_gi.get("video_path") and os.path.exists(_gi.get("video_path") or ""))
+                    # ── PRE-FLIGHT LAYER 1 (render): the reference image is
+                    # the approved faceswap output — if it's missing, the
+                    # button never even becomes clickable
+                    _ref_img = (_gi.get("faceswap_url") or "").strip()
+                    _ref_ok  = _valid_ref_image(_ref_img)
+                    if not _ref_ok:
+                        st.error("❌ Missing reference image — το approved faceswap δεν έχει "
+                                 "έγκυρο URL. Στείλ' το πίσω με ↩ και κάνε 🔄 Recreate.")
+                    else:
+                        st.caption(f"📎 Reference: approved faceswap #{_gi['id']} ✓")
                     if _mk == "kling" and not _has_vid:
                         st.warning("Το Kling θέλει το αρχικό video — λείπει. Διάλεξε Seedance/WAN.")
                     if _mk == "seedance":
@@ -1237,9 +1298,14 @@ with _t_gen:
                     with _gb1:
                         if st.button("🎬 Generate", key=f"gen_btn_{_gi['id']}",
                                       type="primary", use_container_width=True,
-                                      disabled=(_mk == "kling" and not _has_vid)):
+                                      disabled=((_mk == "kling" and not _has_vid) or not _ref_ok)):
                             if not st.session_state.get("_wk"):
                                 st.error("Βάλε Wavespeed key.")
+                            elif not _ref_ok:
+                                # PRE-FLIGHT LAYER 2 (handler): never dispatch
+                                # an empty reference — no claim, no API, 0 credits
+                                st.error("Error: Missing reference image for video edit — "
+                                         "το αίτημα ΔΕΝ στάλθηκε.")
                             elif mm.claim_pipeline_item(_gi["id"], "approved_photo", "generating"):
                                 try:
                                     _gp = st.session_state.get("_custom_prompt", DEFAULT_VIDEO_PROMPT)
@@ -1247,31 +1313,26 @@ with _t_gen:
                                         with open(_gi["video_path"], "rb") as _gfv:
                                             _gpid = ws_submit(
                                                 "kwaivgi/kling-v3.0-pro/motion-control",
-                                                {"image": _gi["faceswap_url"],
+                                                {"image": _ref_img,
                                                  "video": to_b64(_gfv.read(), mime="video/mp4"),
                                                  "prompt": _gp, "duration": 5,
                                                  "aspect_ratio": "9:16", "cfg_scale": 0.5, "seed": -1})
                                     elif _mk == "wan":
                                         _gpid = ws_submit(
                                             "alibaba/wan-2.7/image-to-video",
-                                            {"image": _gi["faceswap_url"], "prompt": _gp,
+                                            {"image": _ref_img, "prompt": _gp,
                                              "duration": 5, "resolution": "1080p", "seed": -1})
                                     elif _has_vid:
-                                        # VIDEO-EDIT (v2v): source reel + approved
-                                        # FACESWAP output as the reference image
-                                        with open(_gi["video_path"], "rb") as _gfv:
-                                            _gpid = ws_submit(
-                                                "bytedance/seedance-2.0/video-edit",
-                                                {"image": _gi["faceswap_url"],
-                                                 "video": to_b64(_gfv.read(), mime="video/mp4"),
-                                                 "prompt": _gp,
-                                                 "resolution": "1080p", "seed": -1})
+                                        # VIDEO-EDIT (v2v) — helper does LAYER-3
+                                        # validation + dual-schema payload mapping
+                                        _gpid = _submit_video_edit(
+                                            _gi["video_path"], _ref_img, _gp)
                                     else:
                                         # no source video (e.g. vault-only photo)
                                         # → graceful i2v fallback
                                         _gpid = ws_submit(
                                             "bytedance/seedance-2.0/image-to-video",
-                                            {"image": _gi["faceswap_url"], "prompt": _gp,
+                                            {"image": _ref_img, "prompt": _gp,
                                              "duration": 5, "resolution": "1080p", "seed": -1})
                                     mm.update_pipeline_item(_gi["id"], gen_pred=_gpid,
                                                             model_key=_mk, prompt=_gp)
@@ -1386,34 +1447,37 @@ with _t_audit:
                                 try:
                                     _rmk = _ai.get("model_key") or st.session_state.get("_gen_model", "seedance")
                                     _rgp = _ai.get("prompt") or st.session_state.get("_custom_prompt", DEFAULT_VIDEO_PROMPT)
+                                    # PRE-FLIGHT: recreate must also carry the
+                                    # approved faceswap reference — block early
+                                    _r_ref = (_ai.get("faceswap_url") or "").strip()
+                                    if not _valid_ref_image(_r_ref):
+                                        raise RuntimeError(
+                                            "Error: Missing reference image for video edit — "
+                                            "το αίτημα ΔΕΝ στάλθηκε (0 credits).")
                                     if _rmk == "kling":
                                         if not (_ai.get("video_path") and os.path.exists(_ai["video_path"])):
                                             raise RuntimeError("Το αρχικό video λείπει — δεν γίνεται Kling recreate.")
                                         with open(_ai["video_path"], "rb") as _rfv:
                                             _rpid = ws_submit(
                                                 "kwaivgi/kling-v3.0-pro/motion-control",
-                                                {"image": _ai["faceswap_url"],
+                                                {"image": _r_ref,
                                                  "video": to_b64(_rfv.read(), mime="video/mp4"),
                                                  "prompt": _rgp, "duration": 5,
                                                  "aspect_ratio": "9:16", "cfg_scale": 0.5, "seed": -1})
                                     elif _rmk == "wan":
                                         _rpid = ws_submit(
                                             "alibaba/wan-2.7/image-to-video",
-                                            {"image": _ai["faceswap_url"], "prompt": _rgp,
+                                            {"image": _r_ref, "prompt": _rgp,
                                              "duration": 5, "resolution": "1080p", "seed": -1})
                                     elif _ai.get("video_path") and os.path.exists(_ai["video_path"]):
-                                        # VIDEO-EDIT (v2v): source reel + faceswap reference
-                                        with open(_ai["video_path"], "rb") as _rfv:
-                                            _rpid = ws_submit(
-                                                "bytedance/seedance-2.0/video-edit",
-                                                {"image": _ai["faceswap_url"],
-                                                 "video": to_b64(_rfv.read(), mime="video/mp4"),
-                                                 "prompt": _rgp,
-                                                 "resolution": "1080p", "seed": -1})
+                                        # VIDEO-EDIT (v2v) — helper validates ref +
+                                        # dual-schema payload mapping
+                                        _rpid = _submit_video_edit(
+                                            _ai["video_path"], _r_ref, _rgp)
                                     else:
                                         _rpid = ws_submit(
                                             "bytedance/seedance-2.0/image-to-video",
-                                            {"image": _ai["faceswap_url"], "prompt": _rgp,
+                                            {"image": _r_ref, "prompt": _rgp,
                                              "duration": 5, "resolution": "1080p", "seed": -1})
                                     # καθάρισε το παλιό local αρχείο (unique per generation)
                                     if _gfp and os.path.exists(_gfp):
