@@ -13,20 +13,33 @@ mm.init_db()
 
 def _find_bin(name):
     import shutil as _sh
-    # 1) already on PATH (packages.txt installed it)
+    # Mirrors processor.py's PROVEN Streamlit Cloud strategy:
+    # 1) imageio_ffmpeg bundled binary (ffmpeg only — most reliable on Cloud;
+    #    it's in requirements.txt, unlike static-ffmpeg which crashes on the
+    #    read-only venv and is NOT installed)
+    if name == "ffmpeg":
+        try:
+            import imageio_ffmpeg
+            p = imageio_ffmpeg.get_ffmpeg_exe()
+            if p and os.path.isfile(str(p)):
+                return str(p)
+        except Exception:
+            pass
+    # 2) PATH (packages.txt installs system ffmpeg+ffprobe)
     p = _sh.which(name)
     if p:
         return p
-    # 2) static-ffmpeg: download + inject bundled binaries into PATH
-    try:
-        import static_ffmpeg
-        static_ffmpeg.add_paths()
-        p = _sh.which(name)
-        if p:
-            return p
-    except Exception:
-        pass
-    # 3) common fixed paths (Streamlit Cloud / Debian)
+    # 3) ffprobe: may sit next to the bundled imageio ffmpeg
+    if name == "ffprobe":
+        try:
+            import imageio_ffmpeg
+            _sib = os.path.join(
+                os.path.dirname(str(imageio_ffmpeg.get_ffmpeg_exe())), "ffprobe")
+            if os.path.isfile(_sib):
+                return _sib
+        except Exception:
+            pass
+    # 4) common fixed paths (Streamlit Cloud / Debian)
     for _p in [f"/usr/bin/{name}", f"/usr/local/bin/{name}", f"/bin/{name}"]:
         if os.path.exists(_p):
             return _p
@@ -587,63 +600,70 @@ def _has_audio(path: str) -> bool:
 
 
 def _ensure_audio(gen_path: str, source_video_path) -> str:
-    """AUDIO PRESERVATION FALLBACK for video-edit outputs.
+    """DETERMINISTIC ORIGINAL-AUDIO MUX for video-edit outputs.
 
-    AI video-edit endpoints often return MUTED videos. If `gen_path` has no
-    audio stream, extract the audio of the ORIGINAL source reel and mux it
-    into the generated video WITHOUT re-encoding the video stream:
+    We submit video-edit with generate_audio=False, so the output is mute BY
+    DESIGN. This function ALWAYS grafts the original reel's audio onto the
+    generated video — it never "detects and maybe skips", because that
+    decision needed ffprobe, and when ffprobe was missing on Streamlit Cloud
+    the check silently answered "source has no audio" and skipped the mux
+    (that was the no-sound bug).
 
-        ffmpeg -i gen -i source -map 0:v:0 -map 1:a:0
+        ffmpeg -i gen -i source -map 0:v:0 -map 1:a:0?
                -c:v copy -c:a copy -shortest out.mp4
 
-    -c:v copy   → the AI-generated frames pass through untouched (lossless, fast)
-    -c:a copy   → original AAC track is byte-copied; if the container refuses,
-                  we retry once with -c:a aac re-encode
-    -shortest   → output ends with the shorter stream, so audio can never
-                  spill past the final video frame
-
-    Sync is inherent: video-edit regenerates the SAME timeline as the source
-    (frame 0 of the edit corresponds to t=0 of the reel), so pairing the
-    source audio from t=0 keeps lips/beats aligned.
+    -map 1:a:0?  → OPTIONAL map: if the source truly has no audio track,
+                   ffmpeg still succeeds (video-only output) instead of erroring
+    -c:v copy    → AI frames pass through untouched (lossless, fast)
+    -c:a copy    → original AAC byte-copied; retry once with -c:a aac if the
+                   container refuses
+    -shortest    → audio can never spill past the final video frame
+    If the API ever ignores generate_audio=False and returns AI audio, the
+    map REPLACES it with the original track — which is exactly the spec.
 
     Thread-safe: pure subprocess + module constants, zero Streamlit calls.
-    Never raises — on any failure the original gen_path is returned so the
-    pipeline continues (with a muted video, which the user can re-scrub).
+    Never raises — on any failure the original gen_path is returned.
     """
     try:
         if not (source_video_path and os.path.exists(source_video_path)):
-            return gen_path                       # no source → nothing to mux
-        if _has_audio(gen_path):
-            return gen_path                       # already has sound
-        if not _has_audio(source_video_path):
-            return gen_path                       # source itself is mute
+            print("[audio-mux] no source video on disk — keeping output as-is")
+            return gen_path
 
-        _ff = FFMPEG_BIN or "ffmpeg"
+        _ff = FFMPEG_BIN
+        if not _ff:
+            try:                                   # last-resort bundled binary
+                import imageio_ffmpeg
+                _ff = imageio_ffmpeg.get_ffmpeg_exe()
+            except Exception:
+                print("[audio-mux] ffmpeg unavailable — keeping mute video")
+                return gen_path
+
         out_path = tempfile.NamedTemporaryFile(delete=False, suffix="_audio.mp4").name
         _base_cmd = [
             _ff, "-y",
-            "-i", gen_path,               # input 0: AI-edited video (mute)
-            "-i", source_video_path,      # input 1: original reel (has audio)
+            "-i", gen_path,               # input 0: AI-edited video
+            "-i", source_video_path,      # input 1: original reel (audio donor)
             "-map", "0:v:0",              # video ← generated
-            "-map", "1:a:0",              # audio ← original
+            "-map", "1:a:0?",             # audio ← original (optional map)
             "-c:v", "copy",               # NEVER re-encode the video stream
             "-shortest",
         ]
         # Attempt 1: lossless audio stream copy
         r = subprocess.run(_base_cmd + ["-c:a", "copy", out_path],
-                           capture_output=True, text=True, timeout=120)
+                           capture_output=True, text=True, timeout=180)
         if r.returncode != 0 or not (os.path.exists(out_path) and os.path.getsize(out_path) > 1000):
             # Attempt 2: re-encode audio to AAC (container compatibility)
             r = subprocess.run(_base_cmd + ["-c:a", "aac", "-b:a", "128k", out_path],
-                               capture_output=True, text=True, timeout=120)
+                               capture_output=True, text=True, timeout=180)
         if r.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
             try:
                 os.remove(gen_path)               # replace the mute file
             except OSError:
                 pass
-            print(f"[audio-mux] ✓ original audio merged → {os.path.basename(out_path)}")
+            _chk = "✓ verified" if _has_audio(out_path) else "(no audio stream in source)"
+            print(f"[audio-mux] original audio merged {_chk} → {os.path.basename(out_path)}")
             return out_path
-        print(f"[audio-mux] ffmpeg failed (exit {r.returncode}) — keeping mute video")
+        print(f"[audio-mux] ffmpeg failed (exit {r.returncode}) — keeping mute video\n{(r.stderr or '')[-400:]}")
         if os.path.exists(out_path):
             try: os.remove(out_path)
             except OSError: pass
@@ -787,9 +807,11 @@ def _submit_video_edit(video_path: str, ref_img: str, prompt: str) -> str:
       reference_images  (optional) up to 9 images guiding character identity
       aspect_ratio      9:16 for reels
       resolution        480p/720p/1080p/4k
-      generate_audio    default TRUE — we force False so the output comes
-                        back mute and _ensure_audio() muxes in the ORIGINAL
-                        reel audio deterministically
+      generate_audio    TRUE — ask WaveSpeed to return the video WITH audio
+                        (safety net: the file is never mute even if our mux
+                        infra fails). _ensure_audio() then REPLACES whatever
+                        audio came back with the ORIGINAL reel track, so the
+                        final sound is always the authentic one.
 
     The old code sent `images` — the endpoint silently IGNORES unknown
     fields (no 400), so the model never received the faceswap reference and
@@ -815,7 +837,7 @@ def _submit_video_edit(video_path: str, ref_img: str, prompt: str) -> str:
             "reference_images": [ref_img],
             "aspect_ratio": "9:16",
             "resolution": "1080p",
-            "generate_audio": False,
+            "generate_audio": True,
         },
     )
     print(f"[video-edit] submitted — reference_images=[faceswap] ✓ (pred {_pid})")
