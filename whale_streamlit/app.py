@@ -9,6 +9,7 @@ import base64
 import threading
 import queue as _stdlib_queue
 import memory_manager as mm
+import drive_exporter as de
 mm.init_db()
 
 def _find_bin(name):
@@ -1607,6 +1608,62 @@ with _t_audit:
                                 mime="video/mp4", key=f"dl_{_ad['id']}",
                                 use_container_width=True, type="primary",
                             )
+
+                        # ── EXPORT TO GOOGLE DRIVE ────────────────────
+                        with st.expander("📤 Export to Drive"):
+                            _exp_devs = de.DEVICE_MAP.get(
+                                (_ad["creator"] or "").upper(), [])
+                            if not _exp_devs:
+                                st.warning(f"Δεν υπάρχουν συσκευές για creator "
+                                           f"{_ad['creator']!r}.")
+                            else:
+                                _exp_date = st.date_input(
+                                    "📅 Date", key=f"exp_date_{_ad['id']}")
+                                _exp_dev = st.selectbox(
+                                    "📱 Device", _exp_devs,
+                                    key=f"exp_dev_{_ad['id']}")
+                                _exp_tod = st.selectbox(
+                                    "🌗 Time of Day", de.TIMES_OF_DAY,
+                                    key=f"exp_tod_{_ad['id']}")
+                                _prev_link = st.session_state.get(
+                                    f"drive_link_{_ad['id']}")
+                                if _prev_link:
+                                    st.success("✅ Ανέβηκε στο Drive")
+                                    st.markdown(f"[🔗 Άνοιγμα στο Drive]({_prev_link})")
+                                if st.button("📤 Upload to Drive",
+                                              key=f"exp_btn_{_ad['id']}",
+                                              type="primary",
+                                              use_container_width=True):
+                                    _oauth_ok = "gcp_oauth" in st.secrets
+                                    if not _oauth_ok:
+                                        st.error("Λείπει το [gcp_oauth] από τα Streamlit "
+                                                 "secrets (client_id / client_secret / "
+                                                 "refresh_token) — δες οδηγίες στο "
+                                                 "drive_exporter.py")
+                                    else:
+                                        _exp_bar = st.progress(0, text="📤 Uploading…")
+                                        try:
+                                            _exp_res = de.upload_video(
+                                                file_path=_sfp,
+                                                creator=_ad["creator"],
+                                                device=_exp_dev,
+                                                date_str=_exp_date.strftime("%Y-%m-%d"),
+                                                time_of_day=_exp_tod,
+                                                oauth_info=dict(st.secrets["gcp_oauth"]),
+                                                progress_cb=lambda p: _exp_bar.progress(
+                                                    p, text=f"📤 Uploading… {int(p*100)}%"),
+                                            )
+                                            _exp_bar.empty()
+                                            st.session_state[f"drive_link_{_ad['id']}"] = (
+                                                _exp_res["webViewLink"])
+                                            st.success(f"✅ {_exp_res['folder_path']}")
+                                            st.rerun()
+                                        except de.DriveExportError as _dee:
+                                            _exp_bar.empty()
+                                            st.error(str(_dee))
+                                        except Exception as _dex:
+                                            _exp_bar.empty()
+                                            st.error(f"Drive upload απέτυχε: {_dex}")
                     else:
                         st.caption("(αρχείο δεν βρέθηκε στο δίσκο)")
                     _dc1b, _dc2b = st.columns(2)
