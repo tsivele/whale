@@ -1628,18 +1628,15 @@ with _t_audit:
                                 _prev_link = st.session_state.get(
                                     f"drive_link_{_ad['id']}")
                                 if _prev_link:
-                                    st.success("✅ Ανέβηκε στο Drive")
-                                    st.markdown(f"[🔗 Άνοιγμα στο Drive]({_prev_link})")
+                                    st.success(f"✅ Ανέβηκε στο Drive: {_prev_link}")
                                 if st.button("📤 Upload to Drive",
                                               key=f"exp_btn_{_ad['id']}",
                                               type="primary",
                                               use_container_width=True):
-                                    _oauth_ok = "gcp_oauth" in st.secrets
-                                    if not _oauth_ok:
-                                        st.error("Λείπει το [gcp_oauth] από τα Streamlit "
-                                                 "secrets (client_id / client_secret / "
-                                                 "refresh_token) — δες οδηγίες στο "
-                                                 "drive_exporter.py")
+                                    _conf_ok = "rclone_conf" in st.secrets
+                                    if not _conf_ok:
+                                        st.error("Λείπει το rclone_conf από τα Streamlit "
+                                                 "secrets — δες οδηγίες στο drive_exporter.py")
                                     else:
                                         _exp_bar = st.progress(0, text="📤 Uploading…")
                                         try:
@@ -1649,14 +1646,14 @@ with _t_audit:
                                                 device=_exp_dev,
                                                 date_str=_exp_date.strftime("%Y-%m-%d"),
                                                 time_of_day=_exp_tod,
-                                                oauth_info=dict(st.secrets["gcp_oauth"]),
+                                                rclone_conf=str(st.secrets["rclone_conf"]),
                                                 progress_cb=lambda p: _exp_bar.progress(
                                                     p, text=f"📤 Uploading… {int(p*100)}%"),
                                             )
                                             _exp_bar.empty()
                                             st.session_state[f"drive_link_{_ad['id']}"] = (
-                                                _exp_res["webViewLink"])
-                                            st.success(f"✅ {_exp_res['folder_path']}")
+                                                _exp_res["folder_path"])
+                                            st.success(f"✅ Ανέβηκε: {_exp_res['folder_path']}")
                                             st.rerun()
                                         except de.DriveExportError as _dee:
                                             _exp_bar.empty()
