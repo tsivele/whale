@@ -90,6 +90,11 @@ def init_db():
             # WAL: readers never block the writer (poller thread vs UI thread)
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
+            # Migration: add gen_cost (real WaveSpeed price) to older DBs
+            _cols = {r[1] for r in conn.execute(
+                "PRAGMA table_info(pipeline_items)").fetchall()}
+            if "gen_cost" not in _cols:
+                conn.execute("ALTER TABLE pipeline_items ADD COLUMN gen_cost REAL")
             conn.commit()
     finally:
         conn.close()

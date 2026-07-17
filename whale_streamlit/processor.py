@@ -220,7 +220,12 @@ class VideoProcessor:
             r1 = subprocess.run(
                 [
                     ffmpeg, "-y", "-i", src,
-                    "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    # -preset ultrafast: same libx264 re-encode (anti-detection
+                    # preserved) but ~5-10x faster, so on Streamlit Cloud's shared
+                    # 1-vCPU the CPU-pegged window per video is short — prevents the
+                    # container health-check timeout that restarts ("crashes") the app
+                    # during a multi-video Scrub All.
+                    "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
                     "-c:a", "aac",
                     tmp_enc,
                 ],
