@@ -10,6 +10,7 @@ import threading
 import queue as _stdlib_queue
 import memory_manager as mm
 import drive_exporter as de
+import cost_engine as ce
 mm.init_db()
 
 def _find_bin(name):
@@ -156,7 +157,6 @@ DEFAULT_VIDEO_PROMPT = (
 MODELS = {
     "Kling v3 Pro (motion control)": "kling",
     "Seedance 2.0 Video-Edit (v2v)": "seedance",
-    "WAN 2.7 (υψηλή ποιότητα)": "wan",
 }
 
 _ss_defaults = {
@@ -381,7 +381,8 @@ def ws_poll_bg(pred_id: str, api_key: str = "", max_wait: int = 1800) -> str:
         status = d.get("status", "running")
         if status in ("completed", "succeeded", "success"):
             outputs = d.get("outputs", [])
-            return outputs[0] if outputs else d.get("output", "")
+            _url = outputs[0] if outputs else d.get("output", "")
+            return _url, _extract_ws_cost(d)
         if status == "failed":
             raise RuntimeError(d.get("error", "Wavespeed generation failed"))
     raise TimeoutError(
@@ -390,11 +391,35 @@ def ws_poll_bg(pred_id: str, api_key: str = "", max_wait: int = 1800) -> str:
     )
 
 
+def _extract_ws_cost(d: dict):
+    """Best-effort: pull the REAL charged price out of a WaveSpeed result.
+
+    WaveSpeed billing appears under different keys across models, so we scan
+    the common shapes and return a float USD, or None if not reported (caller
+    then falls back to the flat per-model estimate)."""
+    if not isinstance(d, dict):
+        return None
+    # direct numeric fields
+    for k in ("cost", "price", "credits", "amount", "billing_amount"):
+        v = d.get(k)
+        if isinstance(v, (int, float)) and v > 0:
+            return float(v)
+    # nested billing/meta objects
+    for outer in ("billing", "meta", "usage", "urls"):
+        o = d.get(outer)
+        if isinstance(o, dict):
+            for k in ("cost", "price", "credits", "amount", "total"):
+                v = o.get(k)
+                if isinstance(v, (int, float)) and v > 0:
+                    return float(v)
+    return None
+
+
 def _launch_parallel_polls(jobs: list, result_q: _stdlib_queue.Queue) -> None:
     """Spawn one daemon thread per job; each puts its result into result_q."""
     def _worker(job):
         try:
-            result = ws_poll_bg(job["pred_id"])
+            result, _ = ws_poll_bg(job["pred_id"])
             result_q.put({"idx": job["idx"], "result": result, "error": None})
         except Exception as exc:
             result_q.put({"idx": job["idx"], "result": None, "error": str(exc)})
@@ -698,7 +723,7 @@ def _launch_fs_poll(item_id: int, pred_id: str) -> None:
     def _w(q=_q, iid=item_id, pid=pred_id, wk=_wk):
         try:
             # photos are quick — 15 min budget is already generous
-            r = ws_poll_bg(pid, api_key=wk, max_wait=900)
+            r, _ = ws_poll_bg(pid, api_key=wk, max_wait=900)
             q.put({"item_id": iid, "result": r, "error": None})
         except TimeoutError as e:
             q.put({"item_id": iid, "result": None,
@@ -720,10 +745,11 @@ def _launch_gen_poll(item_id: int, pred_id: str, src_video=None) -> None:
     def _w(q=_q, iid=item_id, pid=pred_id, wk=_wk, src=src_video):
         try:
             # video-to-video is compute-heavy: 30-minute polling budget
-            r = ws_poll_bg(pid, api_key=wk, max_wait=1800)
+            r, _cost = ws_poll_bg(pid, api_key=wk, max_wait=1800)
             local = download_video_url(r)     # download in worker → no UI freeze
             local = _ensure_audio(local, src) # original-audio fallback mux
-            q.put({"item_id": iid, "result": r, "local": local, "error": None})
+            q.put({"item_id": iid, "result": r, "local": local,
+                   "cost": _cost, "error": None})
         except TimeoutError as e:
             # graceful: lands on the card as an error with Retry/Recreate —
             # never crashes the batch or the UI
@@ -750,7 +776,12 @@ def _launch_batch_scrub(batch: list) -> None:
     def _w(q=_q, items=tuple(batch)):
         from processor import VideoProcessor
         from safety_filter import verify_batch
-        for iid, src in items:
+        for _n, (iid, src) in enumerate(items):
+            # Yield the CPU to the main Streamlit thread BETWEEN videos so the
+            # container health-check keeps getting answered → app doesn't restart
+            # ("crash") mid-batch. First item runs immediately.
+            if _n:
+                time.sleep(3)
             try:
                 results = VideoProcessor.process(src)
                 out = results[0] if isinstance(results, list) else results
@@ -837,7 +868,7 @@ def _submit_video_edit(video_path: str, ref_img: str, prompt: str) -> str:
             "prompt": prompt,
             "reference_images": [ref_img],
             "aspect_ratio": "9:16",
-            "resolution": "1080p",
+            "resolution": "720p",
             "generate_audio": True,
         },
     )
@@ -932,9 +963,13 @@ def _bg_poller():
         if _res["error"]:
             mm.update_pipeline_item(_iid, status="error", error_msg=_res["error"])
         else:
-            mm.update_pipeline_item(_iid, status="generated_pending_scrub",
-                                    gen_url=_res["result"], gen_path=_res["local"],
-                                    error_msg=None)
+            _real_cost = _res.get("cost")
+            _upd = dict(status="generated_pending_scrub",
+                        gen_url=_res["result"], gen_path=_res["local"],
+                        error_msg=None)
+            if _real_cost is not None:          # WaveSpeed reported the true price
+                _upd["gen_cost"] = round(float(_real_cost), 4)
+            mm.update_pipeline_item(_iid, **_upd)
         _changed = True
 
     # ── Drain audit queue → scrubbed ─────────────────────────────────
@@ -986,6 +1021,10 @@ _k_active  = sum(1 for x in _all_kpi if x["status"] in ("swapping", "generating"
 _k_inscrub = sum(1 for x in _all_kpi if x["status"] == "scrubbing")
 _k_done    = sum(1 for x in _all_kpi if x["status"] == "scrubbed")
 
+# ── COST ENGINE: Session Spend computed live from the DB — real WaveSpeed
+#    price where captured, per-model estimate otherwise ──
+_k_spend = ce.session_spend(_all_kpi)
+
 def _kpi_card(icon, value, label, color, sub):
     return (
         f"<div style='text-align:center;padding:4px 0 2px'>"
@@ -996,7 +1035,7 @@ def _kpi_card(icon, value, label, color, sub):
         f"</div>"
     )
 
-_kc1, _kc2, _kc3, _kc4 = st.columns(4, gap="small")
+_kc1, _kc2, _kc3, _kc4, _kc5 = st.columns(5, gap="small")
 with _kc1:
     with st.container(border=True):
         st.markdown(_kpi_card("📸", _k_photos, "Pending Photos", "#c084fc",
@@ -1013,6 +1052,10 @@ with _kc4:
     with st.container(border=True):
         st.markdown(_kpi_card("🧹", _k_inscrub, "In Scrub Queue", "#22d3ee",
                               f"{_k_done} καθαρά συνολικά"), unsafe_allow_html=True)
+with _kc5:
+    with st.container(border=True):
+        st.markdown(_kpi_card("💸", ce.fmt(_k_spend), "Session Spend", "#fbbf24",
+                              "εκτίμηση credits"), unsafe_allow_html=True)
 
 st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 
@@ -1034,6 +1077,27 @@ def _card_header(item, color):
         f"<div style='font-size:11px;font-weight:600;color:{color};margin-bottom:4px'>"
         f"{item['creator']} <span style='color:#554d78'>· #{item['id']} · "
         f"{item['ig_url'][-28:]}</span></div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _cost_badge(item):
+    """Per-video cost badge — the REAL WaveSpeed price once the job finishes,
+    or the per-model estimate (prefixed ~) while it's still running."""
+    _mk = item.get("model_key")
+    if not (_mk and (item.get("gen_pred") or item.get("gen_path") or item.get("gen_url"))):
+        return
+    _lbl = ce.MODEL_LABEL.get(_mk, _mk).split(" (")[0]
+    _, _c = ce.advice(_mk)
+    _real = ce.is_real(item)
+    _amt = ce.cost_of_item(item)
+    _prefix = "" if _real else "~"          # ~ = estimate, plain = real charge
+    _tag = "" if _real else " (εκτ.)"
+    st.markdown(
+        f"<div style='display:inline-block;background:{_c}18;border:1px solid {_c}55;"
+        f"border-radius:6px;padding:1px 8px;margin-bottom:4px'>"
+        f"<span style='color:{_c};font-size:11px;font-weight:700'>💸 {_prefix}{ce.fmt(_amt)}</span>"
+        f"<span style='color:#8b81b8;font-size:10px'> · {_lbl}{_tag}</span></div>",
         unsafe_allow_html=True,
     )
 
@@ -1326,6 +1390,18 @@ with _t_gen:
                 key="gen_model_select",
             )
             st.session_state["_gen_model"] = MODELS[_sel_model]
+            # COST vs QUALITY advisor — updates live with the selection
+            _mk_sel = MODELS[_sel_model]
+            _adv_txt, _adv_col = ce.advice(_mk_sel)
+            st.markdown(
+                f"<div style='background:{_adv_col}18;border:1px solid {_adv_col}55;"
+                f"border-radius:8px;padding:6px 10px;margin-top:4px'>"
+                f"<span style='color:{_adv_col};font-weight:700;font-size:12px'>"
+                f"{_adv_txt}</span><br>"
+                f"<span style='color:#8b81b8;font-size:11px'>Εκτ. κόστος/βίντεο: "
+                f"<b style='color:{_adv_col}'>{ce.fmt(ce.cost_of(_mk_sel))}</b></span></div>",
+                unsafe_allow_html=True,
+            )
         with _gm2:
             st.session_state["_custom_prompt"] = st.text_area(
                 "Video prompt",
@@ -1366,7 +1442,7 @@ with _t_gen:
                     else:
                         st.caption(f"📎 Reference: approved faceswap #{_gi['id']} ✓")
                     if _mk == "kling" and not _has_vid:
-                        st.warning("Το Kling θέλει το αρχικό video — λείπει. Διάλεξε Seedance/WAN.")
+                        st.warning("Το Kling θέλει το αρχικό video — λείπει. Διάλεξε Seedance.")
                     if _mk == "seedance":
                         st.caption("🎞 Video-Edit mode — πηγή: αρχικό reel + faceswap ως reference"
                                    if _has_vid else
@@ -1394,11 +1470,6 @@ with _t_gen:
                                                  "video": to_b64(_gfv.read(), mime="video/mp4"),
                                                  "prompt": _gp, "duration": 5,
                                                  "aspect_ratio": "9:16", "cfg_scale": 0.5, "seed": -1})
-                                    elif _mk == "wan":
-                                        _gpid = ws_submit(
-                                            "alibaba/wan-2.7/image-to-video",
-                                            {"image": _ref_img, "prompt": _gp,
-                                             "duration": 5, "resolution": "1080p", "seed": -1})
                                     elif _has_vid:
                                         # VIDEO-EDIT (v2v) — helper does LAYER-3
                                         # validation + dual-schema payload mapping
@@ -1410,9 +1481,10 @@ with _t_gen:
                                         _gpid = ws_submit(
                                             "bytedance/seedance-2.0/image-to-video",
                                             {"image": _ref_img, "prompt": _gp,
-                                             "duration": 5, "resolution": "1080p", "seed": -1})
+                                             "duration": 5, "resolution": "720p", "seed": -1})
                                     mm.update_pipeline_item(_gi["id"], gen_pred=_gpid,
-                                                            model_key=_mk, prompt=_gp)
+                                                            model_key=_mk, prompt=_gp,
+                                                            gen_cost=None)
                                     _launch_gen_poll(_gi["id"], _gpid,
                                                      src_video=_gi.get("video_path"))
                                 except Exception as _ge:
@@ -1495,6 +1567,7 @@ with _t_audit:
             with _ap_cols[_api % _ap_w]:
                 with st.container(border=True):
                     _card_header(_ai, "#34d399")
+                    _cost_badge(_ai)
                     _gfp = _ai.get("gen_path")
                     if _gfp and os.path.exists(_gfp):
                         # RAM saver: st.video loads the whole MP4 into server
@@ -1541,11 +1614,6 @@ with _t_audit:
                                                  "video": to_b64(_rfv.read(), mime="video/mp4"),
                                                  "prompt": _rgp, "duration": 5,
                                                  "aspect_ratio": "9:16", "cfg_scale": 0.5, "seed": -1})
-                                    elif _rmk == "wan":
-                                        _rpid = ws_submit(
-                                            "alibaba/wan-2.7/image-to-video",
-                                            {"image": _r_ref, "prompt": _rgp,
-                                             "duration": 5, "resolution": "1080p", "seed": -1})
                                     elif _ai.get("video_path") and os.path.exists(_ai["video_path"]):
                                         # VIDEO-EDIT (v2v) — helper validates ref +
                                         # dual-schema payload mapping
@@ -1555,13 +1623,14 @@ with _t_audit:
                                         _rpid = ws_submit(
                                             "bytedance/seedance-2.0/image-to-video",
                                             {"image": _r_ref, "prompt": _rgp,
-                                             "duration": 5, "resolution": "1080p", "seed": -1})
+                                             "duration": 5, "resolution": "720p", "seed": -1})
                                     # καθάρισε το παλιό local αρχείο (unique per generation)
                                     if _gfp and os.path.exists(_gfp):
                                         try: os.remove(_gfp)
                                         except OSError: pass
                                     mm.update_pipeline_item(_ai["id"], gen_pred=_rpid,
-                                                            gen_url=None, gen_path=None)
+                                                            gen_url=None, gen_path=None,
+                                                            gen_cost=None)
                                     _launch_gen_poll(_ai["id"], _rpid,
                                                      src_video=_ai.get("video_path"))
                                 except Exception as _rge:
@@ -1593,6 +1662,7 @@ with _t_audit:
             with _ad_cols[_adi % _ad_w]:
                 with st.container(border=True):
                     _card_header(_ad, "#4ade80")
+                    _cost_badge(_ad)
                     _sfp = _ad.get("scrubbed_path")
                     if _sfp and os.path.exists(_sfp):
                         # RAM saver: preview on demand only
