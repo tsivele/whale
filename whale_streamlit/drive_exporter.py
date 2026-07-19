@@ -103,14 +103,55 @@ def validate_metadata(creator: str, device: str, date_str: str, time_of_day: str
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _rclone_bin() -> str:
+    """Locate rclone. Order: PATH → known paths → cached self-download.
+    The self-download makes Drive export work on Streamlit Cloud even when
+    packages.txt wasn't (re)deployed — it fetches the static binary once and
+    caches it, so the '`rclone` not found' error can no longer block uploads."""
     p = shutil.which("rclone")
     if p:
         return p
     for cand in ("/usr/bin/rclone", "/usr/local/bin/rclone", "/opt/homebrew/bin/rclone"):
         if os.path.exists(cand):
             return cand
-    raise DriveExportError(
-        "Το rclone δεν βρέθηκε — πρόσθεσε `rclone` στο packages.txt (Streamlit Cloud).")
+    _cache = os.path.join(tempfile.gettempdir(), "whale_rclone")
+    _cached = os.path.join(_cache, "rclone")
+    if os.path.exists(_cached) and os.access(_cached, os.X_OK):
+        return _cached
+    return _download_rclone(_cache)
+
+
+def _download_rclone(cache_dir: str) -> str:
+    """Fetch the official static rclone binary for this OS/arch, cache it."""
+    import urllib.request, zipfile, platform, stat
+    os.makedirs(cache_dir, exist_ok=True)
+    _sys = platform.system().lower()          # linux / darwin
+    _mach = platform.machine().lower()
+    _os = "osx" if _sys == "darwin" else "linux"
+    _arch = "arm64" if _mach in ("aarch64", "arm64") else "amd64"
+    url = f"https://downloads.rclone.org/rclone-current-{_os}-{_arch}.zip"
+    zip_path = os.path.join(cache_dir, "rclone.zip")
+    out = os.path.join(cache_dir, "rclone")
+    try:
+        urllib.request.urlretrieve(url, zip_path)
+        with zipfile.ZipFile(zip_path) as z:
+            _member = next((n for n in z.namelist() if n.endswith("/rclone") or n == "rclone"), None)
+            if not _member:
+                raise DriveExportError("Το κατεβασμένο rclone zip δεν περιέχει binary.")
+            with z.open(_member) as src, open(out, "wb") as dst:
+                dst.write(src.read())
+        os.chmod(out, os.stat(out).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        return out
+    except DriveExportError:
+        raise
+    except Exception as e:
+        raise DriveExportError(
+            f"Το rclone δεν βρέθηκε και το auto-download απέτυχε ({e}). "
+            f"Πρόσθεσε `rclone` στο packages.txt και κάνε reboot το app.")
+    finally:
+        try:
+            os.remove(zip_path)
+        except OSError:
+            pass
 
 
 def _write_conf(rclone_conf_text: str) -> str:

@@ -160,7 +160,7 @@ MODELS = {
 }
 
 _ss_defaults = {
-    "creator_mode":  "SOFIA",
+    "creator_mode":  "MELINA",
     "creator2_bytes": None,
     "_gen_model":    "seedance",
     "_custom_prompt": DEFAULT_VIDEO_PROMPT,
@@ -256,22 +256,13 @@ with st.sidebar:
                         else:                       st.warning(f"HTTP {_r.status_code}")
                     except Exception as _e: st.error(str(_e))
 
-    st.markdown("<div style='font-size:11px;color:#6b5fa5;font-weight:600;margin:12px 0 6px;text-transform:uppercase;letter-spacing:.1em'>Creators</div>", unsafe_allow_html=True)
-    _cr1, _cr2 = st.columns(2)
-    with _cr1:
-        _sf = st.file_uploader("SOFIA", type=["jpg","jpeg","png"], key="creator_upload", label_visibility="collapsed")
-        if _sf:
-            st.session_state["creator_bytes"] = _sf.read()
-        if st.session_state.get("creator_bytes"):
-            st.image(st.session_state["creator_bytes"], use_container_width=True)
-            st.caption("SOFIA")
-    with _cr2:
-        _mf = st.file_uploader("MELINA", type=["jpg","jpeg","png"], key="creator2_upload", label_visibility="collapsed")
-        if _mf:
-            st.session_state["creator2_bytes"] = _mf.read()
-        if st.session_state.get("creator2_bytes"):
-            st.image(st.session_state["creator2_bytes"], use_container_width=True)
-            st.caption("MELINA")
+    st.markdown("<div style='font-size:11px;color:#6b5fa5;font-weight:600;margin:12px 0 6px;text-transform:uppercase;letter-spacing:.1em'>Creator</div>", unsafe_allow_html=True)
+    _mf = st.file_uploader("MELINA", type=["jpg","jpeg","png"], key="creator2_upload", label_visibility="collapsed")
+    if _mf:
+        st.session_state["creator2_bytes"] = _mf.read()
+    if st.session_state.get("creator2_bytes"):
+        st.image(st.session_state["creator2_bytes"], width=110)
+        st.caption("MELINA")
 
     st.markdown("<hr style='border-color:rgba(109,40,217,.18);margin:14px 0'>", unsafe_allow_html=True)
     if st.button("🔄 Restart", use_container_width=True, key="restart_btn"):
@@ -1166,13 +1157,14 @@ with _t_disc:
         _disc_urls = _pu(_raw_urls or "")
         _n_disc    = len(_disc_urls)
 
+        _disc_creator = "MELINA"          # Melina is the only creator
         _dc1, _dc2 = st.columns([3, 1])
         with _dc1:
-            _disc_creator = st.radio("Creator", ["SOFIA", "MELINA", "SOFIA + MELINA"],
-                                      horizontal=True, key="disc_creator_select")
+            st.markdown("<div style='color:#c4b5fd;font-size:12px;padding-top:4px'>"
+                        "👤 Creator: <b>MELINA</b></div>", unsafe_allow_html=True)
         with _dc2:
             if _n_disc:
-                st.markdown(f"<div style='text-align:right;color:#4ade80;font-size:12px;padding-top:28px'>✓ {_n_disc} URL(s)</div>", unsafe_allow_html=True)
+                st.markdown(f"<div style='text-align:right;color:#4ade80;font-size:12px;padding-top:2px'>✓ {_n_disc} URL(s)</div>", unsafe_allow_html=True)
 
         _disc_btn_lbl = f"📥 Add {_n_disc} URL(s) to Queue" if _n_disc else "📥 Add to Queue"
         if st.button(_disc_btn_lbl, type="primary", disabled=(_n_disc == 0),
@@ -1182,8 +1174,7 @@ with _t_disc:
             else:
                 _prog_d = st.progress(0, text="⏳ Κατεβάζω…")
                 _errs_d = []
-                _creators = (["SOFIA", "MELINA"] if _disc_creator == "SOFIA + MELINA"
-                             else [_disc_creator])
+                _creators = ["MELINA"]
                 for _di, _durl in enumerate(_disc_urls):
                     _prog_d.progress(_di / _n_disc, text=f"[{_di+1}/{_n_disc}] {_durl[-50:]}")
                     try:
