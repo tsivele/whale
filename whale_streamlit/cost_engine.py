@@ -1,19 +1,85 @@
 """
 cost_engine.py — T-WHALES API Cost Engine
 
-Central source of truth for per-generation video costs, so the UI can show
-what each video costs, advise Quality-vs-Price, and total the session spend.
+Real WaveSpeed pricing (confirmed 2026-07-16 from the model pages). Cost is
+NOT flat — it scales with the video DURATION, which is why a long clip can
+cost many dollars. We compute the exact per-video price from the duration so
+the UI shows the true number, not a misleading flat estimate.
 
-⚠️ PLACEHOLDER PRICES — update MODEL_COST with your real WaveSpeed per-call
-   prices whenever you have them. Everything else derives from this dict.
+SEEDANCE 2.0 video-edit — billed per second on (input + output) duration,
+  input clamped to 2–15 s, output = input for video-edit → billed = 2×dur:
+      720p  $0.15/s → cost = 0.15 × 2 × dur   (5 s → $1.50, 15 s → $4.50)
+      1080p $0.375/s, 480p $0.075/s, 4k $0.75/s
+KLING v3 motion-control — tiered by OUTPUT seconds ($0.168/s, min 3 s, 5-s
+  blocks): 5 s → $0.84, 10 s → $1.68, 20 s → $3.36.
 """
 
-# Cost in USD per successful video generation call.
-# Real WaveSpeed prices (confirmed 2026-07-16 from the model pages).
+import math
+
+# Per-second rate by resolution for Seedance video-edit.
+SEEDANCE_RATE = {"480p": 0.075, "720p": 0.15, "1080p": 0.375, "4k": 0.750}
+SEEDANCE_RES  = "720p"           # the app locks Seedance to 720p
+_DUR_MIN, _DUR_MAX = 2.0, 15.0   # WaveSpeed clamps input duration to this range
+KLING_OUT_SECONDS = 5            # the app requests 5-s Kling outputs
+
+# Rough per-video reference (used only when duration is unknown).
 MODEL_COST = {
-    "kling":    0.84,    # kwaivgi/kling-v3.0-pro/motion-control
-    "seedance": 0.675,   # bytedance/seedance-2.0/video-edit (discounted from 0.75)
+    "kling":    0.84,    # 5-s Kling output
+    "seedance": 1.50,    # ~5-s 720p video-edit
 }
+
+
+def _clamp(d) -> float:
+    try:
+        d = float(d)
+    except (TypeError, ValueError):
+        d = 5.0
+    return max(_DUR_MIN, min(_DUR_MAX, d))
+
+
+def seedance_cost(duration_sec, resolution=SEEDANCE_RES) -> float:
+    """Exact Seedance video-edit price: rate × (input+output) = rate × 2 × dur."""
+    d = _clamp(duration_sec)
+    return round(SEEDANCE_RATE.get(resolution, 0.15) * 2 * d, 2)
+
+
+KLING_MAX = 30.0   # Kling output length is capped at 30 s (video orientation)
+
+
+def _clamp_kling(d) -> float:
+    try:
+        d = float(d)
+    except (TypeError, ValueError):
+        d = 5.0
+    return max(3.0, min(KLING_MAX, d))
+
+
+def kling_cost(duration_sec=5) -> float:
+    """Kling motion-control price — scales with OUTPUT length. Kling has NO
+    duration input; the output ≈ the driving reel length (up to 30 s), so we
+    estimate from the source duration. $0.168/s, min 3 s, billed in 5-s blocks
+    (an upper bound — Kling may return a slightly shorter clip)."""
+    d = _clamp_kling(duration_sec)
+    if d <= 3:
+        return 0.504
+    return round(0.168 * (math.ceil(d / 5) * 5), 2)
+
+
+def estimate_cost(model_key, duration_sec=None) -> float:
+    """Accurate per-video cost for a model given the source video duration.
+    BOTH models scale with duration (Seedance on 2×dur, Kling on output length)."""
+    if model_key == "kling":
+        return kling_cost(duration_sec)
+    return seedance_cost(duration_sec)
+
+
+def breakdown(model_key, duration_sec=None) -> str:
+    """Short 'analytical' breakdown shown on the card so you see WHY it costs that."""
+    if model_key == "kling":
+        d = _clamp_kling(duration_sec)
+        return f"~{d:.0f}s output (Kling, max 30s)"
+    d = _clamp(duration_sec)
+    return f"{d:.0f}s ×2 (in+out) @ {SEEDANCE_RES}"
 
 # Human labels (used in the model selector).
 MODEL_LABEL = {

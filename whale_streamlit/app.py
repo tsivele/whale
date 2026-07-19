@@ -558,6 +558,18 @@ def get_duration(path):
             return 10.0
 
 
+@st.cache_data(show_spinner=False)
+def _cached_duration(path):
+    """ffprobe once per path — the Cost Engine calls this on every 2 s rerun to
+    show the pre-generation price, so it must not re-probe each time."""
+    try:
+        if path and os.path.exists(path):
+            return get_duration(path)
+    except Exception:
+        pass
+    return 5.0
+
+
 def extract_frame(video_path, timestamp):
     out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg").name
 
@@ -1390,16 +1402,23 @@ with _t_gen:
                 key="gen_model_select",
             )
             st.session_state["_gen_model"] = MODELS[_sel_model]
-            # COST vs QUALITY advisor — updates live with the selection
+            # COST vs QUALITY advisor — updates live with the selection.
+            # Seedance cost scales with video length → show the range.
             _mk_sel = MODELS[_sel_model]
             _adv_txt, _adv_col = ce.advice(_mk_sel)
+            if _mk_sel == "kling":
+                _price_txt = (f"{ce.fmt(ce.kling_cost(3))}–{ce.fmt(ce.kling_cost(30))} "
+                              f"ανάλογα με τη διάρκεια (max 30s)")
+            else:
+                _price_txt = (f"{ce.fmt(ce.seedance_cost(2))}–{ce.fmt(ce.seedance_cost(15))} "
+                              f"ανάλογα με τη διάρκεια (720p)")
             st.markdown(
                 f"<div style='background:{_adv_col}18;border:1px solid {_adv_col}55;"
                 f"border-radius:8px;padding:6px 10px;margin-top:4px'>"
                 f"<span style='color:{_adv_col};font-weight:700;font-size:12px'>"
                 f"{_adv_txt}</span><br>"
-                f"<span style='color:#8b81b8;font-size:11px'>Εκτ. κόστος/βίντεο: "
-                f"<b style='color:{_adv_col}'>{ce.fmt(ce.cost_of(_mk_sel))}</b></span></div>",
+                f"<span style='color:#8b81b8;font-size:11px'>Κόστος/βίντεο: "
+                f"<b style='color:{_adv_col}'>{_price_txt}</b></span></div>",
                 unsafe_allow_html=True,
             )
         with _gm2:
@@ -1447,6 +1466,26 @@ with _t_gen:
                         st.caption("🎞 Video-Edit mode — πηγή: αρχικό reel + faceswap ως reference"
                                    if _has_vid else
                                    "🖼 Image-to-Video fallback — δεν υπάρχει source video")
+                    # COST ENGINE: show what THIS video will cost BEFORE generating.
+                    # BOTH models scale with the reel duration.
+                    if _mk == "kling":
+                        _pre_dur = _cached_duration(_gi["video_path"]) if _has_vid else 5
+                        _pre_cost = ce.kling_cost(_pre_dur)
+                    elif _has_vid:
+                        _pre_dur = _cached_duration(_gi["video_path"])
+                        _pre_cost = ce.seedance_cost(_pre_dur)
+                    else:
+                        _pre_dur, _pre_cost = 5, ce.seedance_cost(5)
+                    _, _pc_col = ce.advice(_mk)
+                    st.markdown(
+                        f"<div style='background:{_pc_col}18;border:1px solid {_pc_col}55;"
+                        f"border-radius:8px;padding:5px 10px;margin:2px 0 6px'>"
+                        f"<span style='color:{_pc_col};font-weight:700;font-size:13px'>"
+                        f"💸 Θα κοστίσει ~{ce.fmt(_pre_cost)}</span>"
+                        f"<span style='color:#8b81b8;font-size:10px'> · "
+                        f"{ce.breakdown(_mk, _pre_dur)}</span></div>",
+                        unsafe_allow_html=True,
+                    )
                     _gb1, _gb2, _gb3 = st.columns([3, 1, 1])
                     with _gb1:
                         if st.button("🎬 Generate", key=f"gen_btn_{_gi['id']}",
@@ -1482,9 +1521,18 @@ with _t_gen:
                                             "bytedance/seedance-2.0/image-to-video",
                                             {"image": _ref_img, "prompt": _gp,
                                              "duration": 5, "resolution": "720p", "seed": -1})
+                                    # COST ENGINE: exact price from duration (WaveSpeed
+                                    # bills per second) — computed NOW so the card shows
+                                    # the true cost, not a flat guess
+                                    if _mk == "kling":
+                                        _cost_est = ce.kling_cost(_cached_duration(_gi["video_path"]))
+                                    elif _has_vid:
+                                        _cost_est = ce.seedance_cost(_cached_duration(_gi["video_path"]))
+                                    else:
+                                        _cost_est = ce.seedance_cost(5)
                                     mm.update_pipeline_item(_gi["id"], gen_pred=_gpid,
                                                             model_key=_mk, prompt=_gp,
-                                                            gen_cost=None)
+                                                            gen_cost=_cost_est)
                                     _launch_gen_poll(_gi["id"], _gpid,
                                                      src_video=_gi.get("video_path"))
                                 except Exception as _ge:
@@ -1628,9 +1676,16 @@ with _t_audit:
                                     if _gfp and os.path.exists(_gfp):
                                         try: os.remove(_gfp)
                                         except OSError: pass
+                                    # COST ENGINE: exact price from duration
+                                    if _rmk == "kling":
+                                        _rcost = ce.kling_cost(_cached_duration(_ai.get("video_path")))
+                                    elif _ai.get("video_path") and os.path.exists(_ai["video_path"]):
+                                        _rcost = ce.seedance_cost(_cached_duration(_ai["video_path"]))
+                                    else:
+                                        _rcost = ce.seedance_cost(5)
                                     mm.update_pipeline_item(_ai["id"], gen_pred=_rpid,
                                                             gen_url=None, gen_path=None,
-                                                            gen_cost=None)
+                                                            model_key=_rmk, gen_cost=_rcost)
                                     _launch_gen_poll(_ai["id"], _rpid,
                                                      src_video=_ai.get("video_path"))
                                 except Exception as _rge:
