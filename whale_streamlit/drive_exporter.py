@@ -64,6 +64,45 @@ DEVICE_MAP = {
 
 TIMES_OF_DAY = ["Μερα", "Νυχτα"]
 
+# The 3 phones for auto-distribution, in fill order (matches the agreed
+# example: iPhone 11 → iPhone XS → iPhone 8).
+PHONES = [
+    "iPhone11-Με θυκη",
+    "iPhoneXs-Το κινητο με το Μ πισω το σπασμενο",
+    "iPhone8-Ασπρο Ροζε",
+]
+
+PER_DEVICE_PER_DAY = 2   # exactly 2 videos/device/date: 1 Μερα + 1 Νυχτα
+
+
+def plan_distribution(n_videos, start_date, phones=None):
+    """Round-robin by DATE. Each device gets exactly 2 videos per date — one
+    'Μερα' (day) and one 'Νυχτα' (night). ALL devices are filled for a date
+    (day+night each) BEFORE the date is incremented by 1.
+
+    Example — 18 videos, start 2026-07-27, [iPhone11, iPhoneXS, iPhone8]:
+        07-27: iPhone11(day,night) iPhoneXS(day,night) iPhone8(day,night)
+        07-28: …same…   07-29: …same…   (6 videos/date → 3 dates)
+
+    Returns [{device, date_str, time_of_day, day_index}, …], one per video.
+    """
+    from datetime import timedelta
+    phones = phones or PHONES
+    per_date = len(phones) * PER_DEVICE_PER_DAY     # 3 × 2 = 6 videos/date
+    plan = []
+    for i in range(n_videos):
+        day_off   = i // per_date
+        within    = i % per_date
+        phone_idx = within // PER_DEVICE_PER_DAY    # device: 0,0,1,1,2,2
+        tod       = TIMES_OF_DAY[within % PER_DEVICE_PER_DAY]   # day,night,day,night…
+        plan.append({
+            "device":      phones[phone_idx],
+            "date_str":    (start_date + timedelta(days=day_off)).strftime("%Y-%m-%d"),
+            "time_of_day": tod,
+            "day_index":   day_off,
+        })
+    return plan
+
 import re as _re
 _DATE_RE = _re.compile(r"^\d{4}-\d{2}-\d{2}$")
 

@@ -90,11 +90,13 @@ def init_db():
             # WAL: readers never block the writer (poller thread vs UI thread)
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
-            # Migration: add gen_cost (real WaveSpeed price) to older DBs
+            # Migrations for older DBs
             _cols = {r[1] for r in conn.execute(
                 "PRAGMA table_info(pipeline_items)").fetchall()}
             if "gen_cost" not in _cols:
                 conn.execute("ALTER TABLE pipeline_items ADD COLUMN gen_cost REAL")
+            if "drive_path" not in _cols:      # Drive folder a scrubbed clip was distributed to
+                conn.execute("ALTER TABLE pipeline_items ADD COLUMN drive_path TEXT")
             conn.commit()
     finally:
         conn.close()

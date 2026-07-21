@@ -1702,6 +1702,71 @@ with _t_audit:
 
     # ── CLEAN (scrubbed) ──────────────────────────────────────────
     if _au_done:
+        # ── AUTO-DISTRIBUTE TO DRIVE (scheduler) ─────────────────────
+        _undist = [v for v in _au_done
+                   if not (v.get("drive_path") or "").strip()
+                   and v.get("scrubbed_path") and os.path.exists(v.get("scrubbed_path") or "")]
+        with st.container(border=True):
+            _section_label("📤 Auto-Distribute to Drive", "#4ade80")
+            import datetime as _dt2
+            _adc1, _adc2 = st.columns([1, 2])
+            with _adc1:
+                _start_date = st.date_input("📅 Ημερομηνία εκκίνησης",
+                                            value=st.session_state.get("_distrib_start", _dt2.date.today()),
+                                            key="distrib_start_input")
+                st.session_state["_distrib_start"] = _start_date
+            with _adc2:
+                _plan = de.plan_distribution(len(_undist), _start_date)
+                _n_days = (_plan[-1]["day_index"] + 1) if _plan else 0
+                _per_day = len(de.PHONES) * de.PER_DEVICE_PER_DAY
+                st.markdown(
+                    f"<div style='font-size:12px;color:#8b81b8;padding-top:6px'>"
+                    f"<b style='color:#4ade80'>{len(_undist)}</b> βίντεο προς διανομή · "
+                    f"<b>{len(de.PHONES)} phones × 2/μέρα (1 Μέρα+1 Νύχτα) = {_per_day}/μέρα</b> · "
+                    f"θα απλωθούν σε <b style='color:#4ade80'>{_n_days}</b> μέρες "
+                    f"(από {_start_date.strftime('%d/%m')})</div>",
+                    unsafe_allow_html=True,
+                )
+            if _undist:
+                # compact preview of the first few assignments
+                _prev = de.plan_distribution(min(len(_undist), 6), _start_date)
+                _prev_txt = " · ".join(
+                    f"{i+1}→{p['device'].split('-')[0]}/{p['date_str'][5:]}/{p['time_of_day']}"
+                    for i, p in enumerate(_prev))
+                st.caption(f"Πρώτα: {_prev_txt}{' …' if len(_undist) > 6 else ''}")
+                if st.button(f"📤 Distribute All ({len(_undist)} βίντεο)",
+                             type="primary", use_container_width=True, key="distrib_all_btn"):
+                    if "rclone_conf" not in st.secrets:
+                        st.error("Λείπει το rclone_conf από τα Streamlit secrets.")
+                    else:
+                        _conf = str(st.secrets["rclone_conf"])
+                        _full_plan = de.plan_distribution(len(_undist), _start_date)
+                        _dbar = st.progress(0, text="📤 Distributing…")
+                        _ok, _fail = 0, []
+                        for _vi, (_vid, _slot) in enumerate(zip(_undist, _full_plan)):
+                            _dbar.progress(_vi / len(_undist),
+                                           text=f"📤 [{_vi+1}/{len(_undist)}] "
+                                                f"{_slot['device'].split('-')[0]} · "
+                                                f"{_slot['date_str']} · {_slot['time_of_day']}")
+                            try:
+                                _r = de.upload_video(
+                                    file_path=_vid["scrubbed_path"], creator="MELINA",
+                                    device=_slot["device"], date_str=_slot["date_str"],
+                                    time_of_day=_slot["time_of_day"], rclone_conf=_conf,
+                                    filename=f"whale_{_vid['id']}.mp4")
+                                mm.update_pipeline_item(_vid["id"], drive_path=_r["folder_path"])
+                                _ok += 1
+                            except Exception as _de2:
+                                _fail.append(f"#{_vid['id']}: {_de2}")
+                        _dbar.empty()
+                        if _ok:
+                            st.success(f"✅ {_ok} βίντεο μοιράστηκαν στους φακέλους στο Drive!")
+                        for _f in _fail[:5]:
+                            st.error(_f)
+                        st.rerun()
+            else:
+                st.caption("Όλα τα καθαρά βίντεο έχουν ήδη μοιραστεί ✅")
+
         _section_label(f"✅ Clean — {len(_au_done)}", "#4ade80")
         _ad_cols, _ad_w = _grid(_au_done)
         for _adi, _ad in enumerate(_au_done):
@@ -1709,6 +1774,13 @@ with _t_audit:
                 with st.container(border=True):
                     _card_header(_ad, "#4ade80")
                     _cost_badge(_ad)
+                    _dpath = (_ad.get("drive_path") or "").strip()
+                    if _dpath:
+                        st.markdown(
+                            f"<div style='font-size:10px;color:#4ade80;margin-bottom:4px'>"
+                            f"📤 στο Drive: {_dpath.rsplit('/', 1)[0]}</div>",
+                            unsafe_allow_html=True,
+                        )
                     _sfp = _ad.get("scrubbed_path")
                     if _sfp and os.path.exists(_sfp):
                         # RAM saver: preview on demand only
