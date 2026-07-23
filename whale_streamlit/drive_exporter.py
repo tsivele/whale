@@ -59,8 +59,8 @@ DEVICE_MAP = {
         "iPhone11-Με θυκη",
         "iPhoneXs-Το κινητο με το Μ πισω το σπασμενο",
         "iPhone8-Ασπρο Ροζε",
-        "iPhoneSE",
-        "iPhoneXs(Καινουργιο)",
+        "iPhoneSE(Μαυρο με κουμπι)",
+        "iPhoneXs(7ευρο λεει πισω)",
     ],
 }
 
@@ -73,33 +73,71 @@ PHONES = DEVICE_MAP["MELINA"]
 PER_DEVICE_PER_DAY = 2   # exactly 2 videos/device/date: 1 Μερα + 1 Νυχτα
 
 
-def plan_distribution(n_videos, start_date, phones=None):
-    """Round-robin by DATE. Each device gets exactly 2 videos per date — one
-    'Μερα' (day) and one 'Νυχτα' (night). ALL devices are filled for a date
-    (day+night each) BEFORE the date is incremented by 1.
+def plan_distribution(n_videos, start_date, occupied=None, phones=None, max_days=730):
+    """Assign n videos to (device, date, Μερα/Νυχτα) slots — EXACTLY ONE video
+    per slot. Fills every device for a date (each gets 1 Μερα + 1 Νυχτα) before
+    the date advances by 1.
 
-    Example — 18 videos, start 2026-07-27, [iPhone11, iPhoneXS, iPhone8]:
-        07-27: iPhone11(day,night) iPhoneXS(day,night) iPhone8(day,night)
-        07-28: …same…   07-29: …same…   (6 videos/date → 3 dates)
+    `occupied` = a set of (device, date_str, time_of_day) that ALREADY hold a
+    video (checked from Drive). Those slots are SKIPPED, so re-running never
+    double-fills a folder — it just flows to the next free slot / next day.
+
+    Example — start 2026-07-27, 5 phones, nothing occupied:
+        07-27: each of the 5 phones → 1 Μερα + 1 Νυχτα  (10 videos)
+        07-28: …same…   (10/date). If a slot is taken, it rolls to the next day.
 
     Returns [{device, date_str, time_of_day, day_index}, …], one per video.
     """
     from datetime import timedelta
     phones = phones or PHONES
-    per_date = len(phones) * PER_DEVICE_PER_DAY     # 3 × 2 = 6 videos/date
+    occ = set(occupied or ())
     plan = []
-    for i in range(n_videos):
-        day_off   = i // per_date
-        within    = i % per_date
-        phone_idx = within // PER_DEVICE_PER_DAY    # device: 0,0,1,1,2,2
-        tod       = TIMES_OF_DAY[within % PER_DEVICE_PER_DAY]   # day,night,day,night…
-        plan.append({
-            "device":      phones[phone_idx],
-            "date_str":    (start_date + timedelta(days=day_off)).strftime("%Y-%m-%d"),
-            "time_of_day": tod,
-            "day_index":   day_off,
-        })
+    day_off = 0
+    while len(plan) < n_videos and day_off < max_days:
+        date_str = (start_date + timedelta(days=day_off)).strftime("%Y-%m-%d")
+        for device in phones:                       # fill all devices for the date…
+            for tod in TIMES_OF_DAY:                # …each device: Μερα then Νυχτα
+                if len(plan) >= n_videos:
+                    break
+                if (device, date_str, tod) in occ:  # slot already has a video → skip
+                    continue
+                plan.append({"device": device, "date_str": date_str,
+                             "time_of_day": tod, "day_index": day_off})
+            if len(plan) >= n_videos:
+                break
+        day_off += 1
     return plan
+
+
+def get_occupied_slots(rclone_conf) -> set:
+    """Scan Drive (one rclone call) for slots that already contain a video, so
+    the scheduler won't reuse them. Returns {(device, date_str, time_of_day)}.
+    Survives Streamlit Cloud restarts (the DB is ephemeral, Drive is the truth)."""
+    occupied = set()
+    try:
+        rclone = _rclone_bin()
+    except DriveExportError:
+        return occupied
+    conf_path = _write_conf(rclone_conf)
+    try:
+        r = subprocess.run(
+            [rclone, "--config", conf_path, "lsf", "-R", "--files-only",
+             f"{REMOTE_NAME}:{ROOT_FOLDER_NAME}"],
+            capture_output=True, text=True, timeout=120)
+        if r.returncode == 0:
+            for line in r.stdout.splitlines():
+                # relative to T-WHALES: Melina/Device/Date/Μερα|Νυχτα/file.mp4
+                parts = line.strip().split("/")
+                if len(parts) >= 5:
+                    occupied.add((parts[1], parts[2], parts[3]))
+    except Exception:
+        pass
+    finally:
+        try:
+            os.remove(conf_path)
+        except OSError:
+            pass
+    return occupied
 
 import re as _re
 _DATE_RE = _re.compile(r"^\d{4}-\d{2}-\d{2}$")

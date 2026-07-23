@@ -1715,23 +1715,30 @@ with _t_audit:
                                             value=st.session_state.get("_distrib_start", _dt2.date.today()),
                                             key="distrib_start_input")
                 st.session_state["_distrib_start"] = _start_date
+            # slots already used (from what THIS app distributed) — for the preview
+            _db_occ = set()
+            for _v in _all_kpi:
+                _dp = (_v.get("drive_path") or "").strip()
+                if _dp:
+                    _pp = _dp.split("/")
+                    if len(_pp) >= 5:
+                        _db_occ.add((_pp[2], _pp[3], _pp[4]))
             with _adc2:
-                _plan = de.plan_distribution(len(_undist), _start_date)
+                _plan = de.plan_distribution(len(_undist), _start_date, occupied=_db_occ)
                 _n_days = (_plan[-1]["day_index"] + 1) if _plan else 0
                 _per_day = len(de.PHONES) * de.PER_DEVICE_PER_DAY
                 st.markdown(
                     f"<div style='font-size:12px;color:#8b81b8;padding-top:6px'>"
                     f"<b style='color:#4ade80'>{len(_undist)}</b> βίντεο προς διανομή · "
-                    f"<b>{len(de.PHONES)} phones × 2/μέρα (1 Μέρα+1 Νύχτα) = {_per_day}/μέρα</b> · "
-                    f"θα απλωθούν σε <b style='color:#4ade80'>{_n_days}</b> μέρες "
-                    f"(από {_start_date.strftime('%d/%m')})</div>",
+                    f"<b>1 βίντεο/slot · {len(de.PHONES)} phones × 2 (Μέρα+Νύχτα) = {_per_day}/μέρα</b> · "
+                    f"~<b style='color:#4ade80'>{_n_days}</b> μέρες (από {_start_date.strftime('%d/%m')})</div>",
                     unsafe_allow_html=True,
                 )
             if _undist:
                 # compact preview of the first few assignments
-                _prev = de.plan_distribution(min(len(_undist), 6), _start_date)
+                _prev = _plan[:6]
                 _prev_txt = " · ".join(
-                    f"{i+1}→{p['device'].split('-')[0]}/{p['date_str'][5:]}/{p['time_of_day']}"
+                    f"{i+1}→{p['device'].split('-')[0].split('(')[0]}/{p['date_str'][5:]}/{p['time_of_day']}"
                     for i, p in enumerate(_prev))
                 st.caption(f"Πρώτα: {_prev_txt}{' …' if len(_undist) > 6 else ''}")
                 if st.button(f"📤 Distribute All ({len(_undist)} βίντεο)",
@@ -1740,7 +1747,10 @@ with _t_audit:
                         st.error("Λείπει το rclone_conf από τα Streamlit secrets.")
                     else:
                         _conf = str(st.secrets["rclone_conf"])
-                        _full_plan = de.plan_distribution(len(_undist), _start_date)
+                        # check the REAL Drive so we never double-fill a slot
+                        _drive_occ = de.get_occupied_slots(_conf)
+                        _full_plan = de.plan_distribution(len(_undist), _start_date,
+                                                          occupied=_drive_occ)
                         _dbar = st.progress(0, text="📤 Distributing…")
                         _ok, _fail = 0, []
                         for _vi, (_vid, _slot) in enumerate(zip(_undist, _full_plan)):
