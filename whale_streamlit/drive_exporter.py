@@ -56,21 +56,19 @@ DEVICE_MAP = {
         "iPhoneSE-Καλη κατασταση μαυρο",
     ],
     "MELINA": [
-        "iPhoneXs-Το κινητο με το Μ πισω το σπασμενο",
         "iPhone11-Με θυκη",
+        "iPhoneXs-Το κινητο με το Μ πισω το σπασμενο",
         "iPhone8-Ασπρο Ροζε",
+        "iPhoneSE",
+        "iPhoneXs(Καινουργιο)",
     ],
 }
 
 TIMES_OF_DAY = ["Μερα", "Νυχτα"]
 
-# The 3 phones for auto-distribution, in fill order (matches the agreed
-# example: iPhone 11 → iPhone XS → iPhone 8).
-PHONES = [
-    "iPhone11-Με θυκη",
-    "iPhoneXs-Το κινητο με το Μ πισω το σπασμενο",
-    "iPhone8-Ασπρο Ροζε",
-]
+# The phones for auto-distribution, in fill order. Single source of truth =
+# DEVICE_MAP["MELINA"] so the manual dropdown and the scheduler never diverge.
+PHONES = DEVICE_MAP["MELINA"]
 
 PER_DEVICE_PER_DAY = 2   # exactly 2 videos/device/date: 1 Μερα + 1 Νυχτα
 
