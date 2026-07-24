@@ -82,9 +82,13 @@ def plan_distribution(n_videos, start_date, occupied=None, phones=None, max_days
     video (checked from Drive). Those slots are SKIPPED, so re-running never
     double-fills a folder — it just flows to the next free slot / next day.
 
+    Fill order per date: ALL devices get their Μερα slot FIRST, then ALL
+    devices get their Νυχτα slot; only then does the date advance.
+
     Example — start 2026-07-27, 5 phones, nothing occupied:
-        07-27: each of the 5 phones → 1 Μερα + 1 Νυχτα  (10 videos)
-        07-28: …same…   (10/date). If a slot is taken, it rolls to the next day.
+        07-27 Μερα:  phone1..phone5   (5 videos)
+        07-27 Νυχτα: phone1..phone5   (5 videos)   → 10/date
+        07-28 …same… If a slot is taken, it's skipped and rolls to the next day.
 
     Returns [{device, date_str, time_of_day, day_index}, …], one per video.
     """
@@ -95,11 +99,11 @@ def plan_distribution(n_videos, start_date, occupied=None, phones=None, max_days
     day_off = 0
     while len(plan) < n_videos and day_off < max_days:
         date_str = (start_date + timedelta(days=day_off)).strftime("%Y-%m-%d")
-        for device in phones:                       # fill all devices for the date…
-            for tod in TIMES_OF_DAY:                # …each device: Μερα then Νυχτα
+        for tod in TIMES_OF_DAY:                     # ALL devices Μερα first, THEN all Νυχτα
+            for device in phones:
                 if len(plan) >= n_videos:
                     break
-                if (device, date_str, tod) in occ:  # slot already has a video → skip
+                if (device, date_str, tod) in occ:   # slot already has a video → skip
                     continue
                 plan.append({"device": device, "date_str": date_str,
                              "time_of_day": tod, "day_index": day_off})
