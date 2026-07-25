@@ -11,6 +11,7 @@ import queue as _stdlib_queue
 import memory_manager as mm
 import drive_exporter as de
 import cost_engine as ce
+import discovery as disco
 mm.init_db()
 
 def _find_bin(name):
@@ -559,6 +560,28 @@ def _cached_duration(path):
     except Exception:
         pass
     return 5.0
+
+
+def _ingest_reel(ig_url: str, creator: str) -> int:
+    """Download a reel, extract a cover frame, and add it to the pipeline as a
+    'downloaded' item — the same ingestion the manual URL box does, reused by
+    Auto-Discovery. Returns the new pipeline item id."""
+    _vurl = None
+    if st.session_state.get("_hk"):
+        try:
+            _vurl = hiker_get_video_url(ig_url)
+        except Exception:
+            pass
+    if not _vurl and st.session_state.get("_ak"):
+        _vurl = apify_get_video_url(ig_url)
+    if not _vurl:
+        raise RuntimeError("δεν βρέθηκε video για το URL")
+    _vpath = download_video_url(_vurl)
+    _dur = get_duration(_vpath)
+    _frame = extract_frame(_vpath, max(0.3, 0.05 * _dur))
+    _nid = mm.add_pipeline_item(ig_url, creator)
+    mm.update_pipeline_item(_nid, video_path=_vpath, frame_path=_frame)
+    return _nid
 
 
 def extract_frame(video_path, timestamp):
@@ -1146,8 +1169,115 @@ def _grid(items):
 # TAB 1 — DISCOVERY
 # ════════════════════════════════════════════════════════
 with _t_disc:
+    # ══════════════════════════════════════════════════════
+    # AUTO-DISCOVER — find viral solo Reels from the niche
+    # ══════════════════════════════════════════════════════
     with st.container(border=True):
-        st.markdown("<div style='font-size:12px;font-weight:700;color:#c4b5fd;margin-bottom:8px'>📥 Add Instagram Reels</div>", unsafe_allow_html=True)
+        st.markdown("<div style='font-size:12px;font-weight:700;color:#4ade80;margin-bottom:6px'>🔎 Auto-Discover Viral Reels</div>", unsafe_allow_html=True)
+        _vkey = st.secrets.get("OPENAI_KEY", "") or st.secrets.get("GEMINI_KEY", "")
+        _vprov = "openai" if st.secrets.get("OPENAI_KEY", "") else "gemini"
+        _BATCH = 15
+        _dcol1, _dcol2, _dcol3 = st.columns([2, 2, 1])
+        with _dcol1:
+            _use_vision = st.toggle("👁 Vision filter (solo/φωτισμός)",
+                                    value=bool(_vkey), disabled=not _vkey,
+                                    key="disco_vision_toggle",
+                                    help="Χρειάζεται OPENAI_KEY ή GEMINI_KEY στα secrets"
+                                         if not _vkey else "gpt-4o-mini / Gemini Flash")
+        with _dcol2:
+            _hashtags_raw = st.text_input("Hashtags (προαιρετικά, χωρισμένα με κόμμα)",
+                                          key="disco_hashtags", placeholder="greekgirl, fyp")
+        _hashtags = [h.strip() for h in (_hashtags_raw or "").split(",") if h.strip()]
+
+        if st.button("🔎 Βρες βίντεο", type="primary", use_container_width=True,
+                     key="disco_find_btn"):
+            if not st.session_state.get("_hk"):
+                st.error("Βάλε HikerAPI key στο sidebar.")
+            else:
+                _pbar = st.progress(0, text="🔎 Ψάχνω…")
+                try:
+                    _res = disco.discover(
+                        hiker_key=st.session_state["_hk"],
+                        vision_key=_vkey or None,
+                        vision_provider=_vprov,
+                        hashtags=_hashtags,
+                        use_vision=bool(_use_vision and _vkey),
+                        progress_cb=lambda s, d, t: _pbar.progress(
+                            min(d / max(t, 1), 1.0), text=f"🔎 {s} {d}/{t}"),
+                    )
+                    _pbar.empty()
+                    st.session_state["_disco_results"] = _res
+                    st.session_state["_disco_offset"] = 0
+                    if not _res:
+                        st.warning("Δεν βρέθηκαν βίντεο που να περνούν τα φίλτρα. "
+                                   "Δοκίμασε χωρίς vision ή άλλα hashtags.")
+                except Exception as _dex:
+                    _pbar.empty()
+                    st.error(f"Discovery error: {_dex}")
+
+        _dres = st.session_state.get("_disco_results") or []
+        if _dres:
+            _off = st.session_state.get("_disco_offset", 0) % max(len(_dres), 1)
+            _batch = _dres[_off:_off + _BATCH]
+            _added = st.session_state.setdefault("_disco_added", set())
+            st.markdown(f"<div style='font-size:11px;color:#8b81b8;margin:6px 0'>"
+                        f"Βρέθηκαν <b style='color:#4ade80'>{len(_dres)}</b> · "
+                        f"δείχνω {_off+1}-{_off+len(_batch)}</div>", unsafe_allow_html=True)
+            _b1, _b2 = st.columns(2)
+            with _b1:
+                if st.button(f"➕ Πρόσθεσε αυτά τα {len(_batch)} στο pipeline",
+                             use_container_width=True, key="disco_add_batch"):
+                    _pb = st.progress(0, text="⬇ Κατεβάζω…")
+                    _n_ok = 0
+                    for _bi, _c in enumerate(_batch):
+                        _pb.progress((_bi + 1) / len(_batch),
+                                     text=f"⬇ [{_bi+1}/{len(_batch)}] @{_c.get('username','')}")
+                        if _c["code"] in _added:
+                            continue
+                        try:
+                            _ingest_reel(_c["url"], "MELINA")
+                            _added.add(_c["code"]); _n_ok += 1
+                        except Exception:
+                            pass
+                    _pb.empty()
+                    st.success(f"✅ {_n_ok} βίντεο μπήκαν στο pipeline!")
+                    st.rerun()
+            with _b2:
+                if st.button("🔄 Rebatch (άλλα 15)", use_container_width=True,
+                             key="disco_rebatch"):
+                    st.session_state["_disco_offset"] = _off + _BATCH
+                    st.rerun()
+
+            _n = len(_batch)
+            _rcols = st.columns(min(3, max(1, _n)), gap="small")
+            for _ri, _c in enumerate(_batch):
+                with _rcols[_ri % min(3, max(1, _n))]:
+                    with st.container(border=True):
+                        if _c.get("thumbnail_url"):
+                            try: st.image(_c["thumbnail_url"], use_container_width=True)
+                            except Exception: pass
+                        _sc = _c.get("score", 0)
+                        _scol = "#4ade80" if _sc >= 70 else "#fbbf24" if _sc >= 50 else "#9b8dc4"
+                        st.markdown(
+                            f"<div style='font-size:11px'><b style='color:{_scol}'>💥 {_sc}</b>"
+                            f" · @{_c.get('username','')[:16]}</div>"
+                            f"<div style='font-size:10px;color:#8b81b8'>"
+                            f"{_c.get('views',0):,} views · {_c.get('view_ratio',0)}× foll · "
+                            f"{_c.get('duration',0):.0f}s</div>",
+                            unsafe_allow_html=True)
+                        _isadd = _c["code"] in _added
+                        if st.button("✓ Προστέθηκε" if _isadd else "➕ Add",
+                                     key=f"disco_add_{_c['code']}",
+                                     disabled=_isadd, use_container_width=True):
+                            try:
+                                _ingest_reel(_c["url"], "MELINA")
+                                _added.add(_c["code"])
+                                st.rerun()
+                            except Exception as _ae:
+                                st.error(str(_ae))
+
+    with st.container(border=True):
+        st.markdown("<div style='font-size:12px;font-weight:700;color:#c4b5fd;margin-bottom:8px'>📥 Add Instagram Reels (manual)</div>", unsafe_allow_html=True)
         _raw_urls = st.text_area(
             "URLs",
             placeholder="https://www.instagram.com/reel/ABC123/\nhttps://www.instagram.com/reel/DEF456/",
