@@ -244,7 +244,7 @@ def vision_check(image_urls, api_key: str, provider: str = "openai",
         return {"pass": False, "error": "no frame url"}
     try:
         if provider == "gemini":
-            return _vision_gemini(image_urls, api_key, model or "gemini-1.5-flash")
+            return _vision_gemini(image_urls, api_key, model or "gemini-3.6-flash")
         return _vision_openai(image_urls, api_key, model or "gpt-4o-mini")
     except Exception as e:
         return {"pass": False, "error": str(e)[:200]}
@@ -268,7 +268,9 @@ def _vision_openai(image_urls, api_key, model) -> dict:
 
 
 def _vision_gemini(image_urls, api_key, model) -> dict:
-    # Gemini wants inline base64; fetch the frames then send.
+    # Gemini wants inline base64; fetch the frames then send. Auth via the
+    # x-goog-api-key HEADER (works with both AIza and the new AQ. keys, and
+    # keeps the key out of the URL). model defaults to the current flash tier.
     import base64
     parts = [{"text": VISION_PROMPT}]
     for u in image_urls:
@@ -277,7 +279,7 @@ def _vision_gemini(image_urls, api_key, model) -> dict:
                                        "data": base64.b64encode(img).decode()}})
     r = requests.post(
         f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-        params={"key": api_key},
+        headers={"x-goog-api-key": api_key},
         json={"contents": [{"parts": parts}],
               "generationConfig": {"response_mime_type": "application/json",
                                    "temperature": 0}},

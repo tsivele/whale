@@ -46,9 +46,18 @@ _STRUCTURAL_TAGS = frozenset({
 
 # Tag key substrings (case-insensitive) that indicate tracking/privacy metadata.
 # Any tag whose key contains one of these is a violation.
+# Keys whose mere presence is NOT a violation — only a violation when the VALUE
+# is an actual editing-tool fingerprint (below). Generic defaults like
+# handler_name="VideoHandler" or encoder="" are what real phone videos carry.
+_VALUE_AWARE_KEYS = ("encoder", "handler_name")
+# Editing/processing tool signatures that DO betray manipulation.
+_TOOL_SIGNATURES = ("lavf", "lavc", "libx26", "x264", "x265", "ffmpeg",
+                    "handbrake", "gpac", "mp4box", "shotcut", "premiere",
+                    "vegas", "davinci", "kdenlive", "avidemux")
+
 _FORBIDDEN_KEY_PATTERNS: List[str] = [
-    "encoder",           # Lavc/Lavf fingerprints
-    "handler_name",      # VideoHandler / SoundHandler
+    "encoder",           # Lavc/Lavf fingerprints (value-aware)
+    "handler_name",      # VideoHandler / SoundHandler (value-aware)
     "creation_time",     # recording timestamp
     "date",              # any date field
     "xmp",               # Adobe XMP block
@@ -74,11 +83,13 @@ _FORBIDDEN_KEY_PATTERNS: List[str] = [
     "manifest",          # any manifest blob
 ]
 
-# Raw byte signatures of hidden metadata that ffprobe does not surface
-# as named tags. Searched in the full file bytestream (case-insensitive).
+# Raw byte signatures of hidden metadata that ffprobe does not surface as
+# named tags. ONLY long, specific signatures are used — short 4-byte markers
+# like b"c2pa"/b"jumb" collide with random bytes inside a multi-MB re-encoded
+# video (mdat) and caused FALSE-POSITIVE quarantines of perfectly clean clips.
+# Real C2PA / Content Credentials still get caught by the long signatures below
+# (contentcredentials / adobe namespace / XMP packets).
 _BINARY_SIGNATURES: Dict[str, bytes] = {
-    "C2PA manifest":         b"c2pa",
-    "JUMBF box":             b"jumb",        # JPEG Universal Metadata Box Format
     "XMP metadata block":    b"<x:xmpmeta",
     "XMP packet wrapper":    b"<?xpacket",
     "EXIF header":           b"exif\x00\x00",
@@ -172,6 +183,14 @@ def _check_tag(key: str, value: str) -> Optional[str]:
 
     for pattern in _FORBIDDEN_KEY_PATTERNS:
         if pattern in k_lower:
+            # encoder / handler_name: a violation ONLY if the value is a real
+            # editing-tool fingerprint. Generic values (VideoHandler, Core Media,
+            # etc.) are normal and must not quarantine an otherwise-clean clip.
+            if pattern in _VALUE_AWARE_KEYS:
+                _v = value.lower()
+                if any(sig in _v for sig in _TOOL_SIGNATURES):
+                    return f"{key}={value!r}"
+                return None
             return f"{key}={value!r}"
 
     return None
@@ -207,9 +226,19 @@ def _scan_binary(path: str) -> Dict[str, str]:
     Returns {label: description} for each signature found.
     """
     found: Dict[str, str] = {}
+    _EDGE = 1_048_576   # 1 MB
     try:
+        size = os.path.getsize(path)
         with open(path, "rb") as f:
-            data = f.read()
+            if size <= 2 * _EDGE:
+                data = f.read()                    # small file → scan all
+            else:
+                # Real metadata lives in the mp4 BOXES (ftyp/moov/udta/uuid/XMP)
+                # at the start or end — NOT in the compressed mdat middle. Scan
+                # only the two edges so random bytes in mdat can't false-trigger.
+                head = f.read(_EDGE)
+                f.seek(size - _EDGE)
+                data = head + f.read(_EDGE)
         data_lower = data.lower()
         for label, sig in _BINARY_SIGNATURES.items():
             if sig.lower() in data_lower:

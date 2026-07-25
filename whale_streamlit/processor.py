@@ -17,13 +17,20 @@ import tempfile
 from typing import List, Union
 
 
-# MP4 ftyp-box fields that ffprobe surfaces as TAGs but are structural
-# container requirements (not user-injectable metadata). They live in the
-# 'ftyp' MP4 box — removing them corrupts the container.
+# Tags that ffprobe surfaces but are STRUCTURAL / neutral defaults present in
+# every normal video — NOT injected tracking metadata, so they must not fail
+# verification (flagging them was a false positive that quarantined clean clips):
+#   major_brand/minor_version/compatible_brands → ftyp box (removing corrupts it)
+#   language=und → "undetermined", the neutral default ffmpeg writes on streams
+#   handler_name → generic "VideoHandler"/"SoundHandler" (real phone videos have it)
+#   vendor_id    → generic muxer field
 _STRUCTURAL_TAGS = frozenset({
     "major_brand",
     "minor_version",
     "compatible_brands",
+    "language",
+    "handler_name",
+    "vendor_id",
 })
 
 
