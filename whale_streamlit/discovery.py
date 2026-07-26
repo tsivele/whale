@@ -308,10 +308,12 @@ def _coerce_verdict(v: dict) -> dict:
 
 def discover(hiker_key: str, vision_key: str = None, vision_provider: str = "openai",
              seeds: list = None, hashtags: list = None,
-             use_vision: bool = True, progress_cb=None) -> list:
+             use_vision: bool = True, exclude=None, progress_cb=None) -> list:
     """Run the full pipeline. Returns a list of passing clips (dicts with url,
     score, virality breakdown, vision verdict), sorted by score desc.
 
+    exclude: an iterable of reel codes to SKIP (already seen/added) — lets a
+             'rebatch' surface genuinely fresh videos instead of repeats.
     progress_cb(stage: str, done: int, total: int) is optional."""
     seeds = seeds or SEED_ACCOUNTS
     hashtags = hashtags or []
@@ -356,7 +358,7 @@ def discover(hiker_key: str, vision_key: str = None, vision_provider: str = "ope
 
     # 4) normalise → duration filter → virality score
     scored = []
-    seen = set()
+    seen = set(exclude or ())     # pre-seed with codes to skip (rebatch)
     for m, fb_followers in raw:
         c = parse_clip(m, fb_followers)
         if not c["url"] or c["code"] in seen:

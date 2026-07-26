@@ -1189,39 +1189,48 @@ with _t_disc:
                                           key="disco_hashtags", placeholder="greekgirl, fyp")
         _hashtags = [h.strip() for h in (_hashtags_raw or "").split(",") if h.strip()]
 
-        if st.button("🔎 Βρες βίντεο", type="primary", use_container_width=True,
-                     key="disco_find_btn"):
+        # codes already in the pipeline or added this session → never re-suggest
+        _added = st.session_state.setdefault("_disco_added", set())
+        _exclude = set(_added)
+        import re as _re_code
+        for _it in _all_kpi:
+            _mcode = _re_code.search(r"/(?:reel|p|tv)/([^/?]+)", _it.get("ig_url", ""))
+            if _mcode:
+                _exclude.add(_mcode.group(1))
+
+        def _run_disco(exclude_codes):
             if not st.session_state.get("_hk"):
                 st.error("Βάλε HikerAPI key στο sidebar.")
-            else:
-                _pbar = st.progress(0, text="🔎 Ψάχνω…")
-                try:
-                    _res = disco.discover(
-                        hiker_key=st.session_state["_hk"],
-                        vision_key=_vkey or None,
-                        vision_provider=_vprov,
-                        hashtags=_hashtags,
-                        use_vision=bool(_use_vision and _vkey),
-                        progress_cb=lambda s, d, t: _pbar.progress(
-                            min(d / max(t, 1), 1.0), text=f"🔎 {s} {d}/{t}"),
-                    )
-                    _pbar.empty()
-                    st.session_state["_disco_results"] = _res
-                    st.session_state["_disco_offset"] = 0
-                    if not _res:
-                        st.warning("Δεν βρέθηκαν βίντεο που να περνούν τα φίλτρα. "
-                                   "Δοκίμασε χωρίς vision ή άλλα hashtags.")
-                except Exception as _dex:
-                    _pbar.empty()
-                    st.error(f"Discovery error: {_dex}")
+                return
+            _pbar = st.progress(0, text="🔎 Ψάχνω…")
+            try:
+                _res = disco.discover(
+                    hiker_key=st.session_state["_hk"], vision_key=_vkey or None,
+                    vision_provider=_vprov, hashtags=_hashtags,
+                    use_vision=bool(_use_vision and _vkey), exclude=exclude_codes,
+                    progress_cb=lambda s, d, t: _pbar.progress(
+                        min(d / max(t, 1), 1.0), text=f"🔎 {s} {d}/{t}"))
+                _pbar.empty()
+                st.session_state["_disco_results"] = _res
+                st.session_state["_disco_offset"] = 0
+                if not _res:
+                    st.warning("Δεν βρέθηκαν (άλλα) βίντεο. Δοκίμασε άλλα hashtags ή χωρίς vision.")
+            except Exception as _dex:
+                _pbar.empty()
+                st.error(f"Discovery error: {_dex}")
+
+        if st.button("🔎 Βρες βίντεο", type="primary", use_container_width=True,
+                     key="disco_find_btn"):
+            _run_disco(_exclude)
 
         _dres = st.session_state.get("_disco_results") or []
+        # never show ones already added/in-pipeline (in case they were added after search)
+        _dres = [c for c in _dres if c["code"] not in _added]
         if _dres:
-            _off = st.session_state.get("_disco_offset", 0) % max(len(_dres), 1)
+            _off = min(st.session_state.get("_disco_offset", 0), max(len(_dres) - 1, 0))
             _batch = _dres[_off:_off + _BATCH]
-            _added = st.session_state.setdefault("_disco_added", set())
             st.markdown(f"<div style='font-size:11px;color:#8b81b8;margin:6px 0'>"
-                        f"Βρέθηκαν <b style='color:#4ade80'>{len(_dres)}</b> · "
+                        f"Διαθέσιμα <b style='color:#4ade80'>{len(_dres)}</b> · "
                         f"δείχνω {_off+1}-{_off+len(_batch)}</div>", unsafe_allow_html=True)
             _b1, _b2 = st.columns(2)
             with _b1:
@@ -1243,10 +1252,15 @@ with _t_disc:
                     st.success(f"✅ {_n_ok} βίντεο μπήκαν στο pipeline!")
                     st.rerun()
             with _b2:
-                if st.button("🔄 Rebatch (άλλα 15)", use_container_width=True,
+                if st.button("🔄 Rebatch (άλλα)", use_container_width=True,
                              key="disco_rebatch"):
-                    st.session_state["_disco_offset"] = _off + _BATCH
-                    st.rerun()
+                    if _off + _BATCH < len(_dres):
+                        st.session_state["_disco_offset"] = _off + _BATCH   # next page of cache
+                        st.rerun()
+                    else:
+                        # cache exhausted → fetch a genuinely FRESH set
+                        _run_disco(_exclude | {c["code"] for c in _dres})
+                        st.rerun()
 
             _n = len(_batch)
             _rcols = st.columns(min(3, max(1, _n)), gap="small")
@@ -1845,6 +1859,13 @@ with _t_audit:
                                             value=st.session_state.get("_distrib_start", _dt2.date.today()),
                                             key="distrib_start_input")
                 st.session_state["_distrib_start"] = _start_date
+                _slot_choice = st.selectbox(
+                    "🌗 Slots", ["Μέρα + Νύχτα", "Μόνο Μέρα", "Μόνο Νύχτα"],
+                    key="distrib_slots",
+                    help="π.χ. αν σήμερα ανέβηκαν οι Μέρες, διάλεξε «Μόνο Νύχτα» "
+                         "για να γεμίσουν οι νύχτες και μετά επόμενη μέρα")
+                _times = ({"Μόνο Μέρα": ["Μερα"], "Μόνο Νύχτα": ["Νυχτα"]}
+                          .get(_slot_choice))   # None = both
             # slots already used (from what THIS app distributed) — for the preview
             _db_occ = set()
             for _v in _all_kpi:
@@ -1854,7 +1875,8 @@ with _t_audit:
                     if len(_pp) >= 5:
                         _db_occ.add((_pp[2], _pp[3], _pp[4]))
             with _adc2:
-                _plan = de.plan_distribution(len(_undist), _start_date, occupied=_db_occ)
+                _plan = de.plan_distribution(len(_undist), _start_date,
+                                             occupied=_db_occ, times=_times)
                 _n_days = (_plan[-1]["day_index"] + 1) if _plan else 0
                 _per_day = len(de.PHONES) * de.PER_DEVICE_PER_DAY
                 st.markdown(
@@ -1880,7 +1902,7 @@ with _t_audit:
                         # check the REAL Drive so we never double-fill a slot
                         _drive_occ = de.get_occupied_slots(_conf)
                         _full_plan = de.plan_distribution(len(_undist), _start_date,
-                                                          occupied=_drive_occ)
+                                                          occupied=_drive_occ, times=_times)
                         _dbar = st.progress(0, text="📤 Distributing…")
                         _ok, _fail = 0, []
                         for _vi, (_vid, _slot) in enumerate(zip(_undist, _full_plan)):

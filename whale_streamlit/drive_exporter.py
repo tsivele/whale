@@ -73,17 +73,21 @@ PHONES = DEVICE_MAP["MELINA"]
 PER_DEVICE_PER_DAY = 2   # exactly 2 videos/device/date: 1 Μερα + 1 Νυχτα
 
 
-def plan_distribution(n_videos, start_date, occupied=None, phones=None, max_days=730):
+def plan_distribution(n_videos, start_date, occupied=None, phones=None,
+                      times=None, max_days=730):
     """Assign n videos to (device, date, Μερα/Νυχτα) slots — EXACTLY ONE video
-    per slot. Fills every device for a date (each gets 1 Μερα + 1 Νυχτα) before
-    the date advances by 1.
+    per slot. Fills every device for a date before the date advances by 1.
 
     `occupied` = a set of (device, date_str, time_of_day) that ALREADY hold a
     video (checked from Drive). Those slots are SKIPPED, so re-running never
     double-fills a folder — it just flows to the next free slot / next day.
 
-    Fill order per date: ALL devices get their Μερα slot FIRST, then ALL
-    devices get their Νυχτα slot; only then does the date advance.
+    `times` = which slots to fill, e.g. ["Μερα"] to fill ONLY day, ["Νυχτα"]
+    only night, or None for both (Μερα then Νυχτα). Combined with `occupied`,
+    picking "Νυχτα" after the days are done fills tonight then rolls to tomorrow.
+
+    Fill order per date: ALL devices get their first slot, then ALL devices the
+    second; only then does the date advance.
 
     Example — start 2026-07-27, 5 phones, nothing occupied:
         07-27 Μερα:  phone1..phone5   (5 videos)
@@ -94,12 +98,13 @@ def plan_distribution(n_videos, start_date, occupied=None, phones=None, max_days
     """
     from datetime import timedelta
     phones = phones or PHONES
+    times = times or TIMES_OF_DAY
     occ = set(occupied or ())
     plan = []
     day_off = 0
     while len(plan) < n_videos and day_off < max_days:
         date_str = (start_date + timedelta(days=day_off)).strftime("%Y-%m-%d")
-        for tod in TIMES_OF_DAY:                     # ALL devices Μερα first, THEN all Νυχτα
+        for tod in times:                            # ALL devices this slot, THEN next slot
             for device in phones:
                 if len(plan) >= n_videos:
                     break
