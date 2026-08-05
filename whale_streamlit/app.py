@@ -584,6 +584,20 @@ def _ingest_reel(ig_url: str, creator: str) -> int:
     return _nid
 
 
+def _ingest_upload(file_obj, creator: str) -> int:
+    """Ingest a video the user uploaded from their computer — same pipeline
+    entry as a reel: save it, extract a cover frame, add as 'downloaded' so it
+    flows into Face Swap → Seedance video-edit exactly like a discovered clip."""
+    _tf = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    _tf.write(file_obj.read())
+    _tf.close()
+    _dur = get_duration(_tf.name)
+    _frame = extract_frame(_tf.name, max(0.3, 0.05 * _dur))
+    _nid = mm.add_pipeline_item(f"upload://{file_obj.name}", creator)
+    mm.update_pipeline_item(_nid, video_path=_tf.name, frame_path=_frame)
+    return _nid
+
+
 def extract_frame(video_path, timestamp):
     out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg").name
 
@@ -1289,6 +1303,34 @@ with _t_disc:
                                 st.rerun()
                             except Exception as _ae:
                                 st.error(str(_ae))
+
+    # ══════════════════════════════════════════════════════
+    # MY OWN VIDEOS — upload local files into the pipeline
+    # ══════════════════════════════════════════════════════
+    with st.container(border=True):
+        st.markdown("<div style='font-size:12px;font-weight:700;color:#c084fc;margin-bottom:6px'>📁 Τα δικά μου βίντεο</div>", unsafe_allow_html=True)
+        _uplist = st.file_uploader(
+            "Ανέβασε δικά σου βίντεο (mp4/mov)", type=["mp4", "mov", "m4v"],
+            accept_multiple_files=True, key="disco_upload",
+            label_visibility="collapsed")
+        if _uplist:
+            st.caption(f"✓ {len(_uplist)} αρχείο(α) — θα μπουν στο pipeline (MELINA) "
+                       f"για faceswap → Seedance, όπως τα υπόλοιπα.")
+            if st.button(f"➕ Πρόσθεσε {len(_uplist)} στο pipeline",
+                         type="primary", use_container_width=True, key="disco_upload_btn"):
+                _upb = st.progress(0, text="⬆ Ανεβάζω…")
+                _uok = 0
+                for _ui, _uf in enumerate(_uplist):
+                    _upb.progress((_ui + 1) / len(_uplist),
+                                  text=f"⬆ [{_ui+1}/{len(_uplist)}] {_uf.name[:30]}")
+                    try:
+                        _ingest_upload(_uf, "MELINA")
+                        _uok += 1
+                    except Exception as _ue:
+                        st.warning(f"{_uf.name}: {_ue}")
+                _upb.empty()
+                st.success(f"✅ {_uok} βίντεο μπήκαν στο pipeline!")
+                st.rerun()
 
     with st.container(border=True):
         st.markdown("<div style='font-size:12px;font-weight:700;color:#c4b5fd;margin-bottom:8px'>📥 Add Instagram Reels (manual)</div>", unsafe_allow_html=True)
