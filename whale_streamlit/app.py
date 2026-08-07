@@ -584,17 +584,43 @@ def _ingest_reel(ig_url: str, creator: str) -> int:
     return _nid
 
 
+def _transcode_720(in_path: str) -> str:
+    """Re-encode a video to a compact ≤1280-long-edge H.264 mp4 so it (a) is
+    small enough to send as base64 without a write timeout, and (b) is a real
+    mp4 (iPhone .MOV isn't accepted by the API). Returns in_path on failure."""
+    _out = tempfile.NamedTemporaryFile(delete=False, suffix="_720.mp4").name
+    try:
+        _r = subprocess.run(
+            [FFMPEG_BIN or "ffmpeg", "-y", "-i", in_path,
+             "-vf", "scale=w=1280:h=1280:force_original_aspect_ratio=decrease:force_divisible_by=2",
+             "-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-pix_fmt", "yuv420p",
+             "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", _out],
+            capture_output=True, timeout=300)
+        if _r.returncode == 0 and os.path.exists(_out) and os.path.getsize(_out) > 1000:
+            return _out
+    except Exception:
+        pass
+    try:
+        if os.path.exists(_out):
+            os.remove(_out)
+    except OSError:
+        pass
+    return in_path
+
+
 def _ingest_upload(file_obj, creator: str) -> int:
     """Ingest a video the user uploaded from their computer — same pipeline
-    entry as a reel: save it, extract a cover frame, add as 'downloaded' so it
-    flows into Face Swap → Seedance video-edit exactly like a discovered clip."""
-    _tf = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-    _tf.write(file_obj.read())
-    _tf.close()
-    _dur = get_duration(_tf.name)
-    _frame = extract_frame(_tf.name, max(0.3, 0.05 * _dur))
+    entry as a reel. Uploads (esp. iPhone .MOV) are transcoded to a compact
+    720p mp4 first, so Seedance accepts them and the payload isn't huge."""
+    _raw = tempfile.NamedTemporaryFile(
+        delete=False, suffix=(os.path.splitext(file_obj.name)[1] or ".mp4"))
+    _raw.write(file_obj.read())
+    _raw.close()
+    _vpath = _transcode_720(_raw.name)       # → compact real mp4
+    _dur = get_duration(_vpath)
+    _frame = extract_frame(_vpath, max(0.3, 0.05 * _dur))
     _nid = mm.add_pipeline_item(f"upload://{file_obj.name}", creator)
-    mm.update_pipeline_item(_nid, video_path=_tf.name, frame_path=_frame)
+    mm.update_pipeline_item(_nid, video_path=_vpath, frame_path=_frame)
     return _nid
 
 
@@ -899,7 +925,12 @@ def _submit_video_edit(video_path: str, ref_img: str, prompt: str) -> str:
         )
     if not (video_path and os.path.exists(video_path)):
         raise RuntimeError("Το αρχικό source video λείπει — δεν γίνεται video-edit.")
-    with open(video_path, "rb") as _f:
+    # SAFETY NET: a large source (iPhone .MOV, hi-bitrate) blows up the base64
+    # body → 'write operation timed out'. Compress to compact 720p mp4 first.
+    _vsrc = video_path
+    if os.path.getsize(video_path) > 8 * 1024 * 1024:
+        _vsrc = _transcode_720(video_path)
+    with open(_vsrc, "rb") as _f:
         _vb64 = to_b64(_f.read(), mime="video/mp4")
     _pid = ws_submit(
         "bytedance/seedance-2.0/video-edit",
@@ -1679,7 +1710,10 @@ with _t_gen:
                                 try:
                                     _gp = st.session_state.get("_custom_prompt", DEFAULT_VIDEO_PROMPT)
                                     if _mk == "kling":
-                                        with open(_gi["video_path"], "rb") as _gfv:
+                                        _kv = _gi["video_path"]
+                                        if os.path.getsize(_kv) > 8 * 1024 * 1024:
+                                            _kv = _transcode_720(_kv)
+                                        with open(_kv, "rb") as _gfv:
                                             _gpid = ws_submit(
                                                 "kwaivgi/kling-v3.0-pro/motion-control",
                                                 {"image": _ref_img,
@@ -1832,7 +1866,10 @@ with _t_audit:
                                     if _rmk == "kling":
                                         if not (_ai.get("video_path") and os.path.exists(_ai["video_path"])):
                                             raise RuntimeError("Το αρχικό video λείπει — δεν γίνεται Kling recreate.")
-                                        with open(_ai["video_path"], "rb") as _rfv:
+                                        _rkv = _ai["video_path"]
+                                        if os.path.getsize(_rkv) > 8 * 1024 * 1024:
+                                            _rkv = _transcode_720(_rkv)
+                                        with open(_rkv, "rb") as _rfv:
                                             _rpid = ws_submit(
                                                 "kwaivgi/kling-v3.0-pro/motion-control",
                                                 {"image": _r_ref,
