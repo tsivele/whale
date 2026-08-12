@@ -636,8 +636,11 @@ def _ingest_upload(file_obj, creator: str) -> int:
 def _ingest_audit_upload(file_obj, creator: str) -> int:
     """Ingest a FINISHED video straight into the Audit stage (skip faceswap /
     generation) — it lands as 'generated_pending_scrub' ready for Scrub &
-    Distribute. De-dupes by filename. The scrub itself re-encodes, so no
-    transcode is needed here."""
+    Distribute. De-dupes by filename.
+
+    We DON'T downscale (finished content keeps its resolution), but we DO
+    normalize browser-unsafe formats (iPhone HDR / 10-bit / 4:4:4) to yuv420p
+    so the preview isn't a green wash. Safe files are stored as-is."""
     _url = f"audit://{file_obj.name}"
     _dup = mm.find_item_by_url(_url)
     if _dup:
@@ -645,8 +648,12 @@ def _ingest_audit_upload(file_obj, creator: str) -> int:
     _tf = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     _tf.write(file_obj.read())
     _tf.close()
+    _safe = _normalize_browser_safe(_tf.name)     # fix green HDR/10-bit previews
+    if _safe != _tf.name:
+        try: os.remove(_tf.name)                  # drop the unsafe original
+        except OSError: pass
     _nid = mm.add_pipeline_item(_url, creator, status="generated_pending_scrub")
-    mm.update_pipeline_item(_nid, gen_path=_tf.name)
+    mm.update_pipeline_item(_nid, gen_path=_safe)
     return _nid
 
 
@@ -717,6 +724,85 @@ def _has_audio(path: str) -> bool:
         return False
 
 
+# Pixel formats that every browser's <video> H.264 decoder renders correctly.
+# AI video models (Seedance/Kling) occasionally emit 10-bit / 4:2:2 / 4:4:4 or
+# HDR-tagged H.264. Chrome mis-decodes those as a GREEN wash (luma is right, the
+# chroma planes are read wrong), so the preview looks green even though the file
+# is intact. We detect that and re-encode to plain 8-bit 4:2:0 on the audio mux.
+_BROWSER_SAFE_PIXFMT = {"yuv420p", "yuvj420p"}
+
+
+def _video_needs_normalize(path: str):
+    """Return (needs_reencode: bool, reason: str) for a video's browser safety.
+
+    Reads the video stream's pixel format + color tags via ffprobe. Flags
+    anything that isn't plain 8-bit 4:2:0, plus HDR (bt2020 / PQ / HLG) which
+    also greens out in the browser. When ffprobe is unavailable we return False
+    so the fast stream-copy path is preserved (no behavior change)."""
+    try:
+        r = subprocess.run(
+            [FFPROBE_BIN or "ffprobe", "-v", "quiet",
+             "-select_streams", "v:0",
+             "-show_entries", "stream=pix_fmt,color_space,color_transfer",
+             "-of", "default=noprint_wrappers=1", path],
+            capture_output=True, text=True, timeout=30,
+        )
+        info = {}
+        for line in r.stdout.splitlines():
+            if "=" in line:
+                k, _, v = line.partition("=")
+                info[k.strip()] = v.strip().lower()
+        pix = info.get("pix_fmt", "")
+        if not pix:                       # couldn't read → don't touch it
+            return False, ""
+        if pix not in _BROWSER_SAFE_PIXFMT:
+            return True, f"pix_fmt={pix}"
+        cs = info.get("color_space", "")
+        ct = info.get("color_transfer", "")
+        if "bt2020" in cs or ct in ("smpte2084", "arib-std-b67"):
+            return True, f"hdr(color_space={cs},transfer={ct})"
+        return False, ""
+    except Exception:
+        return False, ""
+
+
+def _normalize_browser_safe(path: str) -> str:
+    """Return a browser-safe version of `path`. If it's a green-prone format
+    (10-bit / 4:2:2 / 4:4:4 / HDR — e.g. an iPhone HDR clip), re-encode it to
+    plain 8-bit yuv420p at the SAME resolution (no downscale — finished content
+    keeps its quality) and return the new file; otherwise return `path`
+    unchanged (no re-encode). Keeps audio. Never raises — on any failure the
+    original path is returned so ingestion never breaks."""
+    _need, _why = _video_needs_normalize(path)
+    if not _need:
+        return path
+    _out = tempfile.NamedTemporaryFile(delete=False, suffix="_safe.mp4").name
+    try:
+        print(f"[normalize] browser-unsafe video ({_why}) — re-encoding to yuv420p bt709")
+        _r = subprocess.run(
+            [FFMPEG_BIN or "ffmpeg", "-y", "-i", path,
+             "-vf", "format=yuv420p",
+             "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+             "-pix_fmt", "yuv420p",
+             # reset HDR/wide-gamut tags → plain SDR, else the browser still
+             # greens an 8-bit file that's still labelled bt2020/PQ/HLG
+             "-color_primaries", "bt709", "-color_trc", "bt709",
+             "-colorspace", "bt709", "-color_range", "tv",
+             "-c:a", "aac", "-b:a", "128k",
+             "-movflags", "+faststart", _out],
+            capture_output=True, timeout=600)
+        if _r.returncode == 0 and os.path.exists(_out) and os.path.getsize(_out) > 1000:
+            return _out
+    except Exception:
+        pass
+    try:
+        if os.path.exists(_out):
+            os.remove(_out)
+    except OSError:
+        pass
+    return path
+
+
 def _ensure_audio(gen_path: str, source_video_path) -> str:
     """DETERMINISTIC ORIGINAL-AUDIO MUX for video-edit outputs.
 
@@ -757,13 +843,28 @@ def _ensure_audio(gen_path: str, source_video_path) -> str:
                 return gen_path
 
         out_path = tempfile.NamedTemporaryFile(delete=False, suffix="_audio.mp4").name
+        # Video handling: normally stream-copy the AI frames untouched (fast,
+        # lossless). BUT if the model emitted a browser-unsafe pixel format
+        # (10-bit / 4:2:2 / 4:4:4 / HDR — the "green preview" bug), re-encode it
+        # to plain 8-bit yuv420p so the <video> tag decodes it correctly.
+        _need_fix, _why = _video_needs_normalize(gen_path)
+        if _need_fix:
+            print(f"[audio-mux] browser-unsafe video ({_why}) — re-encoding to yuv420p bt709")
+            _vargs = ["-vf", "format=yuv420p",
+                      "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                      "-pix_fmt", "yuv420p",
+                      "-color_primaries", "bt709", "-color_trc", "bt709",
+                      "-colorspace", "bt709", "-color_range", "tv",
+                      "-movflags", "+faststart"]
+        else:
+            _vargs = ["-c:v", "copy", "-movflags", "+faststart"]
         _base_cmd = [
             _ff, "-y",
             "-i", gen_path,               # input 0: AI-edited video
             "-i", source_video_path,      # input 1: original reel (audio donor)
             "-map", "0:v:0",              # video ← generated
             "-map", "1:a:0?",             # audio ← original (optional map)
-            "-c:v", "copy",               # NEVER re-encode the video stream
+            *_vargs,                      # copy, or normalize if green-prone
             "-shortest",
         ]
         # Attempt 1: lossless audio stream copy
