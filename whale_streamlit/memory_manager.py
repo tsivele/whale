@@ -195,15 +195,32 @@ def get_asset(asset_id: int):
 # Pipeline Items — 4-tab pipeline tracking
 # ─────────────────────────────────────────────────────────────────────────────
 
-def add_pipeline_item(ig_url: str, creator: str) -> int:
+def find_item_by_url(ig_url: str):
+    """Return the earliest existing pipeline item with this ig_url, or None.
+    Used to keep only ONE item per video (no duplicates)."""
+    if not ig_url:
+        return None
+    conn = _conn()
+    try:
+        with _lock:
+            row = conn.execute(
+                "SELECT * FROM pipeline_items WHERE ig_url=? ORDER BY id ASC LIMIT 1",
+                (ig_url,),
+            ).fetchone()
+            return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def add_pipeline_item(ig_url: str, creator: str, status: str = "downloaded") -> int:
     now = datetime.utcnow().isoformat()
     conn = _conn()
     try:
         with _lock:
             cur = conn.execute(
                 "INSERT INTO pipeline_items (ig_url, creator, status, created_at, updated_at) "
-                "VALUES (?, ?, 'downloaded', ?, ?)",
-                (ig_url, creator, now, now),
+                "VALUES (?, ?, ?, ?, ?)",
+                (ig_url, creator, status, now, now),
             )
             conn.commit()
             return cur.lastrowid

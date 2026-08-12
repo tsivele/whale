@@ -565,7 +565,11 @@ def _cached_duration(path):
 def _ingest_reel(ig_url: str, creator: str) -> int:
     """Download a reel, extract a cover frame, and add it to the pipeline as a
     'downloaded' item — the same ingestion the manual URL box does, reused by
-    Auto-Discovery. Returns the new pipeline item id."""
+    Auto-Discovery. Returns the new pipeline item id.
+    De-dupes: if this reel is already in the pipeline, keep the one."""
+    _dup = mm.find_item_by_url(ig_url)
+    if _dup:
+        return _dup["id"]
     _vurl = None
     if st.session_state.get("_hk"):
         try:
@@ -611,7 +615,12 @@ def _transcode_720(in_path: str) -> str:
 def _ingest_upload(file_obj, creator: str) -> int:
     """Ingest a video the user uploaded from their computer — same pipeline
     entry as a reel. Uploads (esp. iPhone .MOV) are transcoded to a compact
-    720p mp4 first, so Seedance accepts them and the payload isn't huge."""
+    720p mp4 first, so Seedance accepts them and the payload isn't huge.
+    De-dupes by filename: the same file twice keeps only one."""
+    _url = f"upload://{file_obj.name}"
+    _dup = mm.find_item_by_url(_url)
+    if _dup:
+        return _dup["id"]
     _raw = tempfile.NamedTemporaryFile(
         delete=False, suffix=(os.path.splitext(file_obj.name)[1] or ".mp4"))
     _raw.write(file_obj.read())
@@ -619,8 +628,25 @@ def _ingest_upload(file_obj, creator: str) -> int:
     _vpath = _transcode_720(_raw.name)       # → compact real mp4
     _dur = get_duration(_vpath)
     _frame = extract_frame(_vpath, max(0.3, 0.05 * _dur))
-    _nid = mm.add_pipeline_item(f"upload://{file_obj.name}", creator)
+    _nid = mm.add_pipeline_item(_url, creator)
     mm.update_pipeline_item(_nid, video_path=_vpath, frame_path=_frame)
+    return _nid
+
+
+def _ingest_audit_upload(file_obj, creator: str) -> int:
+    """Ingest a FINISHED video straight into the Audit stage (skip faceswap /
+    generation) — it lands as 'generated_pending_scrub' ready for Scrub &
+    Distribute. De-dupes by filename. The scrub itself re-encodes, so no
+    transcode is needed here."""
+    _url = f"audit://{file_obj.name}"
+    _dup = mm.find_item_by_url(_url)
+    if _dup:
+        return _dup["id"]
+    _tf = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    _tf.write(file_obj.read())
+    _tf.close()
+    _nid = mm.add_pipeline_item(_url, creator, status="generated_pending_scrub")
+    mm.update_pipeline_item(_nid, gen_path=_tf.name)
     return _nid
 
 
@@ -1778,6 +1804,29 @@ with _t_gen:
 with _t_audit:
     _render_errors("audit")
 
+    # ── Upload finished videos straight into Audit (skip generation) ──
+    with st.container(border=True):
+        st.markdown("<div style='font-size:12px;font-weight:700;color:#22d3ee;margin-bottom:6px'>⬆ Ανέβασε βίντεο για Scrub</div>", unsafe_allow_html=True)
+        _au_up = st.file_uploader("Έτοιμα βίντεο για audit/scrub", type=["mp4", "mov", "m4v"],
+                                  accept_multiple_files=True, key="audit_upload",
+                                  label_visibility="collapsed")
+        if _au_up:
+            st.caption(f"✓ {len(_au_up)} αρχείο(α) — θα μπουν κατευθείαν στο «Pending» για scrub & distribute.")
+            if st.button(f"⬆ Πρόσθεσε {len(_au_up)} για Scrub", type="primary",
+                         use_container_width=True, key="audit_upload_btn"):
+                _aub = st.progress(0, text="⬆ Ανεβάζω…")
+                _auok = 0
+                for _aui, _auf in enumerate(_au_up):
+                    _aub.progress((_aui + 1) / len(_au_up), text=f"⬆ [{_aui+1}/{len(_au_up)}] {_auf.name[:30]}")
+                    try:
+                        _ingest_audit_upload(_auf, "MELINA")
+                        _auok += 1
+                    except Exception as _aue:
+                        st.warning(f"{_auf.name}: {_aue}")
+                _aub.empty()
+                st.success(f"✅ {_auok} βίντεο μπήκαν για scrub!")
+                st.rerun()
+
     _au_pending  = mm.get_pipeline_items(status="generated_pending_scrub")
     _au_working  = mm.get_pipeline_items(status="scrubbing")
     _au_done     = mm.get_pipeline_items(status="scrubbed")
@@ -1838,6 +1887,15 @@ with _t_audit:
                             st.caption(f"🎬 video έτοιμο ({_mb:.1f} MB) — άνοιξε το Preview για να το δεις")
                     elif _ai.get("gen_url"):
                         st.caption("(τοπικό αρχείο λείπει — υπάρχει μόνο URL)")
+                    # choose which model to recreate with (Kling / Seedance)
+                    _re_lbl = st.selectbox(
+                        "🔄 Recreate με μοντέλο:", list(MODELS.keys()),
+                        index=(list(MODELS.values()).index(_ai.get("model_key"))
+                               if _ai.get("model_key") in MODELS.values() else 1),
+                        key=f"remodel_{_ai['id']}")
+                    _re_mk = MODELS[_re_lbl]
+                    _re_dur = _cached_duration(_ai.get("video_path")) if _ai.get("video_path") else 5
+                    st.caption(f"💸 Recreate ~{ce.fmt(ce.estimate_cost(_re_mk, _re_dur))}")
                     _ab1, _ab2, _ab3 = st.columns([2, 2, 1])
                     with _ab1:
                         if st.button("🧹 Send to Scrub", key=f"scrub_{_ai['id']}",
@@ -1854,7 +1912,7 @@ with _t_audit:
                                       use_container_width=True):
                             if mm.claim_pipeline_item(_ai["id"], "generated_pending_scrub", "generating"):
                                 try:
-                                    _rmk = _ai.get("model_key") or st.session_state.get("_gen_model", "seedance")
+                                    _rmk = _re_mk          # ← chosen in the selector above
                                     _rgp = _ai.get("prompt") or st.session_state.get("_custom_prompt", DEFAULT_VIDEO_PROMPT)
                                     # PRE-FLIGHT: recreate must also carry the
                                     # approved faceswap reference — block early
