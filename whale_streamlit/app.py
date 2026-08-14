@@ -657,6 +657,23 @@ def _ingest_audit_upload(file_obj, creator: str) -> int:
     return _nid
 
 
+def _ingest_photo_upload(file_obj, creator: str) -> int:
+    """Ingest a PHOTO the user uploaded → straight into the Face Swap queue as
+    'downloaded'. The image itself becomes the swap base (Image B) — no video,
+    no frame extraction needed. De-dupes by filename."""
+    _url = f"photo://{file_obj.name}"
+    _dup = mm.find_item_by_url(_url)
+    if _dup:
+        return _dup["id"]
+    _ext = (os.path.splitext(file_obj.name)[1] or ".jpg").lower()
+    _img = tempfile.NamedTemporaryFile(delete=False, suffix=_ext)
+    _img.write(file_obj.read())
+    _img.close()
+    _nid = mm.add_pipeline_item(_url, creator)      # status → 'downloaded'
+    mm.update_pipeline_item(_nid, frame_path=_img.name)
+    return _nid
+
+
 def extract_frame(video_path, timestamp):
     out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg").name
 
@@ -1598,18 +1615,18 @@ with _t_face:
             height=120, key="fs_prompt_input", label_visibility="collapsed",
         )
 
-    # ── Upload your OWN video → straight into the Swap queue ──────────
-    # Enters as 'downloaded' (frame extracted, normalized) so it shows in
-    # "Ready to Swap" below — pick a frame, hit 🎭 Swap with the reference +
-    # your prompt. No Seedance/Kling generation: swap only.
+    # ── Upload your OWN photos → straight into the Swap queue ────────
+    # Each image enters as 'downloaded' with the photo as the swap base, so it
+    # shows in "Ready to Swap" below — hit 🎭 Swap with the reference + your
+    # prompt. Photo → photo swap only (no video, no Seedance/Kling).
     with st.container(border=True):
-        st.markdown("<div style='font-size:12px;font-weight:700;color:#c4b5fd;margin-bottom:6px'>⬆ Ανέβασε βίντεο για Swap</div>", unsafe_allow_html=True)
+        st.markdown("<div style='font-size:12px;font-weight:700;color:#c4b5fd;margin-bottom:6px'>⬆ Ανέβασε φωτογραφίες για Swap</div>", unsafe_allow_html=True)
         _fs_up = st.file_uploader(
-            "Δικά σου βίντεο (mp4/mov) → face swap με τη reference + το prompt σου",
-            type=["mp4", "mov", "m4v"], accept_multiple_files=True,
+            "Δικές σου φωτογραφίες (jpg/png) → face swap με τη reference + το prompt σου",
+            type=["jpg", "jpeg", "png", "webp"], accept_multiple_files=True,
             key="fs_upload", label_visibility="collapsed")
         if _fs_up:
-            st.caption(f"✓ {len(_fs_up)} αρχείο(α) — θα μπουν στο «Ready to Swap» για swap μόνο "
+            st.caption(f"✓ {len(_fs_up)} φωτογραφία(ες) — θα μπουν στο «Ready to Swap» για swap μόνο "
                        f"(με τη reference + το prompt σου).")
             if st.button(f"➕ Πρόσθεσε {len(_fs_up)} για Swap",
                          type="primary", use_container_width=True, key="fs_upload_btn"):
@@ -1619,12 +1636,12 @@ with _t_face:
                     _fpb.progress((_fui + 1) / len(_fs_up),
                                   text=f"⬆ [{_fui+1}/{len(_fs_up)}] {_fuf.name[:30]}")
                     try:
-                        _ingest_upload(_fuf, "MELINA")
+                        _ingest_photo_upload(_fuf, "MELINA")
                         _fok += 1
                     except Exception as _fue:
                         st.warning(f"{_fuf.name}: {_fue}")
                 _fpb.empty()
-                st.success(f"✅ {_fok} βίντεο έτοιμα για Swap παρακάτω!")
+                st.success(f"✅ {_fok} φωτογραφίες έτοιμες για Swap παρακάτω!")
                 st.rerun()
 
     _render_errors("faceswap")
@@ -1634,7 +1651,7 @@ with _t_face:
     _fs_working = mm.get_pipeline_items(status="swapping")
 
     if not (_fs_review or _fs_queue or _fs_working):
-        st.info("Δεν υπάρχουν items εδώ. Ανέβασε βίντεο παραπάνω ⬆ ή πρόσθεσε URLs στο 🔍 Discovery tab.")
+        st.info("Δεν υπάρχουν items εδώ. Ανέβασε φωτογραφίες παραπάνω ⬆ ή πρόσθεσε URLs στο 🔍 Discovery tab.")
 
     # ── REVIEW QUEUE (pending_photo_review) ──────────────────────
     if _fs_review:
