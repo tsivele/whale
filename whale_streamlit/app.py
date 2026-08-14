@@ -1598,6 +1598,35 @@ with _t_face:
             height=120, key="fs_prompt_input", label_visibility="collapsed",
         )
 
+    # ── Upload your OWN video → straight into the Swap queue ──────────
+    # Enters as 'downloaded' (frame extracted, normalized) so it shows in
+    # "Ready to Swap" below — pick a frame, hit 🎭 Swap with the reference +
+    # your prompt. No Seedance/Kling generation: swap only.
+    with st.container(border=True):
+        st.markdown("<div style='font-size:12px;font-weight:700;color:#c4b5fd;margin-bottom:6px'>⬆ Ανέβασε βίντεο για Swap</div>", unsafe_allow_html=True)
+        _fs_up = st.file_uploader(
+            "Δικά σου βίντεο (mp4/mov) → face swap με τη reference + το prompt σου",
+            type=["mp4", "mov", "m4v"], accept_multiple_files=True,
+            key="fs_upload", label_visibility="collapsed")
+        if _fs_up:
+            st.caption(f"✓ {len(_fs_up)} αρχείο(α) — θα μπουν στο «Ready to Swap» για swap μόνο "
+                       f"(με τη reference + το prompt σου).")
+            if st.button(f"➕ Πρόσθεσε {len(_fs_up)} για Swap",
+                         type="primary", use_container_width=True, key="fs_upload_btn"):
+                _fpb = st.progress(0, text="⬆ Ανεβάζω…")
+                _fok = 0
+                for _fui, _fuf in enumerate(_fs_up):
+                    _fpb.progress((_fui + 1) / len(_fs_up),
+                                  text=f"⬆ [{_fui+1}/{len(_fs_up)}] {_fuf.name[:30]}")
+                    try:
+                        _ingest_upload(_fuf, "MELINA")
+                        _fok += 1
+                    except Exception as _fue:
+                        st.warning(f"{_fuf.name}: {_fue}")
+                _fpb.empty()
+                st.success(f"✅ {_fok} βίντεο έτοιμα για Swap παρακάτω!")
+                st.rerun()
+
     _render_errors("faceswap")
 
     _fs_review  = mm.get_pipeline_items(status="pending_photo_review")
@@ -1605,7 +1634,7 @@ with _t_face:
     _fs_working = mm.get_pipeline_items(status="swapping")
 
     if not (_fs_review or _fs_queue or _fs_working):
-        st.info("Δεν υπάρχουν items εδώ. Πρόσθεσε URLs στο 🔍 Discovery tab.")
+        st.info("Δεν υπάρχουν items εδώ. Ανέβασε βίντεο παραπάνω ⬆ ή πρόσθεσε URLs στο 🔍 Discovery tab.")
 
     # ── REVIEW QUEUE (pending_photo_review) ──────────────────────
     if _fs_review:
