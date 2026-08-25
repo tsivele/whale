@@ -66,6 +66,22 @@ CREATE TABLE IF NOT EXISTS pipeline_items (
     created_at      TEXT    NOT NULL,
     updated_at      TEXT    NOT NULL
 );
+
+-- PERMANENT MONEY LEDGER — one row per PAID WaveSpeed call (photo swap or
+-- video generation). Rows are NEVER deleted: WaveSpeed charges the moment a
+-- job is dispatched, so purging the pipeline item must not erase the spend.
+-- `pred_id` (the WaveSpeed prediction id) is UNIQUE → replays/backfills can
+-- INSERT OR IGNORE without ever double-counting the same call.
+CREATE TABLE IF NOT EXISTS spend_ledger (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    pred_id     TEXT    UNIQUE,
+    item_id     INTEGER,
+    kind        TEXT    NOT NULL DEFAULT 'video',   -- 'photo' | 'video'
+    model_key   TEXT,
+    amount      REAL    NOT NULL DEFAULT 0,
+    is_real     INTEGER NOT NULL DEFAULT 0,         -- 1 = price reported by WaveSpeed
+    created_at  TEXT    NOT NULL
+);
 """
 # pipeline_items.status flow (review-based — nothing advances without user action):
 #   downloaded → swapping → pending_photo_review
@@ -97,9 +113,111 @@ def init_db():
                 conn.execute("ALTER TABLE pipeline_items ADD COLUMN gen_cost REAL")
             if "drive_path" not in _cols:      # Drive folder a scrubbed clip was distributed to
                 conn.execute("ALTER TABLE pipeline_items ADD COLUMN drive_path TEXT")
+            # BACKFILL: older DBs tracked spend only on the pipeline row, so
+            # anything already dispatched must be lifted into the permanent
+            # ledger. UNIQUE(pred_id) + INSERT OR IGNORE makes this idempotent —
+            # it can run on every boot and never double-counts.
+            _now = datetime.utcnow().isoformat()
+            conn.execute(
+                "INSERT OR IGNORE INTO spend_ledger "
+                "(pred_id, item_id, kind, model_key, amount, is_real, created_at) "
+                "SELECT gen_pred, id, 'video', COALESCE(model_key,?), "
+                "       COALESCE(gen_cost,?), 0, COALESCE(created_at,?) "
+                "FROM pipeline_items WHERE gen_pred IS NOT NULL AND gen_pred<>''",
+                (DEFAULT_VIDEO_MODEL, DEFAULT_VIDEO_COST, _now),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO spend_ledger "
+                "(pred_id, item_id, kind, model_key, amount, is_real, created_at) "
+                "SELECT faceswap_pred, id, 'photo', 'faceswap', ?, 0, "
+                "       COALESCE(created_at,?) "
+                "FROM pipeline_items WHERE faceswap_pred IS NOT NULL AND faceswap_pred<>''",
+                (DEFAULT_PHOTO_COST, _now),
+            )
             conn.commit()
     finally:
         conn.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Spend ledger (permanent — survives purge/delete of the pipeline item)
+# ─────────────────────────────────────────────────────────────────────────────
+# WaveSpeed bills at DISPATCH, not at download. Deleting a photo or a video
+# gives no money back, so the ledger is written the moment a paid call leaves
+# the app and is never touched by delete_pipeline_item().
+
+# Fallbacks used only by the backfill above (app passes real numbers at runtime).
+DEFAULT_PHOTO_COST  = 0.03
+DEFAULT_VIDEO_COST  = 1.50
+DEFAULT_VIDEO_MODEL = "seedance"
+
+
+def record_spend(pred_id, item_id=None, kind="video", model_key=None,
+                 amount=0.0, is_real=False) -> None:
+    """Log one paid WaveSpeed call. Idempotent on pred_id (a retry of the same
+    prediction never charges twice in the ledger)."""
+    if not pred_id:
+        return
+    conn = _conn()
+    try:
+        with _lock:
+            conn.execute(
+                "INSERT OR IGNORE INTO spend_ledger "
+                "(pred_id, item_id, kind, model_key, amount, is_real, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (str(pred_id), item_id, kind, model_key, float(amount or 0.0),
+                 1 if is_real else 0, datetime.utcnow().isoformat()),
+            )
+            conn.commit()
+    finally:
+        conn.close()
+
+
+def settle_spend(pred_id, amount, is_real=True) -> None:
+    """Replace the estimate with the REAL price WaveSpeed reported for this
+    prediction. No-op if the call was never recorded."""
+    if not pred_id or amount is None:
+        return
+    conn = _conn()
+    try:
+        with _lock:
+            conn.execute(
+                "UPDATE spend_ledger SET amount=?, is_real=? WHERE pred_id=?",
+                (float(amount), 1 if is_real else 0, str(pred_id)),
+            )
+            conn.commit()
+    finally:
+        conn.close()
+
+
+def spend_summary() -> dict:
+    """Everything ever spent — including photos and anything since deleted."""
+    conn = _conn()
+    try:
+        with _lock:
+            rows = conn.execute(
+                "SELECT kind, COUNT(*) n, COALESCE(SUM(amount),0) total "
+                "FROM spend_ledger GROUP BY kind"
+            ).fetchall()
+            _real = conn.execute(
+                "SELECT COUNT(*) FROM spend_ledger WHERE is_real=1").fetchone()[0]
+    finally:
+        conn.close()
+    out = {"total": 0.0, "photo": 0.0, "video": 0.0,
+           "n_photo": 0, "n_video": 0, "n_real": _real}
+    for r in rows:
+        k = r["kind"] if r["kind"] in ("photo", "video") else "video"
+        out[k] += float(r["total"])
+        out["n_" + k] += int(r["n"])
+        out["total"] += float(r["total"])
+    out["total"] = round(out["total"], 2)
+    out["photo"] = round(out["photo"], 2)
+    out["video"] = round(out["video"], 2)
+    return out
+
+
+def total_spend() -> float:
+    return spend_summary()["total"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -298,7 +416,11 @@ def claim_pipeline_item(item_id: int, from_status: str, to_status: str) -> bool:
 
 
 def delete_pipeline_item(item_id: int):
-    """Purge: delete DB row + remove local files not shared with other items."""
+    """Purge: delete DB row + remove local files not shared with other items.
+
+    The spend_ledger is deliberately NOT touched: WaveSpeed charged the moment
+    the job was dispatched, so a deleted photo/video still costs real money and
+    must keep counting in the dashboard total."""
     conn = _conn()
     try:
         with _lock:

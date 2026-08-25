@@ -933,13 +933,14 @@ def _launch_fs_poll(item_id: int, pred_id: str) -> None:
     def _w(q=_q, iid=item_id, pid=pred_id, wk=_wk):
         try:
             # photos are quick — 15 min budget is already generous
-            r, _ = ws_poll_bg(pid, api_key=wk, max_wait=900)
-            q.put({"item_id": iid, "result": r, "error": None})
+            r, _cost = ws_poll_bg(pid, api_key=wk, max_wait=900)
+            q.put({"item_id": iid, "result": r, "pred": pid,
+                   "cost": _cost, "error": None})
         except TimeoutError as e:
-            q.put({"item_id": iid, "result": None,
+            q.put({"item_id": iid, "result": None, "pred": pid,
                    "error": f"Faceswap Failed: Server Timeout — {e}"})
         except Exception as e:
-            q.put({"item_id": iid, "result": None, "error": str(e)})
+            q.put({"item_id": iid, "result": None, "pred": pid, "error": str(e)})
     st.session_state["_active_threads"].add(f"fs_{item_id}")
     threading.Thread(target=_w, daemon=True).start()
 
@@ -958,15 +959,16 @@ def _launch_gen_poll(item_id: int, pred_id: str, src_video=None) -> None:
             r, _cost = ws_poll_bg(pid, api_key=wk, max_wait=1800)
             local = download_video_url(r)     # download in worker → no UI freeze
             local = _ensure_audio(local, src) # original-audio fallback mux
-            q.put({"item_id": iid, "result": r, "local": local,
+            q.put({"item_id": iid, "result": r, "local": local, "pred": pid,
                    "cost": _cost, "error": None})
         except TimeoutError as e:
             # graceful: lands on the card as an error with Retry/Recreate —
             # never crashes the batch or the UI
-            q.put({"item_id": iid, "result": None, "local": None,
+            q.put({"item_id": iid, "result": None, "local": None, "pred": pid,
                    "error": f"Generation Failed: Server Timeout — {e}"})
         except Exception as e:
-            q.put({"item_id": iid, "result": None, "local": None, "error": str(e)})
+            q.put({"item_id": iid, "result": None, "local": None,
+                   "pred": pid, "error": str(e)})
     st.session_state["_active_threads"].add(f"gen_{item_id}")
     threading.Thread(target=_w, daemon=True).start()
 
@@ -1156,6 +1158,11 @@ def _bg_poller():
         _iid = _res["item_id"]
         st.session_state["_active_threads"].discard(f"fs_{_iid}")
         _fs_url = (_res.get("result") or "").strip()
+        # MONEY: the swap was billed at dispatch — swap the estimate for the
+        # real price if WaveSpeed reported one. The ledger row stays either way,
+        # even if the photo is rejected or deleted right after.
+        if _res.get("cost") is not None:
+            mm.settle_spend(_res.get("pred"), round(float(_res["cost"]), 4))
         if _res["error"]:
             mm.update_pipeline_item(_iid, status="error", error_msg=_res["error"])
         elif not _valid_ref_image(_fs_url):
@@ -1184,6 +1191,7 @@ def _bg_poller():
                         error_msg=None)
             if _real_cost is not None:          # WaveSpeed reported the true price
                 _upd["gen_cost"] = round(float(_real_cost), 4)
+                mm.settle_spend(_res.get("pred"), round(float(_real_cost), 4))
             mm.update_pipeline_item(_iid, **_upd)
         _changed = True
 
@@ -1217,6 +1225,137 @@ def _bg_poller():
 
 
 # ──────────────────────────────────────────────────────────
+# BULK DOWNLOAD (ZIP)
+# ──────────────────────────────────────────────────────────
+# st.download_button needs its payload at RENDER time, so zipping inline would
+# rebuild the whole archive on every rerun. Two-step instead: one click packs a
+# zip into a temp file (path parked in session_state), the next render just
+# serves it. Videos are written into the archive straight from disk — never
+# loaded into RAM — which is what keeps a 30-clip export from OOM-ing the
+# 1 vCPU / 1 GB container.
+
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=64)
+def _fetch_photo(url: str):
+    """Download a remote face-swap photo → (bytes, extension). Cached, so the
+    per-card download buttons cost one fetch each, not one per rerun."""
+    r = requests.get(url, timeout=45)
+    r.raise_for_status()
+    _ct = (r.headers.get("content-type") or "").lower()
+    _ext = (".png" if "png" in _ct else
+            ".webp" if "webp" in _ct else
+            ".jpeg" if "jpeg" in _ct or "jpg" in _ct else
+            os.path.splitext(url.split("?")[0])[1] or ".jpg")
+    return r.content, _ext
+
+
+def _photo_entries(items=None):
+    """(name, url) for every face-swap photo we hold, whatever stage it's in."""
+    _src = mm.get_pipeline_items() if items is None else items
+    return [(f"{_i['creator']}_{_i['id']}", (_i.get("faceswap_url") or "").strip())
+            for _i in _src
+            if (_i.get("faceswap_url") or "").strip().startswith("http")]
+
+
+def _video_entries(items=None):
+    """(filename, path) for every clean MP4 still on disk."""
+    _src = mm.get_pipeline_items(status="scrubbed") if items is None else items
+    return [(f"whale_{_i['creator']}_{_i['id']}.mp4", _i["scrubbed_path"])
+            for _i in _src
+            if _i.get("scrubbed_path") and os.path.exists(_i["scrubbed_path"])]
+
+
+def _build_zip(photos=(), videos=(), prefix="whale", progress_cb=None):
+    """Pack into a temp .zip → (path, n_ok, failures). ZIP_STORED: mp4/jpg are
+    already compressed, so deflating them only burns CPU we don't have."""
+    import zipfile
+    _tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip", prefix=f"{prefix}_")
+    _tmp.close()
+    _total = len(photos) + len(videos)
+    _n, _fails, _done = 0, [], 0
+    with zipfile.ZipFile(_tmp.name, "w", zipfile.ZIP_STORED) as _z:
+        for _name, _path in videos:
+            try:
+                _z.write(_path, arcname=f"videos/{_name}")
+                _n += 1
+            except Exception as _ze:
+                _fails.append(f"{_name}: {_ze}")
+            _done += 1
+            if progress_cb:
+                progress_cb(_done / max(_total, 1), _name)
+        for _name, _url in photos:
+            try:
+                _data, _ext = _fetch_photo(_url)
+                _z.writestr(f"photos/{_name}{_ext}", _data)
+                _n += 1
+            except Exception as _ze:
+                _fails.append(f"{_name}: {_ze}")
+            _done += 1
+            if progress_cb:
+                progress_cb(_done / max(_total, 1), _name)
+    return _tmp.name, _n, _fails
+
+
+def _zip_ui(key, label, collector, filename, help=None):
+    """Pack-then-download control. `collector()` → (photos, videos) entries."""
+    _slot = f"_zip_{key}"
+    _ready = st.session_state.get(_slot)
+    if _ready and os.path.exists(_ready[0]):
+        _path, _n, _fails = _ready
+        _mb = os.path.getsize(_path) / 1e6
+        with open(_path, "rb") as _zf:
+            st.download_button(
+                f"⬇ Κατέβασε ZIP · {_n} αρχεία ({_mb:.1f} MB)", _zf,
+                file_name=filename, mime="application/zip",
+                key=f"dlz_{key}", use_container_width=True, type="primary")
+        for _f in _fails[:3]:
+            st.caption(f"⚠ {_f[:70]}")
+        if st.button("↻ Φτιάξε το ξανά", key=f"rez_{key}", use_container_width=True):
+            try:
+                os.remove(_path)
+            except OSError:
+                pass
+            st.session_state.pop(_slot, None)
+            st.rerun()
+        return
+    if st.button(label, key=f"mkz_{key}", use_container_width=True, help=help):
+        _ph, _vd = collector()
+        if not (_ph or _vd):
+            st.warning("Δεν υπάρχει τίποτα για κατέβασμα.")
+            return
+        _bar = st.progress(0.0, text="🗜 Ετοιμάζω το ZIP…")
+        try:
+            _res = _build_zip(
+                _ph, _vd, prefix=key,
+                progress_cb=lambda p, n: _bar.progress(
+                    min(p, 1.0), text=f"🗜 {int(p*100)}% · {str(n)[:28]}"))
+        except Exception as _zex:
+            _bar.empty()
+            st.error(f"ZIP απέτυχε: {_zex}")
+            return
+        _bar.empty()
+        st.session_state[_slot] = _res
+        st.rerun()
+
+
+def _photo_dl_button(item, key_prefix="ph"):
+    """One-click download of a single face-swap photo (bytes are cached)."""
+    _u = (item.get("faceswap_url") or "").strip()
+    if not _u.startswith("http"):
+        return
+    try:
+        _data, _ext = _fetch_photo(_u)
+    except Exception:
+        st.link_button("⬇ Photo", _u, use_container_width=True)
+        return
+    _mime = {".png": "image/png", ".webp": "image/webp"}.get(_ext, "image/jpeg")
+    st.download_button(
+        "⬇ Photo", _data,
+        file_name=f"swap_{item['creator']}_{item['id']}{_ext}",
+        mime=_mime,
+        key=f"{key_prefix}_dl_{item['id']}", use_container_width=True)
+
+
+# ──────────────────────────────────────────────────────────
 # MAIN — HEADER + KPI DASHBOARD
 # ──────────────────────────────────────────────────────────
 _bg_poller()
@@ -1236,9 +1375,11 @@ _k_active  = sum(1 for x in _all_kpi if x["status"] in ("swapping", "generating"
 _k_inscrub = sum(1 for x in _all_kpi if x["status"] == "scrubbing")
 _k_done    = sum(1 for x in _all_kpi if x["status"] == "scrubbed")
 
-# ── COST ENGINE: Session Spend computed live from the DB — real WaveSpeed
-#    price where captured, per-model estimate otherwise ──
-_k_spend = ce.session_spend(_all_kpi)
+# ── COST ENGINE: TOTAL spend from the permanent ledger — every paid WaveSpeed
+#    call ever dispatched, photos included, and NOT reduced when an item is
+#    deleted (WaveSpeed already took the money at dispatch) ──
+_k_ledger = mm.spend_summary()
+_k_spend  = _k_ledger["total"]
 
 def _kpi_card(icon, value, label, color, sub):
     return (
@@ -1269,8 +1410,42 @@ with _kc4:
                               f"{_k_done} καθαρά συνολικά"), unsafe_allow_html=True)
 with _kc5:
     with st.container(border=True):
-        st.markdown(_kpi_card("💸", ce.fmt(_k_spend), "Session Spend", "#fbbf24",
-                              "εκτίμηση credits"), unsafe_allow_html=True)
+        st.markdown(_kpi_card("💸", ce.fmt(_k_spend), "Total Spend", "#fbbf24",
+                              f"{_k_ledger['n_photo']} φωτο · "
+                              f"{_k_ledger['n_video']} βίντεο"), unsafe_allow_html=True)
+
+# Money breakdown — spells out that deleted items still count, because
+# WaveSpeed bills at dispatch and nothing gives that back.
+st.markdown(
+    f"<div style='font-size:10px;color:#6b5fa5;text-align:right;margin:2px 0 0'>"
+    f"💸 Σύνολο WaveSpeed: <b style='color:#fbbf24'>{ce.fmt(_k_spend)}</b> — "
+    f"φωτο {ce.fmt(_k_ledger['photo'])} ({_k_ledger['n_photo']}) + "
+    f"βίντεο {ce.fmt(_k_ledger['video'])} ({_k_ledger['n_video']}) · "
+    f"μετράνε ΚΑΙ τα διαγραμμένα (χρεώνονται στο dispatch)</div>",
+    unsafe_allow_html=True,
+)
+
+# ── DOWNLOAD ALL — one archive with every face-swap photo + every clean MP4.
+#    (Photos on their own live in the 🎭 Face Swap tab.)
+_dl_ph_n = sum(1 for _x in _all_kpi
+               if (_x.get("faceswap_url") or "").strip().startswith("http"))
+_dl_vd_n = sum(1 for _x in _all_kpi
+               if _x.get("scrubbed_path") and os.path.exists(_x.get("scrubbed_path") or ""))
+with st.expander(f"⬇ Download All — {_dl_ph_n} φωτο + {_dl_vd_n} καθαρά βίντεο",
+                 expanded=False):
+    _dla1, _dla2, _dla3 = st.columns(3)
+    with _dla1:
+        _zip_ui("all", f"📦 Όλα ({_dl_ph_n + _dl_vd_n})",
+                lambda: (_photo_entries(), _video_entries()),
+                "whale_all.zip", help="Φωτογραφίες + καθαρά βίντεο σε ένα ZIP")
+    with _dla2:
+        _zip_ui("all_photos", f"🖼 Μόνο φωτο ({_dl_ph_n})",
+                lambda: (_photo_entries(), []),
+                "whale_photos.zip", help="Μόνο τα face-swap photos")
+    with _dla3:
+        _zip_ui("all_videos", f"🎬 Μόνο βίντεο ({_dl_vd_n})",
+                lambda: ([], _video_entries()),
+                "whale_videos.zip", help="Μόνο τα καθαρά (scrubbed) MP4")
 
 st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 
@@ -1644,9 +1819,28 @@ with _t_face:
                 st.success(f"✅ {_fok} φωτογραφίες έτοιμες για Swap παρακάτω!")
                 st.rerun()
 
+    # ── DOWNLOAD PHOTOS ONLY ─────────────────────────────────────────
+    # Separate from the dashboard's Download All: here you grab ONLY the
+    # swapped photos — either every one we hold, or just the ones still
+    # waiting for review.
+    _fs_all_photos = _photo_entries()
+    _fs_review     = mm.get_pipeline_items(status="pending_photo_review")
+    _fs_rev_photos = _photo_entries(_fs_review)
+    if _fs_all_photos:
+        with st.expander(f"⬇ Download Photos — {len(_fs_all_photos)} φωτογραφίες",
+                         expanded=False):
+            _fsd1, _fsd2 = st.columns(2)
+            with _fsd1:
+                _zip_ui("fs_photos", f"🖼 Όλες οι φωτο ({len(_fs_all_photos)})",
+                        lambda: (_fs_all_photos, []), "faceswap_photos.zip",
+                        help="Κάθε face-swap φωτογραφία, σε όποιο στάδιο κι αν είναι")
+            with _fsd2:
+                _zip_ui("fs_pending", f"🖼 Μόνο σε review ({len(_fs_rev_photos)})",
+                        lambda: (_fs_rev_photos, []), "faceswap_pending.zip",
+                        help="Μόνο όσες περιμένουν Approve/Recreate")
+
     _render_errors("faceswap")
 
-    _fs_review  = mm.get_pipeline_items(status="pending_photo_review")
     _fs_queue   = mm.get_pipeline_items(status="downloaded")
     _fs_working = mm.get_pipeline_items(status="swapping")
 
@@ -1666,6 +1860,7 @@ with _t_face:
                             st.image(_rv["faceswap_url"], use_container_width=True)
                         except Exception:
                             st.caption("(εικόνα μη διαθέσιμη)")
+                    _photo_dl_button(_rv, key_prefix="rev")
                     _rc1, _rc2, _rc3 = st.columns([2, 2, 1])
                     with _rc1:
                         if st.button("✅ Approve", key=f"rev_ap_{_rv['id']}",
@@ -1690,6 +1885,10 @@ with _t_face:
                                     )
                                     mm.update_pipeline_item(_rv["id"], faceswap_pred=_pid,
                                                             faceswap_url=None)
+                                    # MONEY: a recreate is a NEW paid photo edit
+                                    mm.record_spend(_pid, _rv["id"], kind="photo",
+                                                    model_key="faceswap",
+                                                    amount=ce.photo_cost())
                                     _launch_fs_poll(_rv["id"], _pid)
                                 except Exception as _rce:
                                     mm.update_pipeline_item(_rv["id"], status="error",
@@ -1750,6 +1949,11 @@ with _t_face:
                                      "seed": -1},
                                 )
                                 mm.update_pipeline_item(_fi["id"], faceswap_pred=_pid)
+                                # MONEY: WaveSpeed charges the photo edit NOW —
+                                # ledger it before anything can be deleted
+                                mm.record_spend(_pid, _fi["id"], kind="photo",
+                                                model_key="faceswap",
+                                                amount=ce.photo_cost())
                                 _launch_fs_poll(_fi["id"], _pid)
                             except Exception as _fse:
                                 mm.update_pipeline_item(_fi["id"], status="error",
@@ -1917,6 +2121,8 @@ with _t_gen:
                                     mm.update_pipeline_item(_gi["id"], gen_pred=_gpid,
                                                             model_key=_mk, prompt=_gp,
                                                             gen_cost=_cost_est)
+                                    mm.record_spend(_gpid, _gi["id"], kind="video",
+                                                    model_key=_mk, amount=_cost_est)
                                     _launch_gen_poll(_gi["id"], _gpid,
                                                      src_video=_gi.get("video_path"))
                                 except Exception as _ge:
@@ -2105,6 +2311,11 @@ with _t_audit:
                                     mm.update_pipeline_item(_ai["id"], gen_pred=_rpid,
                                                             gen_url=None, gen_path=None,
                                                             model_key=_rmk, gen_cost=_rcost)
+                                    # MONEY: recreate = a second paid generation.
+                                    # The old pred keeps its own ledger row — both
+                                    # were charged, so both stay counted.
+                                    mm.record_spend(_rpid, _ai["id"], kind="video",
+                                                    model_key=_rmk, amount=_rcost)
                                     _launch_gen_poll(_ai["id"], _rpid,
                                                      src_video=_ai.get("video_path"))
                                 except Exception as _rge:
@@ -2213,7 +2424,16 @@ with _t_audit:
             else:
                 st.caption("Όλα τα καθαρά βίντεο έχουν ήδη μοιραστεί ✅")
 
-        _section_label(f"✅ Clean — {len(_au_done)}", "#4ade80")
+        _cl_hdr1, _cl_hdr2 = st.columns([3, 1])
+        with _cl_hdr1:
+            _section_label(f"✅ Clean — {len(_au_done)}", "#4ade80")
+        with _cl_hdr2:
+            # bulk export of the finished clips — no more one click per video
+            _au_vd = _video_entries(_au_done)
+            if _au_vd:
+                _zip_ui("audit_clean", f"⬇ Download All ({len(_au_vd)})",
+                        lambda: ([], _au_vd), "whale_clean_videos.zip",
+                        help="Όλα τα καθαρά MP4 σε ένα ZIP")
         _ad_cols, _ad_w = _grid(_au_done)
         for _adi, _ad in enumerate(_au_done):
             with _ad_cols[_adi % _ad_w]:

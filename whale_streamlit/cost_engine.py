@@ -28,6 +28,17 @@ MODEL_COST = {
     "seedance": 1.50,    # ~5-s 720p video-edit
 }
 
+# Face-swap photo (qwen-image-2.0-pro/edit) — flat per image. WaveSpeed charges
+# this the moment the swap is submitted, whether or not we keep the result, so
+# it goes straight into the permanent ledger. Overwritten by the real price
+# whenever WaveSpeed reports one back.
+PHOTO_COST = 0.03
+
+
+def photo_cost() -> float:
+    """USD for one face-swap photo edit."""
+    return PHOTO_COST
+
 
 def _clamp(d) -> float:
     try:
@@ -127,11 +138,12 @@ def cost_of_item(item) -> float:
 
 
 def session_spend(items) -> float:
-    """Total spend across every item that dispatched a paid generation call —
-    real price where WaveSpeed reported it, estimate otherwise. Computed live
-    from the DB, so it's immediate (gen_pred set at dispatch), self-correcting
-    (swaps to the real price when the job finishes), and survives restarts.
-    Cancelled/deleted items are gone from the DB, so they never count."""
+    """LEGACY — spend of the items still present in the pipeline.
+
+    Do NOT use this for the dashboard total: it under-reports, because it skips
+    face-swap photos entirely and drops to zero for anything the user deleted
+    (WaveSpeed already charged for those). The dashboard reads the permanent
+    ledger instead — memory_manager.spend_summary(). Kept for per-view subtotals."""
     total = 0.0
     for it in items:
         if it.get("gen_pred") or it.get("gen_path") or it.get("gen_url"):
