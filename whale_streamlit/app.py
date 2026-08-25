@@ -2348,6 +2348,14 @@ with _t_audit:
         with st.container(border=True):
             _section_label("📤 Auto-Distribute to Drive", "#4ade80")
             import datetime as _dt2
+            # ── WHICH PHONES (optional) ──────────────────────────────
+            # Ξε-τσέκαρε ό,τι δεν θες: κρατάς μόνο ένα κινητό → όλα τα
+            # βίντεο πάνε εκεί (Μέρα/Νύχτα, μετά επόμενη μέρα).
+            _phones_sel = st.multiselect(
+                "📱 Κινητά που θα ανέβουν", de.PHONES, default=de.PHONES,
+                key="distrib_phones",
+                help="Προαιρετικό: άφησε τσεκαρισμένα ΜΟΝΟ τα κινητά που θες. "
+                     "Όσα βγάλεις δεν θα πάρουν κανένα βίντεο.")
             _adc1, _adc2 = st.columns([1, 2])
             with _adc1:
                 _start_date = st.date_input("📅 Ημερομηνία εκκίνησης",
@@ -2371,17 +2379,24 @@ with _t_audit:
                         _db_occ.add((_pp[2], _pp[3], _pp[4]))
             with _adc2:
                 _plan = de.plan_distribution(len(_undist), _start_date,
-                                             occupied=_db_occ, times=_times)
+                                             occupied=_db_occ, phones=_phones_sel,
+                                             times=_times)
                 _n_days = (_plan[-1]["day_index"] + 1) if _plan else 0
-                _per_day = len(de.PHONES) * de.PER_DEVICE_PER_DAY
+                # slots/day follows BOTH choices: πόσα κινητά × πόσα slots
+                _n_tod   = len(_times or de.TIMES_OF_DAY)
+                _per_day = len(_phones_sel) * _n_tod
                 st.markdown(
                     f"<div style='font-size:12px;color:#8b81b8;padding-top:6px'>"
                     f"<b style='color:#4ade80'>{len(_undist)}</b> βίντεο προς διανομή · "
-                    f"<b>1 βίντεο/slot · {len(de.PHONES)} phones × 2 (Μέρα+Νύχτα) = {_per_day}/μέρα</b> · "
+                    f"<b>1 βίντεο/slot · {len(_phones_sel)}/{len(de.PHONES)} phones × "
+                    f"{_n_tod} ({'Μέρα+Νύχτα' if _n_tod == 2 else _slot_choice.replace('Μόνο ', '')}) "
+                    f"= {_per_day}/μέρα</b> · "
                     f"~<b style='color:#4ade80'>{_n_days}</b> μέρες (από {_start_date.strftime('%d/%m')})</div>",
                     unsafe_allow_html=True,
                 )
-            if _undist:
+            if _undist and not _phones_sel:
+                st.warning("Διάλεξε τουλάχιστον ένα κινητό για να γίνει η διανομή.")
+            elif _undist:
                 # compact preview of the first few assignments
                 _prev = _plan[:6]
                 _prev_txt = " · ".join(
@@ -2397,7 +2412,9 @@ with _t_audit:
                         # check the REAL Drive so we never double-fill a slot
                         _drive_occ = de.get_occupied_slots(_conf)
                         _full_plan = de.plan_distribution(len(_undist), _start_date,
-                                                          occupied=_drive_occ, times=_times)
+                                                          occupied=_drive_occ,
+                                                          phones=_phones_sel,
+                                                          times=_times)
                         _dbar = st.progress(0, text="📤 Distributing…")
                         _ok, _fail = 0, []
                         for _vi, (_vid, _slot) in enumerate(zip(_undist, _full_plan)):
@@ -2416,6 +2433,10 @@ with _t_audit:
                             except Exception as _de2:
                                 _fail.append(f"#{_vid['id']}: {_de2}")
                         _dbar.empty()
+                        if len(_full_plan) < len(_undist):
+                            st.warning(f"Δεν χώρεσαν όλα: βρέθηκαν {len(_full_plan)} ελεύθερα "
+                                       f"slots για {len(_undist)} βίντεο — τα υπόλοιπα έμειναν "
+                                       f"αδιάθετα (πρόσθεσε κινητά ή slots).")
                         if _ok:
                             st.success(f"✅ {_ok} βίντεο μοιράστηκαν στους φακέλους στο Drive!")
                         for _f in _fail[:5]:

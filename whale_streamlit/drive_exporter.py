@@ -82,6 +82,11 @@ def plan_distribution(n_videos, start_date, occupied=None, phones=None,
     video (checked from Drive). Those slots are SKIPPED, so re-running never
     double-fills a folder — it just flows to the next free slot / next day.
 
+    `phones` = which devices to fill, e.g. only the two you actually want to
+    post from. None = every device in PHONES. An EMPTY list means "no device
+    selected" and returns an empty plan — it must NEVER fall back to all
+    phones, or deselecting everything would upload everywhere.
+
     `times` = which slots to fill, e.g. ["Μερα"] to fill ONLY day, ["Νυχτα"]
     only night, or None for both (Μερα then Νυχτα). Combined with `occupied`,
     picking "Νυχτα" after the days are done fills tonight then rolls to tomorrow.
@@ -97,8 +102,12 @@ def plan_distribution(n_videos, start_date, occupied=None, phones=None,
     Returns [{device, date_str, time_of_day, day_index}, …], one per video.
     """
     from datetime import timedelta
-    phones = phones or PHONES
-    times = times or TIMES_OF_DAY
+    # None = "not specified" → the full default. [] = "explicitly nothing" →
+    # empty plan. Conflating the two would silently post to every phone.
+    phones = list(PHONES) if phones is None else list(phones)
+    times = list(TIMES_OF_DAY) if times is None else list(times)
+    if not (phones and times and n_videos > 0):
+        return []
     occ = set(occupied or ())
     plan = []
     day_off = 0
