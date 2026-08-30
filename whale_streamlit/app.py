@@ -2576,14 +2576,14 @@ with _t_audit:
                                             value=st.session_state.get("_distrib_start", _dt2.date.today()),
                                             key="distrib_start_input")
                 st.session_state["_distrib_start"] = _start_date
-                # Κάθε κινητό έχει τις δικές του 2 ώρες — εδώ διαλέγεις ΠΟΙΕΣ
-                # ώρες θα γεμίσουν. Ένα κινητό μπαίνει στο πλάνο μόνο για τις
-                # δικές του ώρες που είναι τσεκαρισμένες εδώ.
-                _times = st.multiselect(
-                    "🕐 Ώρες που θα γεμίσουν", de.ALL_TIMES, default=de.ALL_TIMES,
-                    key="distrib_hours",
-                    help="π.χ. αν ανέβηκαν ήδη οι μεσημεριανές, κράτα μόνο "
-                         "22:00/23:00/00:00 για να γεμίσουν τα βραδινά.")
+                # Κάθε κινητό παίρνει ΜΙΑ ώρα: τη Βασική (με το *) ή τη Μη
+                # Βασική. Το * δείχνει την ώρα που δόθηκε πρώτη, ανεξάρτητα
+                # από τη χρονολογική σειρά εμφάνισης.
+                _mode = st.radio(
+                    "🕐 Ώρα ανά κινητό", de.SLOT_MODES, key="distrib_mode",
+                    horizontal=True,
+                    help="Βασική Ώρα = η ώρα με το * · Μη Βασική Ώρα = η άλλη. "
+                         "Κάθε κινητό ανεβάζει 1 βίντεο την ημέρα.")
             # slots already used (from what THIS app distributed) — for the preview
             _db_occ = set()
             for _v in _all_kpi:
@@ -2595,27 +2595,37 @@ with _t_audit:
             with _adc2:
                 _plan = de.plan_distribution(len(_undist), _start_date,
                                              occupied=_db_occ, phones=_phones_sel,
-                                             hours=_times)
+                                             mode=_mode)
                 _n_days = (_plan[-1]["day_index"] + 1) if _plan else 0
-                # slots/day = πόσες ΩΡΕΣ έχει συνολικά η επιλογή κινητών
-                _per_day = de.slots_per_day(_phones_sel, _times)
+                # slots/μέρα = ένα ανά επιλεγμένο κινητό
+                _per_day = de.slots_per_day(_phones_sel)
+                # ποιο κινητό ανεβάζει τι ώρα — ΜΕ ΣΕΙΡΑ, το πρωινό πρώτο
+                _sched = sorted(
+                    ((de.time_for(_d, _mode), _d) for _d in _phones_sel),
+                    key=lambda _hd: (de._hour_key(_hd[0]),
+                                     de.PHONES.index(_hd[1]) if _hd[1] in de.PHONES else 99))
+                _hrs_txt = "<br>".join(
+                    f"<b style='color:#4ade80'>{_h}</b> · "
+                    f"ΚΙΝΗΤΟ {de.PHONES.index(_d) + 1 if _d in de.PHONES else '?'} · {_d}"
+                    for _h, _d in _sched) or "—"
                 st.markdown(
                     f"<div style='font-size:12px;color:#8b81b8;padding-top:6px'>"
                     f"<b style='color:#4ade80'>{len(_undist)}</b> βίντεο προς διανομή · "
-                    f"<b>1 βίντεο/ώρα · {len(_phones_sel)}/{len(de.PHONES)} κινητά · "
-                    f"{', '.join(_times) if _times else '—'} "
-                    f"= {_per_day}/μέρα</b> · "
-                    f"~<b style='color:#4ade80'>{_n_days}</b> μέρες (από {_start_date.strftime('%d/%m')})</div>",
+                    f"<b>{_mode} · 1 βίντεο/κινητό · "
+                    f"{len(_phones_sel)}/{len(de.PHONES)} κινητά = {_per_day}/μέρα</b> · "
+                    f"~<b style='color:#4ade80'>{_n_days}</b> μέρες (από {_start_date.strftime('%d/%m')})"
+                    f"<div style='font-size:11px;color:#8b81b8;margin-top:6px;line-height:1.7'>"
+                    f"{_hrs_txt}</div></div>",
                     unsafe_allow_html=True,
                 )
-            if _undist and not (_phones_sel and _times):
-                st.warning("Διάλεξε τουλάχιστον ένα κινητό ΚΑΙ μία ώρα για να γίνει η διανομή.")
+            if _undist and not _phones_sel:
+                st.warning("Διάλεξε τουλάχιστον ένα κινητό για να γίνει η διανομή.")
             elif _undist:
                 # compact preview of the first few assignments
                 _prev = _plan[:6]
                 _prev_txt = " · ".join(
-                    f"{i+1}→ΚΙΝ{de.PHONES.index(p['device']) + 1 if p['device'] in de.PHONES else '?'}"
-                    f"/{p['date_str'][5:]}/{p['time_of_day']}"
+                    f"{i+1}→ΚΙΝ{de.PHONES.index(p['device']) + 1 if p['device'] in de.PHONES else '?'} "
+                    f"{p['device']} / {p['date_str'][5:]} / {p['time_of_day']}"
                     for i, p in enumerate(_prev))
                 st.caption(f"Πρώτα: {_prev_txt}{' …' if len(_undist) > 6 else ''}")
                 if st.button(f"📤 Distribute All ({len(_undist)} βίντεο)",
@@ -2629,13 +2639,13 @@ with _t_audit:
                         _full_plan = de.plan_distribution(len(_undist), _start_date,
                                                           occupied=_drive_occ,
                                                           phones=_phones_sel,
-                                                          hours=_times)
+                                                          mode=_mode)
                         _dbar = st.progress(0, text="📤 Distributing…")
                         _ok, _fail = 0, []
                         for _vi, (_vid, _slot) in enumerate(zip(_undist, _full_plan)):
                             _dbar.progress(_vi / len(_undist),
                                            text=f"📤 [{_vi+1}/{len(_undist)}] "
-                                                f"{_slot['device'].split('-')[0]} · "
+                                                f"{_slot['device']} · "
                                                 f"{_slot['date_str']} · {_slot['time_of_day']}")
                             try:
                                 _r = de.upload_video(
@@ -2717,8 +2727,12 @@ with _t_audit:
                                     key=f"exp_dev_{_ad['id']}")
                                 # οι ώρες ακολουθούν το κινητό που διάλεξες
                                 _exp_tod = st.selectbox(
-                                    "🕐 Ώρα", de.device_times(_exp_dev),
-                                    key=f"exp_tod_{_ad['id']}_{_exp_dev}")
+                                    "🕐 Ώρα", de.SLOT_MODES,
+                                    format_func=lambda _m, _d=_exp_dev: (
+                                        f"{de.time_for(_d, _m)}"
+                                        f"{'*' if _m == de.MODE_PRIMARY else ''} · {_m}"),
+                                    key=f"exp_mode_{_ad['id']}_{_exp_dev}")
+                                _exp_tod = de.time_for(_exp_dev, _exp_tod)
                                 _prev_link = st.session_state.get(
                                     f"drive_link_{_ad['id']}")
                                 if _prev_link:
