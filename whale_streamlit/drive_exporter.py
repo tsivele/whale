@@ -12,7 +12,7 @@ Why rclone (and not a custom Google Cloud OAuth app):
 Uploads approved & scrubbed videos into a strict, dynamically-created
 hierarchy inside the user's own Google Drive:
 
-    T-WHALES / [Creator] / [Device] / [Date YYYY-MM-DD] / [Time of Day] / final_video.mp4
+    T-WHALES / [Creator] / [Device] / [Date YYYY-MM-DD] / [Ώρα HH:MM] / final_video.mp4
 
 Setup (one-time):
   1. Locally:  rclone authorize "drive"   → click Allow → copy the token JSON.
@@ -50,81 +50,154 @@ DRIVE_CREATOR_FOLDER = {
     "MELINA": "Melina",
 }
 
+# Listed in ΚΙΝΗΤΟ 1..5 order — the numbering the phones are known by.
 DEVICE_MAP = {
     "SOFIA": [
         "iPhoneXs-Μαυρο με 70 ευρο ταμπελακι",
         "iPhoneSE-Καλη κατασταση μαυρο",
     ],
     "MELINA": [
-        "iPhone11-Με θυκη",
-        "iPhoneXs-Το κινητο με το Μ πισω το σπασμενο",
-        "iPhone8-Ασπρο Ροζε",
-        "iPhoneSE(Μαυρο με κουμπι)",
-        "iPhoneXs(7ευρο λεει πισω)",
+        "iPhone8-Ασπρο Ροζε",                          # ΚΙΝΗΤΟ 1
+        "iPhoneXs-Το κινητο με το Μ πισω το σπασμενο",  # ΚΙΝΗΤΟ 2
+        "iPhone11-Με θυκη",                            # ΚΙΝΗΤΟ 3
+        "iPhoneSE(Μαυρο με κουμπι)",                   # ΚΙΝΗΤΟ 4
+        "iPhoneXs(7ευρο λεει πισω)",                   # ΚΙΝΗΤΟ 5
     ],
 }
 
-TIMES_OF_DAY = ["Μερα", "Νυχτα"]
+# ── POSTING HOURS ────────────────────────────────────────────────────────────
+# Each phone posts at its OWN two hours, and the hour IS the Drive folder:
+#     T-WHALES/Melina/iPhone8-Ασπρο Ροζε/2026-09-01/13:00/whale_42.mp4
+# (This replaced the old generic Μερα/Νυχτα folders.)
+DEVICE_TIMES = {
+    "iPhone8-Ασπρο Ροζε":                          ["13:00", "19:00"],
+    "iPhoneXs-Το κινητο με το Μ πισω το σπασμενο":  ["13:00", "00:00"],
+    "iPhone11-Με θυκη":                            ["22:00", "10:00"],
+    "iPhoneSE(Μαυρο με κουμπι)":                   ["10:00", "23:00"],
+    "iPhoneXs(7ευρο λεει πισω)":                   ["22:00", "10:00"],
+}
+
+# The Instagram account each phone posts from (display only — never a folder).
+DEVICE_ACCOUNT = {
+    "iPhone8-Ασπρο Ροζε":                          "melin_ioannou",
+    "iPhoneXs-Το κινητο με το Μ πισω το σπασμενο":  "melinaki.ioann",
+    "iPhone11-Με θυκη":                            "melin.ioannou",
+    "iPhoneSE(Μαυρο με κουμπι)":                   "yourcutemel",
+    "iPhoneXs(7ευρο λεει πισω)":                   "ikoritsara",
+}
+
+# Fallback for any phone with no hours of its own (e.g. the SOFIA devices).
+DEFAULT_TIMES = ["13:00", "22:00"]
+
+# Old folder names — still accepted on upload so anything already sitting in
+# Drive under Μερα/Νυχτα keeps validating.
+LEGACY_TIMES = ["Μερα", "Νυχτα"]
+TIMES_OF_DAY = LEGACY_TIMES          # back-compat alias for older callers
 
 # The phones for auto-distribution, in fill order. Single source of truth =
 # DEVICE_MAP["MELINA"] so the manual dropdown and the scheduler never diverge.
 PHONES = DEVICE_MAP["MELINA"]
 
-PER_DEVICE_PER_DAY = 2   # exactly 2 videos/device/date: 1 Μερα + 1 Νυχτα
+PER_DEVICE_PER_DAY = 2   # exactly 2 videos/device/date — one per posting hour
+
+
+def device_times(device) -> list:
+    """The two posting hours for `device` (its own, or the default pair)."""
+    return list(DEVICE_TIMES.get(device, DEFAULT_TIMES))
+
+
+def _hour_key(hour: str):
+    """Sort key that reads a day the way a person does: 10:00 → 13:00 → 19:00
+    → 23:00 → 00:00. Anything before 06:00 is LATE night, so it sorts at the
+    end of its date instead of jumping to the front."""
+    try:
+        h, m = (int(x) for x in str(hour).split(":")[:2])
+    except (ValueError, TypeError):
+        return (99, 99)
+    return (h + 24, m) if h < 6 else (h, m)
+
+
+ALL_TIMES = sorted({t for d in PHONES for t in device_times(d)}, key=_hour_key)
+
+
+def device_label(device) -> str:
+    """'ΚΙΝΗΤΟ 3 · melin.ioannou · 22:00/10:00' — for the pickers, so a phone is
+    recognisable without decoding its folder name."""
+    _hrs = "/".join(device_times(device))
+    _acc = DEVICE_ACCOUNT.get(device)
+    try:
+        _num = f"ΚΙΝΗΤΟ {PHONES.index(device) + 1} · "
+    except ValueError:
+        _num = ""
+    return f"{_num}{_acc + ' · ' if _acc else ''}{device} · {_hrs}"
 
 
 def plan_distribution(n_videos, start_date, occupied=None, phones=None,
-                      times=None, max_days=730):
-    """Assign n videos to (device, date, Μερα/Νυχτα) slots — EXACTLY ONE video
-    per slot. Fills every device for a date before the date advances by 1.
+                      hours=None, max_days=730, times=None):
+    """Assign n videos to (device, date, hour) slots — EXACTLY ONE video per
+    slot. Every phone posts at its OWN two hours (see DEVICE_TIMES), and the
+    hour is the Drive folder.
 
-    `occupied` = a set of (device, date_str, time_of_day) that ALREADY hold a
-    video (checked from Drive). Those slots are SKIPPED, so re-running never
+    `occupied` = a set of (device, date_str, hour) that ALREADY holds a video
+    (read back from Drive). Those slots are SKIPPED, so re-running never
     double-fills a folder — it just flows to the next free slot / next day.
 
-    `phones` = which devices to fill, e.g. only the two you actually want to
-    post from. None = every device in PHONES. An EMPTY list means "no device
-    selected" and returns an empty plan — it must NEVER fall back to all
-    phones, or deselecting everything would upload everywhere.
+    `phones` = which devices to fill. None = every device in PHONES. An EMPTY
+    list means "no device selected" and returns an empty plan — it must NEVER
+    fall back to all phones, or deselecting everything would upload everywhere.
 
-    `times` = which slots to fill, e.g. ["Μερα"] to fill ONLY day, ["Νυχτα"]
-    only night, or None for both (Μερα then Νυχτα). Combined with `occupied`,
-    picking "Νυχτα" after the days are done fills tonight then rolls to tomorrow.
+    `hours` = which posting hours to fill, e.g. ["22:00", "23:00"] for the late
+    slots only. A phone contributes a slot only for its own hours that are in
+    this list. None = every hour. (`times` is the old argument name and still
+    works.)
 
-    Fill order per date: ALL devices get their first slot, then ALL devices the
-    second; only then does the date advance.
+    Fill order inside a date is CHRONOLOGICAL — 10:00, 13:00, 19:00, 22:00,
+    23:00, then 00:00 as the late-night slot — so the videos go out in the same
+    order a person would post them.
 
-    Example — start 2026-07-27, 5 phones, nothing occupied:
-        07-27 Μερα:  phone1..phone5   (5 videos)
-        07-27 Νυχτα: phone1..phone5   (5 videos)   → 10/date
-        07-28 …same… If a slot is taken, it's skipped and rolls to the next day.
+    Example — start 2026-09-01, all 5 phones, nothing occupied:
+        09-01 10:00 → ΚΙΝΗΤΟ 3, ΚΙΝΗΤΟ 4, ΚΙΝΗΤΟ 5
+        09-01 13:00 → ΚΙΝΗΤΟ 1, ΚΙΝΗΤΟ 2
+        09-01 19:00 → ΚΙΝΗΤΟ 1 … and so on, 10 slots/date.
 
     Returns [{device, date_str, time_of_day, day_index}, …], one per video.
+    `time_of_day` holds the hour, so every caller downstream is unchanged.
     """
     from datetime import timedelta
     # None = "not specified" → the full default. [] = "explicitly nothing" →
     # empty plan. Conflating the two would silently post to every phone.
     phones = list(PHONES) if phones is None else list(phones)
-    times = list(TIMES_OF_DAY) if times is None else list(times)
-    if not (phones and times and n_videos > 0):
+    if hours is None:
+        hours = times                      # legacy argument name
+    hours = list(ALL_TIMES) if hours is None else list(hours)
+    if not (phones and hours and n_videos > 0):
+        return []
+    # every (hour, device) pair this run may use, in chronological order
+    slots = [(h, d) for d in phones for h in device_times(d) if h in hours]
+    slots.sort(key=lambda hd: (_hour_key(hd[0]), phones.index(hd[1])))
+    if not slots:
         return []
     occ = set(occupied or ())
     plan = []
     day_off = 0
     while len(plan) < n_videos and day_off < max_days:
         date_str = (start_date + timedelta(days=day_off)).strftime("%Y-%m-%d")
-        for tod in times:                            # ALL devices this slot, THEN next slot
-            for device in phones:
-                if len(plan) >= n_videos:
-                    break
-                if (device, date_str, tod) in occ:   # slot already has a video → skip
-                    continue
-                plan.append({"device": device, "date_str": date_str,
-                             "time_of_day": tod, "day_index": day_off})
+        for _hour, device in slots:
             if len(plan) >= n_videos:
                 break
+            if (device, date_str, _hour) in occ:   # slot already has a video
+                continue
+            plan.append({"device": device, "date_str": date_str,
+                         "time_of_day": _hour, "day_index": day_off})
         day_off += 1
     return plan
+
+
+def slots_per_day(phones=None, hours=None) -> int:
+    """How many videos fit in one date for this phone/hour selection."""
+    phones = list(PHONES) if phones is None else list(phones)
+    hours = list(ALL_TIMES) if hours is None else list(hours)
+    return sum(1 for d in phones for h in device_times(d) if h in hours)
 
 
 def get_occupied_slots(rclone_conf) -> set:
@@ -144,7 +217,7 @@ def get_occupied_slots(rclone_conf) -> set:
             capture_output=True, text=True, timeout=120)
         if r.returncode == 0:
             for line in r.stdout.splitlines():
-                # relative to T-WHALES: Melina/Device/Date/Μερα|Νυχτα/file.mp4
+                # relative to T-WHALES: Melina/Device/Date/HH:MM/file.mp4
                 parts = line.strip().split("/")
                 if len(parts) >= 5:
                     occupied.add((parts[1], parts[2], parts[3]))
@@ -185,9 +258,11 @@ def validate_metadata(creator: str, device: str, date_str: str, time_of_day: str
     if not _DATE_RE.match(date_str or ""):
         raise DriveExportError(
             f"Μη έγκυρη ημερομηνία {date_str!r} — μορφή YYYY-MM-DD (π.χ. 2026-07-20)")
-    if time_of_day not in TIMES_OF_DAY:
+    _allowed = device_times(device) + LEGACY_TIMES
+    if time_of_day not in _allowed:
         raise DriveExportError(
-            f"Μη έγκυρο Time of Day {time_of_day!r} — επιτρέπονται: {TIMES_OF_DAY}")
+            f"Μη έγκυρη ώρα {time_of_day!r} για {device!r} — "
+            f"επιτρέπονται: {device_times(device)}")
     return DRIVE_CREATOR_FOLDER[_c], device, date_str, time_of_day
 
 

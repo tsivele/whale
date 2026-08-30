@@ -1356,6 +1356,204 @@ def _photo_dl_button(item, key_prefix="ph"):
 
 
 # ──────────────────────────────────────────────────────────
+# BULK ACTIONS (one button per section — Scrub-All style)
+# ──────────────────────────────────────────────────────────
+# Every stage gets the same three verbs where they make sense: SEND (advance
+# the whole queue), DOWNLOAD (one archive), DELETE (purge the whole section).
+# Anything irreversible or PAID is armed first and fired second, so a stray
+# click can never purge a tab or dispatch a batch of paid jobs.
+
+def _confirm_action(key, label, confirm_label, help=None, kind="secondary"):
+    """Two-stage button: first click arms it, second click fires. Returns True
+    only on the confirming click."""
+    _flag = f"_armed_{key}"
+    if st.session_state.get(_flag):
+        _c1, _c2 = st.columns([4, 1])
+        with _c1:
+            _go = st.button(confirm_label, key=f"go_{key}", type="primary",
+                            use_container_width=True)
+        with _c2:
+            if st.button("✖", key=f"no_{key}", use_container_width=True, help="Άκυρο"):
+                st.session_state.pop(_flag, None)
+                st.rerun()
+        if _go:
+            st.session_state.pop(_flag, None)
+            return True
+        return False
+    if st.button(label, key=f"arm_{key}", use_container_width=True,
+                 help=help, type=kind):
+        st.session_state[_flag] = True
+        st.rerun()
+    return False
+
+
+def _delete_all_button(items, key, what="items"):
+    """🗑 Delete All for one section — full purge (DB row + local files).
+    The spend ledger is untouched: WaveSpeed already charged for these."""
+    if not items:
+        return
+    if _confirm_action(key, f"🗑 Delete All ({len(items)})",
+                       f"⚠ ΝΑΙ — σβήσε {len(items)}",
+                       help=f"Πλήρες purge: {len(items)} {what} + τα αρχεία τους. "
+                            f"Τα λεφτά που ξοδεύτηκαν ΜΕΝΟΥΝ στο Total Spend."):
+        _bar = st.progress(0.0, text="🗑 Διαγράφω…")
+        for _di, _dit in enumerate(items):
+            mm.delete_pipeline_item(_dit["id"])
+            _bar.progress((_di + 1) / len(items),
+                          text=f"🗑 {_di + 1}/{len(items)}")
+        _bar.empty()
+        st.rerun()
+
+
+# One-click downloads are capped: st.download_button holds the whole payload in
+# the session's media store on every render, so a 100 MB+ archive would sit in
+# RAM on a 1 GB container. Under the cap → real one-click button. Over it →
+# pack once, then download (the two-step keeps the container alive).
+_ONE_CLICK_MAX = 60 * 1024 * 1024
+_PHOTO_EST     = 300_000          # rough bytes per face-swap photo
+
+
+@st.cache_data(show_spinner="🗜 Ετοιμάζω το ZIP…", max_entries=3)
+def _zip_cached(sig, _photos, _videos, prefix):
+    """Build (and remember) the archive for one exact set of items.
+
+    `sig` alone is the cache key (the _-prefixed payloads are excluded from
+    hashing by Streamlit), and it carries each video's size — so a re-scrubbed
+    clip that reuses its path still invalidates the archive."""
+    return _build_zip(list(_photos), list(_videos), prefix=prefix)
+
+
+def _download_all_button(key, label, photos=(), videos=(), filename="whale.zip",
+                         help=None):
+    """⬇ Download All for one section, in the same slot as 🧹 Scrub All."""
+    photos, videos = tuple(photos), tuple(videos)
+    if not (photos or videos):
+        return
+    _size = len(photos) * _PHOTO_EST
+    for _n, _p in videos:
+        try:
+            _size += os.path.getsize(_p)
+        except OSError:
+            pass
+    if _size > _ONE_CLICK_MAX:
+        # too big to keep in RAM — pack first, then serve
+        _zip_ui(key, f"{label} · {_size/1e6:.0f} MB",
+                lambda: (list(photos), list(videos)), filename, help=help)
+        return
+    _sig = (tuple(_n for _n, _ in photos),
+            tuple((_n, os.path.getsize(_p)) for _n, _p in videos
+                  if os.path.exists(_p)))
+    _path, _n_ok, _fails = _zip_cached(_sig, photos, videos, key)
+    if not os.path.exists(_path):        # temp file swept by the OS → rebuild
+        _zip_cached.clear()
+        st.rerun()
+    with open(_path, "rb") as _zf:
+        st.download_button(label, _zf, file_name=filename,
+                           mime="application/zip", key=f"dl1_{key}",
+                           use_container_width=True, type="primary", help=help)
+    for _f in _fails[:2]:
+        st.caption(f"⚠ {_f[:70]}")
+
+
+# ── PAID DISPATCH (single source of truth, shared by 1-click and batch) ──────
+# Both the per-card buttons and the *All buttons go through these, so the
+# pre-flight checks that protect credits can never drift apart between them.
+
+def _dispatch_swap(item) -> str:
+    """Submit ONE face swap and ledger the charge. The item must already be
+    claimed into 'swapping'. Raises on failure — caller marks it errored."""
+    _cb = (st.session_state["creator2_bytes"] if item["creator"] == "MELINA"
+           else st.session_state["creator_bytes"])
+    with open(item["frame_path"], "rb") as _ffr:
+        _fb = to_b64(_ffr.read())
+    _pid = ws_submit(
+        "wavespeed-ai/qwen-image-2.0-pro/edit",
+        {"images": [to_b64(_cb), _fb],
+         "prompt": st.session_state.get("_fs_prompt", DEFAULT_FACE_SWAP_PROMPT),
+         "seed": -1},
+    )
+    mm.update_pipeline_item(item["id"], faceswap_pred=_pid, faceswap_url=None)
+    # MONEY: WaveSpeed charges the photo edit NOW — ledger it before anything
+    # can be deleted
+    mm.record_spend(_pid, item["id"], kind="photo", model_key="faceswap",
+                    amount=ce.photo_cost())
+    _launch_fs_poll(item["id"], _pid)
+    return _pid
+
+
+def _dispatch_generation(item, model_key, prompt, ref_img=None):
+    """Submit ONE paid video generation and ledger the charge → (pred, cost).
+
+    PRE-FLIGHT: an invalid reference or a missing source raises BEFORE any
+    network call, so a bad item burns 0 credits. The item must already be
+    claimed into 'generating'."""
+    _ref = (ref_img if ref_img is not None else (item.get("faceswap_url") or "")).strip()
+    if not _valid_ref_image(_ref):
+        raise RuntimeError(
+            "Error: Missing reference image for video edit — "
+            "το αίτημα ΔΕΝ στάλθηκε (0 credits).")
+    _vp = item.get("video_path")
+    _has_vid = bool(_vp and os.path.exists(_vp))
+    if model_key == "kling":
+        if not _has_vid:
+            raise RuntimeError("Το αρχικό video λείπει — δεν γίνεται Kling.")
+        _kv = _vp
+        if os.path.getsize(_kv) > 8 * 1024 * 1024:
+            _kv = _transcode_720(_kv)
+        with open(_kv, "rb") as _gfv:
+            _pid = ws_submit(
+                "kwaivgi/kling-v3.0-pro/motion-control",
+                {"image": _ref, "video": to_b64(_gfv.read(), mime="video/mp4"),
+                 "prompt": prompt, "duration": 5,
+                 "aspect_ratio": "9:16", "cfg_scale": 0.5, "seed": -1})
+        _cost = ce.kling_cost(_cached_duration(_vp))
+    elif _has_vid:
+        # VIDEO-EDIT (v2v) — helper does its own validation + payload mapping
+        _pid = _submit_video_edit(_vp, _ref, prompt)
+        _cost = ce.seedance_cost(_cached_duration(_vp))
+    else:
+        # no source video (e.g. vault-only photo) → graceful i2v fallback
+        _pid = ws_submit(
+            "bytedance/seedance-2.0/image-to-video",
+            {"image": _ref, "prompt": prompt, "duration": 5,
+             "resolution": "720p", "seed": -1})
+        _cost = ce.seedance_cost(5)
+    mm.record_spend(_pid, item["id"], kind="video", model_key=model_key,
+                    amount=_cost)
+    return _pid, _cost
+
+
+def _batch_dispatch(items, from_status, to_status, fn, bar_label):
+    """Claim → dispatch every item in a section, one at a time.
+
+    Claiming is atomic per item, so a racing click (or a second tab) can never
+    double-dispatch the same job. A failure lands on that one card as an error;
+    the rest of the batch keeps going."""
+    _bar = st.progress(0.0, text=f"{bar_label}…")
+    _ok, _skip, _fail = 0, 0, []
+    for _bi, _bit in enumerate(items):
+        _bar.progress((_bi + 1) / len(items),
+                      text=f"{bar_label} {_bi + 1}/{len(items)}")
+        if not mm.claim_pipeline_item(_bit["id"], from_status, to_status):
+            _skip += 1
+            continue
+        try:
+            fn(_bit)
+            _ok += 1
+        except Exception as _bex:
+            mm.update_pipeline_item(_bit["id"], status="error", error_msg=str(_bex))
+            _fail.append(f"#{_bit['id']}: {_bex}")
+    _bar.empty()
+    if _ok:
+        st.success(f"✅ {_ok} στάλθηκαν!")
+    if _skip:
+        st.info(f"↷ {_skip} παραλείφθηκαν (ήδη σε επεξεργασία).")
+    for _f in _fail[:3]:
+        st.error(_f[:160])
+    return _ok
+
+
+# ──────────────────────────────────────────────────────────
 # MAIN — HEADER + KPI DASHBOARD
 # ──────────────────────────────────────────────────────────
 _bg_poller()
@@ -1435,17 +1633,18 @@ with st.expander(f"⬇ Download All — {_dl_ph_n} φωτο + {_dl_vd_n} καθ�
                  expanded=False):
     _dla1, _dla2, _dla3 = st.columns(3)
     with _dla1:
-        _zip_ui("all", f"📦 Όλα ({_dl_ph_n + _dl_vd_n})",
-                lambda: (_photo_entries(), _video_entries()),
-                "whale_all.zip", help="Φωτογραφίες + καθαρά βίντεο σε ένα ZIP")
+        _download_all_button("all", f"📦 Όλα ({_dl_ph_n + _dl_vd_n})",
+                             photos=_photo_entries(), videos=_video_entries(),
+                             filename="whale_all.zip",
+                             help="Φωτογραφίες + καθαρά βίντεο σε ένα ZIP")
     with _dla2:
-        _zip_ui("all_photos", f"🖼 Μόνο φωτο ({_dl_ph_n})",
-                lambda: (_photo_entries(), []),
-                "whale_photos.zip", help="Μόνο τα face-swap photos")
+        _download_all_button("all_photos", f"🖼 Μόνο φωτο ({_dl_ph_n})",
+                             photos=_photo_entries(), filename="whale_photos.zip",
+                             help="Μόνο τα face-swap photos")
     with _dla3:
-        _zip_ui("all_videos", f"🎬 Μόνο βίντεο ({_dl_vd_n})",
-                lambda: ([], _video_entries()),
-                "whale_videos.zip", help="Μόνο τα καθαρά (scrubbed) MP4")
+        _download_all_button("all_videos", f"🎬 Μόνο βίντεο ({_dl_vd_n})",
+                             videos=_video_entries(), filename="whale_videos.zip",
+                             help="Μόνο τα καθαρά (scrubbed) MP4")
 
 st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 
@@ -1743,7 +1942,13 @@ with _t_disc:
     if not _all_items:
         st.info("Δεν υπάρχουν items ακόμα. Πρόσθεσε URLs παραπάνω — μετά συνέχισε στο 🎭 Face Swap tab.")
     else:
-        _section_label("📊 Pipeline Overview")
+        _ovh1, _ovh2 = st.columns([5, 2])
+        with _ovh1:
+            _section_label("📊 Pipeline Overview")
+        with _ovh2:
+            # the global wipe: every item in EVERY stage (face swap, generation,
+            # audit) — the spend ledger survives it
+            _delete_all_button(_all_items, "global_del", "items σε ΟΛΑ τα stages")
         _by_status = {}
         for _it in _all_items:
             _by_status.setdefault(_it["status"], []).append(_it)
@@ -1819,28 +2024,9 @@ with _t_face:
                 st.success(f"✅ {_fok} φωτογραφίες έτοιμες για Swap παρακάτω!")
                 st.rerun()
 
-    # ── DOWNLOAD PHOTOS ONLY ─────────────────────────────────────────
-    # Separate from the dashboard's Download All: here you grab ONLY the
-    # swapped photos — either every one we hold, or just the ones still
-    # waiting for review.
-    _fs_all_photos = _photo_entries()
-    _fs_review     = mm.get_pipeline_items(status="pending_photo_review")
-    _fs_rev_photos = _photo_entries(_fs_review)
-    if _fs_all_photos:
-        with st.expander(f"⬇ Download Photos — {len(_fs_all_photos)} φωτογραφίες",
-                         expanded=False):
-            _fsd1, _fsd2 = st.columns(2)
-            with _fsd1:
-                _zip_ui("fs_photos", f"🖼 Όλες οι φωτο ({len(_fs_all_photos)})",
-                        lambda: (_fs_all_photos, []), "faceswap_photos.zip",
-                        help="Κάθε face-swap φωτογραφία, σε όποιο στάδιο κι αν είναι")
-            with _fsd2:
-                _zip_ui("fs_pending", f"🖼 Μόνο σε review ({len(_fs_rev_photos)})",
-                        lambda: (_fs_rev_photos, []), "faceswap_pending.zip",
-                        help="Μόνο όσες περιμένουν Approve/Recreate")
-
     _render_errors("faceswap")
 
+    _fs_review  = mm.get_pipeline_items(status="pending_photo_review")
     _fs_queue   = mm.get_pipeline_items(status="downloaded")
     _fs_working = mm.get_pipeline_items(status="swapping")
 
@@ -1849,7 +2035,29 @@ with _t_face:
 
     # ── REVIEW QUEUE (pending_photo_review) ──────────────────────
     if _fs_review:
-        _section_label(f"🖼️ Photo Review — {len(_fs_review)} pending", "#c084fc")
+        # ── SECTION BAR: send everything on / grab the photos / wipe it ──
+        _rvh1, _rvh2, _rvh3, _rvh4 = st.columns([3, 2, 2, 2])
+        with _rvh1:
+            _section_label(f"🖼️ Photo Review — {len(_fs_review)} pending", "#c084fc")
+        with _rvh2:
+            if st.button(f"➡ SEND IT ALL ({len(_fs_review)})", type="primary",
+                         use_container_width=True, key="fs_send_all",
+                         help="Approve όλες → πάνε στο 🎬 Generation (δωρεάν, "
+                              "γυρνάνε πίσω με ↩ αν αλλάξεις γνώμη)"):
+                _sent = 0
+                for _sv in _fs_review:
+                    if mm.claim_pipeline_item(_sv["id"], "pending_photo_review",
+                                              "approved_photo"):
+                        _sent += 1
+                st.success(f"✅ {_sent} πήγαν στο Generation!")
+                st.rerun()
+        with _rvh3:
+            _download_all_button("fs_review_dl", f"⬇ Download All ({len(_fs_review)})",
+                                 photos=_photo_entries(_fs_review),
+                                 filename="faceswap_photos.zip",
+                                 help="Όλες οι φωτογραφίες σε review, σε ένα ZIP")
+        with _rvh4:
+            _delete_all_button(_fs_review, "fs_review_del", "φωτογραφίες")
         _rv_cols, _rv_w = _grid(_fs_review)
         for _rvi, _rv in enumerate(_fs_review):
             with _rv_cols[_rvi % _rv_w]:
@@ -1872,24 +2080,9 @@ with _t_face:
                                       use_container_width=True):
                             if mm.claim_pipeline_item(_rv["id"], "pending_photo_review", "swapping"):
                                 try:
-                                    _cb_r = (st.session_state["creator2_bytes"]
-                                             if _rv["creator"] == "MELINA"
-                                             else st.session_state["creator_bytes"])
-                                    with open(_rv["frame_path"], "rb") as _ffr:
-                                        _fb = to_b64(_ffr.read())
-                                    _pid = ws_submit(
-                                        "wavespeed-ai/qwen-image-2.0-pro/edit",
-                                        {"images": [to_b64(_cb_r), _fb],
-                                         "prompt": st.session_state.get("_fs_prompt", DEFAULT_FACE_SWAP_PROMPT),
-                                         "seed": -1},
-                                    )
-                                    mm.update_pipeline_item(_rv["id"], faceswap_pred=_pid,
-                                                            faceswap_url=None)
-                                    # MONEY: a recreate is a NEW paid photo edit
-                                    mm.record_spend(_pid, _rv["id"], kind="photo",
-                                                    model_key="faceswap",
-                                                    amount=ce.photo_cost())
-                                    _launch_fs_poll(_rv["id"], _pid)
+                                    # a recreate is a NEW paid photo edit — same
+                                    # dispatcher as Swap / Swap All
+                                    _dispatch_swap(_rv)
                                 except Exception as _rce:
                                     mm.update_pipeline_item(_rv["id"], status="error",
                                                             error_msg=str(_rce))
@@ -1902,7 +2095,30 @@ with _t_face:
 
     # ── SWAP QUEUE (downloaded) ───────────────────────────────────
     if _fs_queue:
-        _section_label(f"📋 Ready to Swap — {len(_fs_queue)}")
+        _fqh1, _fqh2, _fqh3 = st.columns([4, 2, 2])
+        with _fqh1:
+            _section_label(f"📋 Ready to Swap — {len(_fs_queue)}")
+        with _fqh2:
+            # PAID batch → armed first, and the arming label spells out the cost
+            _sw_n = len(_fs_queue)
+            if _confirm_action("fs_swap_all", f"🎭 Swap All ({_sw_n})",
+                               f"💸 ΝΑΙ — ~{ce.fmt(_sw_n * ce.photo_cost())}",
+                               help=f"Face swap σε {_sw_n} φωτογραφίες · "
+                                    f"~{ce.fmt(_sw_n * ce.photo_cost())} συνολικά",
+                               kind="primary"):
+                if not st.session_state.get("_wk"):
+                    st.error("Βάλε Wavespeed key στο sidebar.")
+                else:
+                    _swappable = [_x for _x in _fs_queue
+                                  if _x.get("frame_path") and os.path.exists(_x["frame_path"])]
+                    if len(_swappable) < len(_fs_queue):
+                        st.warning(f"↷ {len(_fs_queue) - len(_swappable)} χωρίς frame — παραλείπονται.")
+                    if _swappable:
+                        _batch_dispatch(_swappable, "downloaded", "swapping",
+                                        _dispatch_swap, "🎭 Swapping")
+                        st.rerun()
+        with _fqh3:
+            _delete_all_button(_fs_queue, "fs_queue_del", "items")
         _fq_cols, _fq_w = _grid(_fs_queue)
         for _fqi, _fi in enumerate(_fs_queue):
             with _fq_cols[_fqi % _fq_w]:
@@ -1937,24 +2153,7 @@ with _t_face:
                             st.error("Δεν υπάρχει frame.")
                         elif mm.claim_pipeline_item(_fi["id"], "downloaded", "swapping"):
                             try:
-                                _cb = (st.session_state["creator2_bytes"]
-                                       if _fi["creator"] == "MELINA"
-                                       else st.session_state["creator_bytes"])
-                                with open(_fi["frame_path"], "rb") as _ffr:
-                                    _fb = to_b64(_ffr.read())
-                                _pid = ws_submit(
-                                    "wavespeed-ai/qwen-image-2.0-pro/edit",
-                                    {"images": [to_b64(_cb), _fb],
-                                     "prompt": st.session_state.get("_fs_prompt", DEFAULT_FACE_SWAP_PROMPT),
-                                     "seed": -1},
-                                )
-                                mm.update_pipeline_item(_fi["id"], faceswap_pred=_pid)
-                                # MONEY: WaveSpeed charges the photo edit NOW —
-                                # ledger it before anything can be deleted
-                                mm.record_spend(_pid, _fi["id"], kind="photo",
-                                                model_key="faceswap",
-                                                amount=ce.photo_cost())
-                                _launch_fs_poll(_fi["id"], _pid)
+                                _dispatch_swap(_fi)
                             except Exception as _fse:
                                 mm.update_pipeline_item(_fi["id"], status="error",
                                                         error_msg=str(_fse))
@@ -1964,7 +2163,13 @@ with _t_face:
 
     # ── PROCESSING (swapping) ─────────────────────────────────────
     if _fs_working:
-        _section_label(f"⏳ Processing — {len(_fs_working)}", "#fbbf24")
+        # Delete All here is the escape hatch for a job that hangs — the money
+        # is already spent either way, so purging only clears the card.
+        _fwh1, _fwh2 = st.columns([5, 2])
+        with _fwh1:
+            _section_label(f"⏳ Processing — {len(_fs_working)}", "#fbbf24")
+        with _fwh2:
+            _delete_all_button(_fs_working, "fs_working_del", "jobs σε εξέλιξη")
         _fw_cols, _fw_w = _grid(_fs_working)
         for _fwi, _fw in enumerate(_fs_working):
             with _fw_cols[_fwi % _fw_w]:
@@ -2022,7 +2227,63 @@ with _t_gen:
         st.info("Δεν υπάρχουν approved photos. Κάνε ✅ Approve στο 🎭 Face Swap tab.")
 
     if _gn_ready:
-        _section_label(f"✔ Approved — ready to generate ({len(_gn_ready)})", "#818cf8")
+        # ── SECTION BAR: fire the whole queue / grab the photos / wipe it ──
+        _mk_all = st.session_state["_gen_model"]
+        _gp_all = st.session_state.get("_custom_prompt", DEFAULT_VIDEO_PROMPT)
+        # total cost = sum of the per-item prices (both models bill per second,
+        # so this is the real number, not count × flat rate)
+        _gen_total = 0.0
+        for _gx in _gn_ready:
+            _gxv = _gx.get("video_path")
+            _gxd = _cached_duration(_gxv) if (_gxv and os.path.exists(_gxv)) else 5
+            _gen_total += (ce.kling_cost(_gxd) if _mk_all == "kling"
+                           else ce.seedance_cost(_gxd))
+        _gnh1, _gnh2, _gnh3, _gnh4 = st.columns([3, 2, 2, 2])
+        with _gnh1:
+            _section_label(f"✔ Approved — ready to generate ({len(_gn_ready)})", "#818cf8")
+        with _gnh2:
+            if _confirm_action("gen_all", f"🎬 Generate All ({len(_gn_ready)})",
+                               f"💸 ΝΑΙ — ~{ce.fmt(_gen_total)}",
+                               help=f"{len(_gn_ready)} βίντεο με "
+                                    f"{ce.MODEL_LABEL.get(_mk_all, _mk_all)} · "
+                                    f"~{ce.fmt(_gen_total)} συνολικά",
+                               kind="primary"):
+                if not st.session_state.get("_wk"):
+                    st.error("Βάλε Wavespeed key στο sidebar.")
+                else:
+                    # PRE-FLIGHT for the batch: anything without a valid
+                    # reference (or without the source reel Kling needs) is
+                    # dropped BEFORE dispatch → 0 credits burned on it
+                    _gen_ok, _gen_bad = [], 0
+                    for _gx in _gn_ready:
+                        _gxv = _gx.get("video_path")
+                        if not _valid_ref_image((_gx.get("faceswap_url") or "").strip()):
+                            _gen_bad += 1
+                        elif _mk_all == "kling" and not (_gxv and os.path.exists(_gxv)):
+                            _gen_bad += 1
+                        else:
+                            _gen_ok.append(_gx)
+                    if _gen_bad:
+                        st.warning(f"↷ {_gen_bad} παραλείπονται (λείπει reference ή source video) "
+                                   f"— 0 credits γι' αυτά.")
+                    if _gen_ok:
+                        def _gen_one(_it, _mk=_mk_all, _gp=_gp_all):
+                            _pid, _c = _dispatch_generation(_it, _mk, _gp)
+                            mm.update_pipeline_item(_it["id"], gen_pred=_pid,
+                                                    model_key=_mk, prompt=_gp,
+                                                    gen_cost=_c)
+                            _launch_gen_poll(_it["id"], _pid,
+                                             src_video=_it.get("video_path"))
+                        _batch_dispatch(_gen_ok, "approved_photo", "generating",
+                                        _gen_one, "🎬 Generating")
+                        st.rerun()
+        with _gnh3:
+            _download_all_button("gen_ready_dl", f"⬇ Download All ({len(_gn_ready)})",
+                                 photos=_photo_entries(_gn_ready),
+                                 filename="approved_photos.zip",
+                                 help="Οι approved φωτογραφίες σε ένα ZIP")
+        with _gnh4:
+            _delete_all_button(_gn_ready, "gen_ready_del", "approved photos")
         _gr_cols, _gr_w = _grid(_gn_ready)
         for _gri, _gi in enumerate(_gn_ready):
             with _gr_cols[_gri % _gr_w]:
@@ -2086,43 +2347,14 @@ with _t_gen:
                             elif mm.claim_pipeline_item(_gi["id"], "approved_photo", "generating"):
                                 try:
                                     _gp = st.session_state.get("_custom_prompt", DEFAULT_VIDEO_PROMPT)
-                                    if _mk == "kling":
-                                        _kv = _gi["video_path"]
-                                        if os.path.getsize(_kv) > 8 * 1024 * 1024:
-                                            _kv = _transcode_720(_kv)
-                                        with open(_kv, "rb") as _gfv:
-                                            _gpid = ws_submit(
-                                                "kwaivgi/kling-v3.0-pro/motion-control",
-                                                {"image": _ref_img,
-                                                 "video": to_b64(_gfv.read(), mime="video/mp4"),
-                                                 "prompt": _gp, "duration": 5,
-                                                 "aspect_ratio": "9:16", "cfg_scale": 0.5, "seed": -1})
-                                    elif _has_vid:
-                                        # VIDEO-EDIT (v2v) — helper does LAYER-3
-                                        # validation + dual-schema payload mapping
-                                        _gpid = _submit_video_edit(
-                                            _gi["video_path"], _ref_img, _gp)
-                                    else:
-                                        # no source video (e.g. vault-only photo)
-                                        # → graceful i2v fallback
-                                        _gpid = ws_submit(
-                                            "bytedance/seedance-2.0/image-to-video",
-                                            {"image": _ref_img, "prompt": _gp,
-                                             "duration": 5, "resolution": "720p", "seed": -1})
-                                    # COST ENGINE: exact price from duration (WaveSpeed
-                                    # bills per second) — computed NOW so the card shows
-                                    # the true cost, not a flat guess
-                                    if _mk == "kling":
-                                        _cost_est = ce.kling_cost(_cached_duration(_gi["video_path"]))
-                                    elif _has_vid:
-                                        _cost_est = ce.seedance_cost(_cached_duration(_gi["video_path"]))
-                                    else:
-                                        _cost_est = ce.seedance_cost(5)
+                                    # LAYER-3 pre-flight + exact price + ledger all
+                                    # live in the shared dispatcher, so this card
+                                    # and 🎬 Generate All behave identically
+                                    _gpid, _cost_est = _dispatch_generation(
+                                        _gi, _mk, _gp, ref_img=_ref_img)
                                     mm.update_pipeline_item(_gi["id"], gen_pred=_gpid,
                                                             model_key=_mk, prompt=_gp,
                                                             gen_cost=_cost_est)
-                                    mm.record_spend(_gpid, _gi["id"], kind="video",
-                                                    model_key=_mk, amount=_cost_est)
                                     _launch_gen_poll(_gi["id"], _gpid,
                                                      src_video=_gi.get("video_path"))
                                 except Exception as _ge:
@@ -2143,7 +2375,11 @@ with _t_gen:
                             st.rerun()
 
     if _gn_working:
-        _section_label(f"⏳ Processing — {len(_gn_working)}", "#fbbf24")
+        _gwh1, _gwh2 = st.columns([5, 2])
+        with _gwh1:
+            _section_label(f"⏳ Processing — {len(_gn_working)}", "#fbbf24")
+        with _gwh2:
+            _delete_all_button(_gn_working, "gen_working_del", "jobs σε εξέλιξη")
         _gw_cols, _gw_w = _grid(_gn_working)
         for _gwi, _gw in enumerate(_gn_working):
             with _gw_cols[_gwi % _gw_w]:
@@ -2189,9 +2425,20 @@ with _t_audit:
 
     # ── PENDING ACTION (generated_pending_scrub) ─────────────────
     if _au_pending:
-        _hdr1, _hdr2 = st.columns([3, 1])
+        _hdr1, _hdr2, _hdr3, _hdr4 = st.columns([3, 2, 2, 2])
         with _hdr1:
             _section_label(f"🎬 Pending Action — {len(_au_pending)} video(s)", "#34d399")
+        with _hdr3:
+            # the raw generated clips, before scrubbing
+            _download_all_button(
+                "au_pending_dl", f"⬇ Download All ({len(_au_pending)})",
+                videos=[(f"gen_{_x['creator']}_{_x['id']}.mp4", _x["gen_path"])
+                        for _x in _au_pending
+                        if _x.get("gen_path") and os.path.exists(_x["gen_path"])],
+                filename="generated_videos.zip",
+                help="Τα generated βίντεο όπως ήρθαν (πριν το scrub)")
+        with _hdr4:
+            _delete_all_button(_au_pending, "au_pending_del", "generated videos")
         with _hdr2:
             if len(_au_pending) >= 2:
                 if st.button(f"🧹 Scrub All ({len(_au_pending)})", type="primary",
@@ -2267,55 +2514,17 @@ with _t_audit:
                                 try:
                                     _rmk = _re_mk          # ← chosen in the selector above
                                     _rgp = _ai.get("prompt") or st.session_state.get("_custom_prompt", DEFAULT_VIDEO_PROMPT)
-                                    # PRE-FLIGHT: recreate must also carry the
-                                    # approved faceswap reference — block early
-                                    _r_ref = (_ai.get("faceswap_url") or "").strip()
-                                    if not _valid_ref_image(_r_ref):
-                                        raise RuntimeError(
-                                            "Error: Missing reference image for video edit — "
-                                            "το αίτημα ΔΕΝ στάλθηκε (0 credits).")
-                                    if _rmk == "kling":
-                                        if not (_ai.get("video_path") and os.path.exists(_ai["video_path"])):
-                                            raise RuntimeError("Το αρχικό video λείπει — δεν γίνεται Kling recreate.")
-                                        _rkv = _ai["video_path"]
-                                        if os.path.getsize(_rkv) > 8 * 1024 * 1024:
-                                            _rkv = _transcode_720(_rkv)
-                                        with open(_rkv, "rb") as _rfv:
-                                            _rpid = ws_submit(
-                                                "kwaivgi/kling-v3.0-pro/motion-control",
-                                                {"image": _r_ref,
-                                                 "video": to_b64(_rfv.read(), mime="video/mp4"),
-                                                 "prompt": _rgp, "duration": 5,
-                                                 "aspect_ratio": "9:16", "cfg_scale": 0.5, "seed": -1})
-                                    elif _ai.get("video_path") and os.path.exists(_ai["video_path"]):
-                                        # VIDEO-EDIT (v2v) — helper validates ref +
-                                        # dual-schema payload mapping
-                                        _rpid = _submit_video_edit(
-                                            _ai["video_path"], _r_ref, _rgp)
-                                    else:
-                                        _rpid = ws_submit(
-                                            "bytedance/seedance-2.0/image-to-video",
-                                            {"image": _r_ref, "prompt": _rgp,
-                                             "duration": 5, "resolution": "720p", "seed": -1})
+                                    # MONEY: recreate = a SECOND paid generation.
+                                    # The old pred keeps its own ledger row — both
+                                    # were charged, so both stay counted.
+                                    _rpid, _rcost = _dispatch_generation(_ai, _rmk, _rgp)
                                     # καθάρισε το παλιό local αρχείο (unique per generation)
                                     if _gfp and os.path.exists(_gfp):
                                         try: os.remove(_gfp)
                                         except OSError: pass
-                                    # COST ENGINE: exact price from duration
-                                    if _rmk == "kling":
-                                        _rcost = ce.kling_cost(_cached_duration(_ai.get("video_path")))
-                                    elif _ai.get("video_path") and os.path.exists(_ai["video_path"]):
-                                        _rcost = ce.seedance_cost(_cached_duration(_ai["video_path"]))
-                                    else:
-                                        _rcost = ce.seedance_cost(5)
                                     mm.update_pipeline_item(_ai["id"], gen_pred=_rpid,
                                                             gen_url=None, gen_path=None,
                                                             model_key=_rmk, gen_cost=_rcost)
-                                    # MONEY: recreate = a second paid generation.
-                                    # The old pred keeps its own ledger row — both
-                                    # were charged, so both stay counted.
-                                    mm.record_spend(_rpid, _ai["id"], kind="video",
-                                                    model_key=_rmk, amount=_rcost)
                                     _launch_gen_poll(_ai["id"], _rpid,
                                                      src_video=_ai.get("video_path"))
                                 except Exception as _rge:
@@ -2332,7 +2541,11 @@ with _t_audit:
 
     # ── IN SCRUB (scrubbing) ──────────────────────────────────────
     if _au_working:
-        _section_label(f"⚙️ Scrubbing — {len(_au_working)}", "#22d3ee")
+        _awh1, _awh2 = st.columns([5, 2])
+        with _awh1:
+            _section_label(f"⚙️ Scrubbing — {len(_au_working)}", "#22d3ee")
+        with _awh2:
+            _delete_all_button(_au_working, "au_working_del", "scrubs σε εξέλιξη")
         _aw_cols, _aw_w = _grid(_au_working)
         for _awi, _aw in enumerate(_au_working):
             with _aw_cols[_awi % _aw_w]:
@@ -2350,25 +2563,27 @@ with _t_audit:
             import datetime as _dt2
             # ── WHICH PHONES (optional) ──────────────────────────────
             # Ξε-τσέκαρε ό,τι δεν θες: κρατάς μόνο ένα κινητό → όλα τα
-            # βίντεο πάνε εκεί (Μέρα/Νύχτα, μετά επόμενη μέρα).
+            # βίντεο πάνε εκεί, στις 2 δικές του ώρες, μετά επόμενη μέρα.
             _phones_sel = st.multiselect(
                 "📱 Κινητά που θα ανέβουν", de.PHONES, default=de.PHONES,
-                key="distrib_phones",
+                key="distrib_phones", format_func=de.device_label,
                 help="Προαιρετικό: άφησε τσεκαρισμένα ΜΟΝΟ τα κινητά που θες. "
-                     "Όσα βγάλεις δεν θα πάρουν κανένα βίντεο.")
+                     "Όσα βγάλεις δεν θα πάρουν κανένα βίντεο. Κάθε κινητό "
+                     "ανεβάζει στις δικές του ώρες.")
             _adc1, _adc2 = st.columns([1, 2])
             with _adc1:
                 _start_date = st.date_input("📅 Ημερομηνία εκκίνησης",
                                             value=st.session_state.get("_distrib_start", _dt2.date.today()),
                                             key="distrib_start_input")
                 st.session_state["_distrib_start"] = _start_date
-                _slot_choice = st.selectbox(
-                    "🌗 Slots", ["Μέρα + Νύχτα", "Μόνο Μέρα", "Μόνο Νύχτα"],
-                    key="distrib_slots",
-                    help="π.χ. αν σήμερα ανέβηκαν οι Μέρες, διάλεξε «Μόνο Νύχτα» "
-                         "για να γεμίσουν οι νύχτες και μετά επόμενη μέρα")
-                _times = ({"Μόνο Μέρα": ["Μερα"], "Μόνο Νύχτα": ["Νυχτα"]}
-                          .get(_slot_choice))   # None = both
+                # Κάθε κινητό έχει τις δικές του 2 ώρες — εδώ διαλέγεις ΠΟΙΕΣ
+                # ώρες θα γεμίσουν. Ένα κινητό μπαίνει στο πλάνο μόνο για τις
+                # δικές του ώρες που είναι τσεκαρισμένες εδώ.
+                _times = st.multiselect(
+                    "🕐 Ώρες που θα γεμίσουν", de.ALL_TIMES, default=de.ALL_TIMES,
+                    key="distrib_hours",
+                    help="π.χ. αν ανέβηκαν ήδη οι μεσημεριανές, κράτα μόνο "
+                         "22:00/23:00/00:00 για να γεμίσουν τα βραδινά.")
             # slots already used (from what THIS app distributed) — for the preview
             _db_occ = set()
             for _v in _all_kpi:
@@ -2380,27 +2595,27 @@ with _t_audit:
             with _adc2:
                 _plan = de.plan_distribution(len(_undist), _start_date,
                                              occupied=_db_occ, phones=_phones_sel,
-                                             times=_times)
+                                             hours=_times)
                 _n_days = (_plan[-1]["day_index"] + 1) if _plan else 0
-                # slots/day follows BOTH choices: πόσα κινητά × πόσα slots
-                _n_tod   = len(_times or de.TIMES_OF_DAY)
-                _per_day = len(_phones_sel) * _n_tod
+                # slots/day = πόσες ΩΡΕΣ έχει συνολικά η επιλογή κινητών
+                _per_day = de.slots_per_day(_phones_sel, _times)
                 st.markdown(
                     f"<div style='font-size:12px;color:#8b81b8;padding-top:6px'>"
                     f"<b style='color:#4ade80'>{len(_undist)}</b> βίντεο προς διανομή · "
-                    f"<b>1 βίντεο/slot · {len(_phones_sel)}/{len(de.PHONES)} phones × "
-                    f"{_n_tod} ({'Μέρα+Νύχτα' if _n_tod == 2 else _slot_choice.replace('Μόνο ', '')}) "
+                    f"<b>1 βίντεο/ώρα · {len(_phones_sel)}/{len(de.PHONES)} κινητά · "
+                    f"{', '.join(_times) if _times else '—'} "
                     f"= {_per_day}/μέρα</b> · "
                     f"~<b style='color:#4ade80'>{_n_days}</b> μέρες (από {_start_date.strftime('%d/%m')})</div>",
                     unsafe_allow_html=True,
                 )
-            if _undist and not _phones_sel:
-                st.warning("Διάλεξε τουλάχιστον ένα κινητό για να γίνει η διανομή.")
+            if _undist and not (_phones_sel and _times):
+                st.warning("Διάλεξε τουλάχιστον ένα κινητό ΚΑΙ μία ώρα για να γίνει η διανομή.")
             elif _undist:
                 # compact preview of the first few assignments
                 _prev = _plan[:6]
                 _prev_txt = " · ".join(
-                    f"{i+1}→{p['device'].split('-')[0].split('(')[0]}/{p['date_str'][5:]}/{p['time_of_day']}"
+                    f"{i+1}→ΚΙΝ{de.PHONES.index(p['device']) + 1 if p['device'] in de.PHONES else '?'}"
+                    f"/{p['date_str'][5:]}/{p['time_of_day']}"
                     for i, p in enumerate(_prev))
                 st.caption(f"Πρώτα: {_prev_txt}{' …' if len(_undist) > 6 else ''}")
                 if st.button(f"📤 Distribute All ({len(_undist)} βίντεο)",
@@ -2414,7 +2629,7 @@ with _t_audit:
                         _full_plan = de.plan_distribution(len(_undist), _start_date,
                                                           occupied=_drive_occ,
                                                           phones=_phones_sel,
-                                                          times=_times)
+                                                          hours=_times)
                         _dbar = st.progress(0, text="📤 Distributing…")
                         _ok, _fail = 0, []
                         for _vi, (_vid, _slot) in enumerate(zip(_undist, _full_plan)):
@@ -2445,16 +2660,18 @@ with _t_audit:
             else:
                 st.caption("Όλα τα καθαρά βίντεο έχουν ήδη μοιραστεί ✅")
 
-        _cl_hdr1, _cl_hdr2 = st.columns([3, 1])
+        _cl_hdr1, _cl_hdr2, _cl_hdr3 = st.columns([4, 2, 2])
         with _cl_hdr1:
             _section_label(f"✅ Clean — {len(_au_done)}", "#4ade80")
         with _cl_hdr2:
             # bulk export of the finished clips — no more one click per video
-            _au_vd = _video_entries(_au_done)
-            if _au_vd:
-                _zip_ui("audit_clean", f"⬇ Download All ({len(_au_vd)})",
-                        lambda: ([], _au_vd), "whale_clean_videos.zip",
-                        help="Όλα τα καθαρά MP4 σε ένα ZIP")
+            _download_all_button("audit_clean",
+                                 f"⬇ Download All ({len(_au_done)})",
+                                 videos=_video_entries(_au_done),
+                                 filename="whale_clean_videos.zip",
+                                 help="Όλα τα καθαρά MP4 σε ένα ZIP")
+        with _cl_hdr3:
+            _delete_all_button(_au_done, "audit_clean_del", "clean videos")
         _ad_cols, _ad_w = _grid(_au_done)
         for _adi, _ad in enumerate(_au_done):
             with _ad_cols[_adi % _ad_w]:
@@ -2496,10 +2713,12 @@ with _t_audit:
                                     "📅 Date", key=f"exp_date_{_ad['id']}")
                                 _exp_dev = st.selectbox(
                                     "📱 Device", _exp_devs,
+                                    format_func=de.device_label,
                                     key=f"exp_dev_{_ad['id']}")
+                                # οι ώρες ακολουθούν το κινητό που διάλεξες
                                 _exp_tod = st.selectbox(
-                                    "🌗 Time of Day", de.TIMES_OF_DAY,
-                                    key=f"exp_tod_{_ad['id']}")
+                                    "🕐 Ώρα", de.device_times(_exp_dev),
+                                    key=f"exp_tod_{_ad['id']}_{_exp_dev}")
                                 _prev_link = st.session_state.get(
                                     f"drive_link_{_ad['id']}")
                                 if _prev_link:
