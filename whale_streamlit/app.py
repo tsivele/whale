@@ -2579,11 +2579,12 @@ with _t_audit:
                 # Κάθε κινητό παίρνει ΜΙΑ ώρα: τη Βασική (με το *) ή τη Μη
                 # Βασική. Το * δείχνει την ώρα που δόθηκε πρώτη, ανεξάρτητα
                 # από τη χρονολογική σειρά εμφάνισης.
-                _mode = st.radio(
-                    "🕐 Ώρα ανά κινητό", de.SLOT_MODES, key="distrib_mode",
-                    horizontal=True,
+                _modes = st.multiselect(
+                    "🕐 Ώρες ανά κινητό", de.SLOT_MODES, default=de.SLOT_MODES,
+                    key="distrib_modes",
                     help="Βασική Ώρα = η ώρα με το * · Μη Βασική Ώρα = η άλλη. "
-                         "Κάθε κινητό ανεβάζει 1 βίντεο την ημέρα.")
+                         "Κράτα και τις δύο (2 βίντεο/κινητό/μέρα) ή μόνο τη "
+                         "μία (1 βίντεο/κινητό/μέρα).")
             # slots already used (from what THIS app distributed) — for the preview
             _db_occ = set()
             for _v in _all_kpi:
@@ -2595,31 +2596,34 @@ with _t_audit:
             with _adc2:
                 _plan = de.plan_distribution(len(_undist), _start_date,
                                              occupied=_db_occ, phones=_phones_sel,
-                                             mode=_mode)
+                                             modes=_modes)
                 _n_days = (_plan[-1]["day_index"] + 1) if _plan else 0
                 # slots/μέρα = ένα ανά επιλεγμένο κινητό
-                _per_day = de.slots_per_day(_phones_sel)
+                _per_day = de.slots_per_day(_phones_sel, _modes)
                 # ποιο κινητό ανεβάζει τι ώρα — ΜΕ ΣΕΙΡΑ, το πρωινό πρώτο
                 _sched = sorted(
-                    ((de.time_for(_d, _mode), _d) for _d in _phones_sel),
-                    key=lambda _hd: (de._hour_key(_hd[0]),
-                                     de.PHONES.index(_hd[1]) if _hd[1] in de.PHONES else 99))
+                    ((de.time_for(_d, _m), _d, _m)
+                     for _d in _phones_sel for _m in de.SLOT_MODES if _m in _modes),
+                    key=lambda _x: (de._hour_key(_x[0]),
+                                    de.PHONES.index(_x[1]) if _x[1] in de.PHONES else 99))
                 _hrs_txt = "<br>".join(
-                    f"<b style='color:#4ade80'>{_h}</b> · "
+                    f"<b style='color:#4ade80'>{_h}{'*' if _m == de.MODE_PRIMARY else ''}</b> · "
                     f"ΚΙΝΗΤΟ {de.PHONES.index(_d) + 1 if _d in de.PHONES else '?'} · {_d}"
-                    for _h, _d in _sched) or "—"
+                    for _h, _d, _m in _sched) or "—"
                 st.markdown(
                     f"<div style='font-size:12px;color:#8b81b8;padding-top:6px'>"
                     f"<b style='color:#4ade80'>{len(_undist)}</b> βίντεο προς διανομή · "
-                    f"<b>{_mode} · 1 βίντεο/κινητό · "
+                    f"<b>{' + '.join(_modes) if _modes else '—'} · "
+                    f"{len(_modes)} βίντεο/κινητό · "
                     f"{len(_phones_sel)}/{len(de.PHONES)} κινητά = {_per_day}/μέρα</b> · "
                     f"~<b style='color:#4ade80'>{_n_days}</b> μέρες (από {_start_date.strftime('%d/%m')})"
                     f"<div style='font-size:11px;color:#8b81b8;margin-top:6px;line-height:1.7'>"
                     f"{_hrs_txt}</div></div>",
                     unsafe_allow_html=True,
                 )
-            if _undist and not _phones_sel:
-                st.warning("Διάλεξε τουλάχιστον ένα κινητό για να γίνει η διανομή.")
+            if _undist and not (_phones_sel and _modes):
+                st.warning("Διάλεξε τουλάχιστον ένα κινητό ΚΑΙ μία ώρα "
+                           "(Βασική ή Μη Βασική) για να γίνει η διανομή.")
             elif _undist:
                 # compact preview of the first few assignments
                 _prev = _plan[:6]
@@ -2639,7 +2643,7 @@ with _t_audit:
                         _full_plan = de.plan_distribution(len(_undist), _start_date,
                                                           occupied=_drive_occ,
                                                           phones=_phones_sel,
-                                                          mode=_mode)
+                                                          modes=_modes)
                         _dbar = st.progress(0, text="📤 Distributing…")
                         _ok, _fail = 0, []
                         for _vi, (_vid, _slot) in enumerate(zip(_undist, _full_plan)):

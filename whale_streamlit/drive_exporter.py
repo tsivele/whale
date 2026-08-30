@@ -110,7 +110,7 @@ SLOT_MODES     = [MODE_PRIMARY, MODE_SECONDARY]
 # DEVICE_MAP["MELINA"] so the manual dropdown and the scheduler never diverge.
 PHONES = DEVICE_MAP["MELINA"]
 
-PER_DEVICE_PER_DAY = 1   # μία ώρα ανά κινητό ανά ημερομηνία
+PER_DEVICE_PER_DAY = 2   # το πολύ 2 ώρες/κινητό/μέρα — 1 αν διαλέξεις μόνο τη μία
 
 
 def device_times(device) -> list:
@@ -176,13 +176,24 @@ def device_label(device) -> str:
     return f"{_num}{_acc + ' · ' if _acc else ''}{device} · {time_label(device)}"
 
 
+def _mode_list(modes, mode):
+    """Κανονικοποιεί την επιλογή ωρών σε λίστα modes.
+    None = «δεν δόθηκε» → και οι δύο ώρες. [] = «ρητά τίποτα» → άδειο."""
+    if modes is None:
+        modes = [mode] if mode is not None else list(SLOT_MODES)
+    elif isinstance(modes, str):
+        modes = [modes]
+    return [m for m in SLOT_MODES if m in modes]      # σταθερή σειρά
+
+
 def plan_distribution(n_videos, start_date, occupied=None, phones=None,
-                      mode=MODE_PRIMARY, max_days=730):
+                      modes=None, mode=None, max_days=730):
     """Μοιράζει n βίντεο σε slots (κινητό, ημερομηνία, ώρα) — ΕΝΑ βίντεο ανά slot.
 
-    Κάθε κινητό παίρνει ΜΙΑ ώρα την ημέρα: τη Βασική Ώρα (η πρώτη που δόθηκε
-    αρχικά, με το *) ή τη Μη Βασική Ώρα, ανάλογα με το `mode`. Άρα τα slots
-    μιας ημερομηνίας = όσα και τα επιλεγμένα κινητά.
+    `modes` = ποιες ώρες θα γεμίσουν: [Βασική Ώρα], [Μη Βασική Ώρα], ή και τις
+    δύο μαζί. Κάθε κινητό παίρνει μία ώρα ανά επιλεγμένο mode — άρα τα slots
+    μιας ημερομηνίας = κινητά × επιλεγμένες ώρες (5 ή 10 με 5 κινητά).
+    None = και οι δύο. ΚΕΝΗ λίστα = άδειο πλάνο.
 
     `occupied` = set από (κινητό, date_str, ώρα) που ΕΧΕΙ ήδη βίντεο (διαβασμένο
     από το Drive). Αυτά παραλείπονται, οπότε ένα δεύτερο τρέξιμο δεν ξαναγεμίζει
@@ -201,10 +212,14 @@ def plan_distribution(n_videos, start_date, occupied=None, phones=None,
     from datetime import timedelta
     # None = "δεν δόθηκε" → όλα. [] = "ρητά τίποτα" → άδειο πλάνο.
     phones = list(PHONES) if phones is None else list(phones)
-    if not (phones and n_videos > 0):
+    modes = _mode_list(modes, mode)
+    if not (phones and modes and n_videos > 0):
         return []
-    # ένα slot ανά κινητό, ταξινομημένα χρονολογικά
-    slots = [(time_for(d, mode), d) for d in phones]
+    # ένα slot ανά κινητό ανά επιλεγμένη ώρα, ταξινομημένα χρονολογικά
+    slots = []
+    for d in phones:
+        for h in dict.fromkeys(time_for(d, m) for m in modes):   # χωρίς διπλά
+            slots.append((h, d))
     slots.sort(key=lambda hd: (_hour_key(hd[0]), phones.index(hd[1])))
     occ = set(occupied or ())
     plan = []
@@ -222,9 +237,11 @@ def plan_distribution(n_videos, start_date, occupied=None, phones=None,
     return plan
 
 
-def slots_per_day(phones=None) -> int:
-    """Πόσα βίντεο χωράνε σε μία ημερομηνία — ένα ανά κινητό."""
-    return len(PHONES if phones is None else phones)
+def slots_per_day(phones=None, modes=None, mode=None) -> int:
+    """Πόσα βίντεο χωράνε σε μία ημερομηνία — ένα ανά κινητό ανά επιλεγμένη ώρα."""
+    phones = list(PHONES) if phones is None else list(phones)
+    modes = _mode_list(modes, mode)
+    return sum(len(dict.fromkeys(time_for(d, m) for m in modes)) for d in phones)
 
 
 def get_occupied_slots(rclone_conf) -> set:
