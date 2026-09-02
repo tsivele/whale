@@ -18,6 +18,7 @@ Design principles
 import logging
 import os
 from typing import Callable, Dict, List, Optional, Union
+import re as _re
 
 log = logging.getLogger("queue_manager")
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
@@ -27,32 +28,48 @@ logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 # URL Parsing
 # ─────────────────────────────────────────────────────────────────────────────
 
+_URL_RE = _re.compile(r"https?://[^\s,;'\"<>()\[\]]+", _re.IGNORECASE)
+
+
 def parse_url_text(raw_text: str) -> List[str]:
     """
-    Parse a multiline string of URLs (from st.text_area copy-paste).
+    Parse a blob of URLs pasted into a text area.
 
-    Rules applied to every line:
-      - Strip leading / trailing whitespace (tabs, spaces, \\r)
-      - Skip empty lines
-      - Skip comment lines starting with '#'
+    Extracts EVERY http(s) URL it can find, wherever it sits:
+      - one per line (the classic case)
+      - several on the SAME line, separated by spaces, commas or semicolons
+      - surrounded by quotes, brackets or trailing punctuation
+    Lines starting with '#' are ignored, and duplicates are dropped while the
+    original order is preserved.
+
+    Splitting on newlines alone (the old behaviour) silently glued two links
+    pasted on one line into a single malformed string, which then failed at the
+    scraper and looked like "the link just didn't work".
 
     Example input
     -------------
-        https://www.instagram.com/reel/ABC123/
-        https://www.instagram.com/reel/DEF456/
-
+        https://www.instagram.com/reel/ABC123/ https://www.instagram.com/reel/DEF456/
         # this line is ignored
-        https://www.instagram.com/reel/GHI789/
+        https://www.instagram.com/reel/GHI789/, https://www.instagram.com/reel/ABC123/
 
     Returns
     -------
     ["https://...ABC123/", "https://...DEF456/", "https://...GHI789/"]
     """
     urls: List[str] = []
-    for line in raw_text.splitlines():
-        url = line.strip()
-        if url and not url.startswith("#"):
-            urls.append(url)
+    seen = set()
+    for line in (raw_text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        found = _URL_RE.findall(line)
+        if not found and line:
+            found = [line]                      # bare id/handle — let the caller judge
+        for url in found:
+            url = url.rstrip(".,;)]}\"'")       # trailing punctuation from prose
+            if url and url not in seen:
+                seen.add(url)
+                urls.append(url)
     log.info("Parsed %d URL(s) from text input", len(urls))
     return urls
 

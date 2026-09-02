@@ -113,6 +113,18 @@ def init_db():
                 conn.execute("ALTER TABLE pipeline_items ADD COLUMN gen_cost REAL")
             if "drive_path" not in _cols:      # Drive folder a scrubbed clip was distributed to
                 conn.execute("ALTER TABLE pipeline_items ADD COLUMN drive_path TEXT")
+            # MULTI-FRAME REFERENCES — Seedance locks identity far better with
+            # 3-4 swapped face/scene refs than with a single frame. These hold
+            # the JSON lists; the legacy single-value columns (frame_path,
+            # faceswap_url, faceswap_pred) keep holding the ANCHOR, so every
+            # existing reader keeps working unchanged.
+            for _c, _t in (("frame_paths",    "TEXT"),   # JSON [paths] extracted
+                           ("faceswap_preds", "TEXT"),   # JSON [pred ids] in flight
+                           ("faceswap_urls",  "TEXT"),   # JSON [swapped image urls]
+                           ("ref_video_path", "TEXT"),   # 2nd source video (scene refs)
+                           ("ingest_meta",    "TEXT")):  # JSON counters for the job report
+                if _c not in _cols:
+                    conn.execute(f"ALTER TABLE pipeline_items ADD COLUMN {_c} {_t}")
             # BACKFILL: older DBs tracked spend only on the pipeline row, so
             # anything already dispatched must be lifted into the permanent
             # ledger. UNIQUE(pred_id) + INSERT OR IGNORE makes this idempotent —
@@ -312,6 +324,29 @@ def get_asset(asset_id: int):
 # ─────────────────────────────────────────────────────────────────────────────
 # Pipeline Items — 4-tab pipeline tracking
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ── JSON list columns (multi-frame refs) ─────────────────────────────────────
+# Stored as JSON text so the schema stays one table and old rows (NULL) simply
+# read back as an empty list.
+
+def jlist(item, field) -> list:
+    """Read a JSON-list column off an item dict → always a list."""
+    import json as _json
+    _v = (item or {}).get(field)
+    if not _v:
+        return []
+    try:
+        _p = _json.loads(_v)
+        return list(_p) if isinstance(_p, (list, tuple)) else []
+    except (ValueError, TypeError):
+        return []
+
+
+def jdump(values) -> str:
+    """Serialize a list for a JSON-list column."""
+    import json as _json
+    return _json.dumps(list(values or []))
+
 
 def find_item_by_url(ig_url: str):
     """Return the earliest existing pipeline item with this ig_url, or None.

@@ -521,14 +521,145 @@ def apify_get_video_url(ig_url):
     return video_url
 
 
-def download_video_url(url):
-    r = requests.get(url, stream=True, timeout=60)
-    r.raise_for_status()
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-    for chunk in r.iter_content(chunk_size=8192):
-        tmp.write(chunk)
-    tmp.close()
-    return tmp.name
+# ──────────────────────────────────────────────────────────
+# INGEST INSTRUMENTATION
+# ──────────────────────────────────────────────────────────
+# Every ingest step writes a line here. The log lives in session_state, NOT in
+# st.warning(), because anything printed right before st.rerun() is thrown away
+# when the script restarts — that is why failed links used to disappear and a
+# partial batch looked like a clean success.
+
+INGEST_LOG = "_ingest_log"
+
+
+def _ilog(stage: str, target: str, ok: bool, detail: str = ""):
+    """Record one ingest step (and mirror it to the server log)."""
+    _row = {"stage": stage, "target": str(target)[-70:], "ok": bool(ok),
+            "detail": str(detail)[:300], "t": time.strftime("%H:%M:%S")}
+    try:
+        st.session_state.setdefault(INGEST_LOG, []).append(_row)
+    except Exception:
+        pass                                   # worker thread — console only
+    print(f"[ingest] {'OK ' if ok else 'FAIL'} {stage:<10} {_row['target']} {detail}")
+    return _row
+
+
+def _ingest_report_reset():
+    st.session_state[INGEST_LOG] = []
+
+
+def _render_ingest_report(where: str = "main"):
+    """Show the last batch's per-asset outcome. Survives the rerun, so failures
+    stay on screen until the next batch instead of flashing past.
+
+    `where` keeps the widget keys unique — the same report is rendered at the
+    top of every tab that can ingest."""
+    _log = st.session_state.get(INGEST_LOG) or []
+    if not _log:
+        return
+    _fails = [r for r in _log if not r["ok"]]
+    _oks   = [r for r in _log if r["ok"] and r["stage"] == "ingest"]
+    _icon  = "⚠️" if _fails else "✅"
+    with st.expander(f"{_icon} Ingest report — {len(_oks)} ΟΚ · {len(_fails)} απέτυχαν",
+                     expanded=bool(_fails)):
+        for _r in _log:
+            _c = "#4ade80" if _r["ok"] else "#f87171"
+            st.markdown(
+                f"<div style='font-size:11px;color:{_c};font-family:monospace'>"
+                f"{_r['t']} {'✓' if _r['ok'] else '✗'} <b>{_r['stage']}</b> · "
+                f"{_r['target']} <span style='color:#8b81b8'>{_r['detail']}</span></div>",
+                unsafe_allow_html=True)
+        if st.button("✖ Καθάρισε το report", key=f"ing_clear_{where}"):
+            _ingest_report_reset()
+            st.rerun()
+
+
+# Floor for "this is a real file, not an empty response". Deliberately LOW:
+# a short or flat clip can legitimately be a few KB, and rejecting a valid
+# upload is worse than accepting a small one. Error pages are caught by the
+# content-type check instead, and empty reads by _read_upload().
+_MIN_VIDEO_BYTES = 2048
+
+
+def download_video_url(url, tries: int = 3, min_bytes: int = _MIN_VIDEO_BYTES):
+    """Download a media URL to a temp file — VERIFIED and RETRIED.
+
+    The old version streamed chunks and returned whatever arrived: a connection
+    dropped mid-stream produced a truncated file, raise_for_status() never
+    fired, and the half-file flowed downstream as if it were valid. Now we:
+      · check the HTTP status AND the content-type
+      · compare the bytes written against Content-Length (short read = failure)
+      · reject implausibly small files
+      · retry transient failures with backoff
+    Raises RuntimeError with a specific reason — never returns a partial file.
+    """
+    _last = ""
+    for _attempt in range(1, tries + 1):
+        _tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        try:
+            r = requests.get(url, stream=True, timeout=(15, 120))
+            r.raise_for_status()
+            _ctype = (r.headers.get("content-type") or "").split(";")[0].lower()
+            _clen = r.headers.get("content-length")
+            _expect = int(_clen) if (_clen or "").isdigit() else None
+            _got = 0
+            for _chunk in r.iter_content(chunk_size=64 * 1024):
+                if _chunk:
+                    _tmp.write(_chunk)
+                    _got += len(_chunk)
+            _tmp.close()
+            if _expect is not None and _got < _expect:
+                raise RuntimeError(
+                    f"κομμένο download: {_got}/{_expect} bytes ({_got * 100 // max(_expect, 1)}%)")
+            if _got < min_bytes:
+                raise RuntimeError(f"πολύ μικρό αρχείο ({_got} bytes, content-type {_ctype or '?'})")
+            if _ctype and not (_ctype.startswith("video/") or _ctype.startswith("image/")
+                               or _ctype in ("application/octet-stream", "binary/octet-stream")):
+                raise RuntimeError(f"λάθος content-type: {_ctype}")
+            _ilog("download", url, True,
+                  f"{_got/1e6:.1f} MB · {_ctype or 'n/a'} · attempt {_attempt}")
+            return _tmp.name
+        except Exception as _e:
+            _last = str(_e)
+            try:
+                _tmp.close()
+                os.remove(_tmp.name)           # never leave a partial file behind
+            except OSError:
+                pass
+            _ilog("download", url, False, f"attempt {_attempt}/{tries}: {_last}")
+            if _attempt < tries:
+                time.sleep(1.5 * _attempt)     # backoff for transient errors
+    raise RuntimeError(f"download απέτυχε μετά από {tries} προσπάθειες: {_last}")
+
+
+def _read_upload(file_obj) -> bytes:
+    """Read a Streamlit upload SAFELY.
+
+    UploadedFile is a buffer that persists across reruns: a second .read()
+    returns b"" and used to write a 0-byte file that failed silently later on.
+    Always rewind first, and never accept an empty read.
+    """
+    try:
+        file_obj.seek(0)
+    except Exception:
+        pass
+    _data = file_obj.read() or b""
+    if not _data:
+        raise RuntimeError("το αρχείο διαβάστηκε κενό (0 bytes) — ξανα-ανέβασέ το")
+    return _data
+
+
+def _content_key(prefix: str, file_obj, data: bytes) -> str:
+    """De-dupe key that keys on CONTENT, not just the filename.
+
+    Keying on the filename alone silently merged different clips that happened
+    to share a name (IMG_0001.MOV, video.mp4 …): the second upload returned the
+    first item's id and still counted as a success, so files vanished without a
+    trace. Same content → same key (a real duplicate); same name but different
+    bytes → different keys, both ingested.
+    """
+    import hashlib
+    return f"{prefix}://{getattr(file_obj, 'name', 'file')}#{hashlib.sha1(data).hexdigest()[:12]}"
 
 
 # ──────────────────────────────────────────────────────────
@@ -569,22 +700,38 @@ def _ingest_reel(ig_url: str, creator: str) -> int:
     De-dupes: if this reel is already in the pipeline, keep the one."""
     _dup = mm.find_item_by_url(ig_url)
     if _dup:
+        _ilog("dedupe", ig_url, True, f"υπάρχει ήδη ως #{_dup['id']} — δεν ξανα-μπαίνει")
         return _dup["id"]
-    _vurl = None
+    # resolve the playable URL — keep BOTH scrapers' reasons, so a failure says
+    # why instead of a blank "δεν βρέθηκε video"
+    _vurl, _why = None, []
     if st.session_state.get("_hk"):
         try:
             _vurl = hiker_get_video_url(ig_url)
-        except Exception:
-            pass
+            _ilog("resolve", ig_url, True, "HikerAPI ✓")
+        except Exception as _he:
+            _why.append(f"Hiker: {_he}")
+            _ilog("resolve", ig_url, False, f"HikerAPI: {_he}")
     if not _vurl and st.session_state.get("_ak"):
-        _vurl = apify_get_video_url(ig_url)
+        try:
+            _vurl = apify_get_video_url(ig_url)
+            _ilog("resolve", ig_url, True, "Apify ✓")
+        except Exception as _ae:
+            _why.append(f"Apify: {_ae}")
+            _ilog("resolve", ig_url, False, f"Apify: {_ae}")
     if not _vurl:
-        raise RuntimeError("δεν βρέθηκε video για το URL")
-    _vpath = download_video_url(_vurl)
+        raise RuntimeError("δεν βρέθηκε video — " + (" · ".join(_why) or "λείπει HikerAPI/Apify key"))
+    _vpath = download_video_url(_vurl)          # verified + retried
     _dur = get_duration(_vpath)
-    _frame = extract_frame(_vpath, max(0.3, 0.05 * _dur))
+    _frames = _select_frames(_vpath, duration=_dur)
+    _ilog("frames", ig_url, bool(_frames), f"{len(_frames)} frames από {_dur:.1f}s")
+    if not _frames:
+        raise RuntimeError("δεν βγήκε κανένα frame από το video")
     _nid = mm.add_pipeline_item(ig_url, creator)
-    mm.update_pipeline_item(_nid, video_path=_vpath, frame_path=_frame)
+    mm.update_pipeline_item(_nid, video_path=_vpath,
+                            frame_path=_frames[0], frame_paths=mm.jdump(_frames))
+    _ilog("ingest", ig_url, True,
+          f"#{_nid} · {os.path.getsize(_vpath)/1e6:.1f} MB · {len(_frames)} frames")
     return _nid
 
 
@@ -617,19 +764,27 @@ def _ingest_upload(file_obj, creator: str) -> int:
     entry as a reel. Uploads (esp. iPhone .MOV) are transcoded to a compact
     720p mp4 first, so Seedance accepts them and the payload isn't huge.
     De-dupes by filename: the same file twice keeps only one."""
-    _url = f"upload://{file_obj.name}"
+    _data = _read_upload(file_obj)
+    _url = _content_key("upload", file_obj, _data)
     _dup = mm.find_item_by_url(_url)
     if _dup:
+        _ilog("dedupe", file_obj.name, True, f"ίδιο περιεχόμενο με #{_dup['id']}")
         return _dup["id"]
     _raw = tempfile.NamedTemporaryFile(
         delete=False, suffix=(os.path.splitext(file_obj.name)[1] or ".mp4"))
-    _raw.write(file_obj.read())
+    _raw.write(_data)
     _raw.close()
+    _ilog("upload", file_obj.name, True, f"{len(_data)/1e6:.1f} MB στον δίσκο")
     _vpath = _transcode_720(_raw.name)       # → compact real mp4
     _dur = get_duration(_vpath)
-    _frame = extract_frame(_vpath, max(0.3, 0.05 * _dur))
+    _frames = _select_frames(_vpath, duration=_dur)
+    _ilog("frames", file_obj.name, bool(_frames), f"{len(_frames)} frames από {_dur:.1f}s")
+    if not _frames:
+        raise RuntimeError("δεν βγήκε κανένα frame από το video")
     _nid = mm.add_pipeline_item(_url, creator)
-    mm.update_pipeline_item(_nid, video_path=_vpath, frame_path=_frame)
+    mm.update_pipeline_item(_nid, video_path=_vpath,
+                            frame_path=_frames[0], frame_paths=mm.jdump(_frames))
+    _ilog("ingest", file_obj.name, True, f"#{_nid} · {len(_frames)} frames")
     return _nid
 
 
@@ -641,19 +796,25 @@ def _ingest_audit_upload(file_obj, creator: str) -> int:
     We DON'T downscale (finished content keeps its resolution), but we DO
     normalize browser-unsafe formats (iPhone HDR / 10-bit / 4:4:4) to yuv420p
     so the preview isn't a green wash. Safe files are stored as-is."""
-    _url = f"audit://{file_obj.name}"
+    _data = _read_upload(file_obj)
+    _url = _content_key("audit", file_obj, _data)
     _dup = mm.find_item_by_url(_url)
     if _dup:
+        _ilog("dedupe", file_obj.name, True, f"ίδιο περιεχόμενο με #{_dup['id']}")
         return _dup["id"]
     _tf = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-    _tf.write(file_obj.read())
+    _tf.write(_data)
     _tf.close()
+    _ilog("upload", file_obj.name, True, f"{len(_data)/1e6:.1f} MB στον δίσκο")
     _safe = _normalize_browser_safe(_tf.name)     # fix green HDR/10-bit previews
     if _safe != _tf.name:
         try: os.remove(_tf.name)                  # drop the unsafe original
         except OSError: pass
+    if not (os.path.exists(_safe) and os.path.getsize(_safe) > _MIN_VIDEO_BYTES):
+        raise RuntimeError("το αρχείο δεν γράφτηκε σωστά στον δίσκο")
     _nid = mm.add_pipeline_item(_url, creator, status="generated_pending_scrub")
     mm.update_pipeline_item(_nid, gen_path=_safe)
+    _ilog("ingest", file_obj.name, True, f"#{_nid} → scrub queue")
     return _nid
 
 
@@ -661,16 +822,22 @@ def _ingest_photo_upload(file_obj, creator: str) -> int:
     """Ingest a PHOTO the user uploaded → straight into the Face Swap queue as
     'downloaded'. The image itself becomes the swap base (Image B) — no video,
     no frame extraction needed. De-dupes by filename."""
-    _url = f"photo://{file_obj.name}"
+    _data = _read_upload(file_obj)
+    _url = _content_key("photo", file_obj, _data)
     _dup = mm.find_item_by_url(_url)
     if _dup:
+        _ilog("dedupe", file_obj.name, True, f"ίδιο περιεχόμενο με #{_dup['id']}")
         return _dup["id"]
     _ext = (os.path.splitext(file_obj.name)[1] or ".jpg").lower()
     _img = tempfile.NamedTemporaryFile(delete=False, suffix=_ext)
-    _img.write(file_obj.read())
+    _img.write(_data)
     _img.close()
     _nid = mm.add_pipeline_item(_url, creator)      # status → 'downloaded'
-    mm.update_pipeline_item(_nid, frame_path=_img.name)
+    # a photo IS its own single frame — no extraction, so the multi-frame list
+    # is just that one image
+    mm.update_pipeline_item(_nid, frame_path=_img.name,
+                            frame_paths=mm.jdump([_img.name]))
+    _ilog("ingest", file_obj.name, True, f"#{_nid} · {len(_data)/1e6:.2f} MB φωτο")
     return _nid
 
 
@@ -716,6 +883,115 @@ def extract_frame(video_path, timestamp):
         pass
 
     raise RuntimeError("Δεν μπόρεσα να εξάγω frame — ffmpeg/av/cv2 δεν είναι διαθέσιμα")
+
+
+# ──────────────────────────────────────────────────────────
+# MULTI-FRAME REFERENCE SELECTION
+# ──────────────────────────────────────────────────────────
+# Seedance locks identity far more reliably when it gets several face/scene
+# references instead of one frame. We pull 3-4 frames spread across the clip so
+# they differ in angle, expression and moment, then drop near-duplicates.
+
+REF_FRAMES_TARGET = 4        # όσα προσπαθούμε να βγάλουμε από το κύριο video
+REF_FRAMES_MIN    = 2        # κάτω από αυτό η γενιά θεωρείται degraded
+_FRAME_POSITIONS  = (0.12, 0.38, 0.62, 0.85)   # A frontal-ish, B, C, D — spread out
+
+
+def _dhash(path, size: int = 16):
+    """Difference-hash of a frame (256 bits at size=16).
+
+    Deliberately fine-grained: an 8x8 hash averages a whole face away, so two
+    genuinely different moments of the same fixed-camera shot came out
+    identical and we threw away references we had already paid to extract.
+    """
+    try:
+        from PIL import Image
+        with Image.open(path) as _im:
+            _g = _im.convert("L").resize((size + 1, size), Image.LANCZOS)
+            _px = list(_g.getdata())
+        _bits = 0
+        for _row in range(size):
+            for _col in range(size):
+                _i = _row * (size + 1) + _col
+                _bits = (_bits << 1) | (1 if _px[_i] > _px[_i + 1] else 0)
+        return _bits
+    except Exception:
+        return None
+
+
+def _too_similar(h1, h2, max_dist: int = 3) -> bool:
+    """True only for VIRTUALLY IDENTICAL frames (≤3 differing bits of 256).
+
+    Strict on purpose — dropping a reference is worse than keeping a similar
+    one, because every extra reference helps Seedance hold the identity.
+    """
+    if h1 is None or h2 is None:
+        return False
+    return bin(h1 ^ h2).count("1") <= max_dist
+
+
+def _try_extract(video_path, ts, label=""):
+    """Extract one frame, retrying EARLIER if the timestamp lands past the end.
+
+    get_duration() falls back to a guess of 10 s when ffprobe is missing, so a
+    'late' position can sit beyond a shorter clip; ffmpeg then writes nothing
+    and the reference is silently lost. Walk backwards instead of giving up.
+    """
+    for _t in (ts, ts * 0.6, ts * 0.3, 0.5):
+        try:
+            _f = extract_frame(video_path, max(0.1, _t))
+            if _f and os.path.exists(_f) and os.path.getsize(_f) > 512:
+                return _f
+        except Exception:
+            continue
+    _ilog("frame", f"{label}@{ts:.1f}s", False, "καμία εξαγωγή σε 4 προσπάθειες")
+    return None
+
+
+def _select_frames(video_path, duration=None, want: int = REF_FRAMES_TARGET,
+                   label: str = "main") -> list:
+    """Extract up to `want` frames spread across the clip, for variety.
+
+    Positions are early / mid / late so the references differ in moment,
+    expression and angle rather than being one cover frame. Near-identical
+    frames are dropped — but never below REF_FRAMES_MIN while candidates
+    remain, since a slightly similar reference still beats no reference.
+    Never raises: returns whatever it managed to get.
+    """
+    if not (video_path and os.path.exists(video_path)):
+        _ilog("frames", label, False, "λείπει το αρχείο video")
+        return []
+    _dur = duration if duration else get_duration(video_path)
+    try:
+        _dur = float(_dur)
+    except (TypeError, ValueError):
+        _dur = 5.0
+    _dur = max(_dur, 0.6)
+    # candidates, one per position
+    _cands = []
+    for _pos in _FRAME_POSITIONS[:max(1, want)]:
+        _ts = max(0.2, min(_dur - 0.3, _pos * _dur))
+        _f = _try_extract(video_path, _ts, label)
+        if _f:
+            _cands.append(_f)
+    # greedy de-duplication
+    _kept, _hashes, _spare = [], [], []
+    for _f in _cands:
+        _h = _dhash(_f)
+        if any(_too_similar(_h, _o) for _o in _hashes):
+            _spare.append(_f)
+            continue
+        _kept.append(_f)
+        _hashes.append(_h)
+    # keep near-duplicates rather than fall under the minimum
+    while len(_kept) < min(REF_FRAMES_MIN, len(_cands)) and _spare:
+        _kept.append(_spare.pop(0))
+    for _f in _spare:                       # τα υπόλοιπα διπλά φεύγουν
+        try: os.remove(_f)
+        except OSError: pass
+    _ilog("frames", label, bool(_kept),
+          f"{len(_kept)} refs (candidates {len(_cands)}, διπλά {len(_spare)}) · {_dur:.1f}s")
+    return _kept
 
 
 def strip_metadata(in_path):
@@ -926,21 +1202,41 @@ from datetime import datetime as _dt
 # bound as a default argument in the MAIN thread at launch time; results
 # travel back exclusively through stdlib queues, drained by _bg_poller.
 
-def _launch_fs_poll(item_id: int, pred_id: str) -> None:
-    """Poll faceswap result in background; puts into _fs_queue."""
+def _launch_fs_poll(item_id: int, pred_ids) -> None:
+    """Poll EVERY face-swap prediction of one item; one message into _fs_queue.
+
+    An item now carries 3-4 swapped reference frames instead of one, so this
+    worker waits on all of them in parallel and reports which succeeded. A
+    single failed frame does NOT sink the item — the drain keeps going as long
+    as at least one swap came back (REF_FRAMES_MIN for full quality).
+    """
+    _preds = [pred_ids] if isinstance(pred_ids, str) else list(pred_ids or [])
     _q  = st.session_state["_fs_queue"]      # captured in main thread
     _wk = st.session_state.get("_wk", "")
-    def _w(q=_q, iid=item_id, pid=pred_id, wk=_wk):
-        try:
-            # photos are quick — 15 min budget is already generous
-            r, _cost = ws_poll_bg(pid, api_key=wk, max_wait=900)
-            q.put({"item_id": iid, "result": r, "pred": pid,
-                   "cost": _cost, "error": None})
-        except TimeoutError as e:
-            q.put({"item_id": iid, "result": None, "pred": pid,
-                   "error": f"Faceswap Failed: Server Timeout — {e}"})
-        except Exception as e:
-            q.put({"item_id": iid, "result": None, "pred": pid, "error": str(e)})
+
+    def _w(q=_q, iid=item_id, preds=tuple(_preds), wk=_wk):
+        _res = [None] * len(preds)           # (url, cost) per index
+        _err = [None] * len(preds)
+
+        def _one(_i, _pid):
+            try:
+                # photos are quick — 15 min budget is already generous
+                _r, _c = ws_poll_bg(_pid, api_key=wk, max_wait=900)
+                _res[_i] = (_r, _c)
+            except TimeoutError as _te:
+                _err[_i] = f"Server Timeout — {_te}"
+            except Exception as _e:
+                _err[_i] = str(_e)
+
+        _ths = [threading.Thread(target=_one, args=(_i, _p), daemon=True)
+                for _i, _p in enumerate(preds)]
+        for _t in _ths:
+            _t.start()
+        for _t in _ths:
+            _t.join()
+        q.put({"item_id": iid, "preds": list(preds),
+               "results": _res, "errors": _err, "error": None})
+
     st.session_state["_active_threads"].add(f"fs_{item_id}")
     threading.Thread(target=_w, daemon=True).start()
 
@@ -1034,21 +1330,105 @@ def _error_stage(item: dict):
     return "faceswap", "downloaded"
 
 
+def _job_meta(item_id, **fields) -> str:
+    """Merge counters into the item's `ingest_meta` JSON and return it.
+
+    This is the EXTENSION of the job status contract — the existing status
+    fields are untouched, this just adds visibility:
+        assets_ingested · frames_extracted · ref_frames_from_second_video
+        swaps_ok · swaps_failed · degraded · refs_sent · swap_errors
+    """
+    import json as _json
+    _cur = mm.get_pipeline_item(item_id) or {}
+    try:
+        _m = _json.loads(_cur.get("ingest_meta") or "{}")
+        if not isinstance(_m, dict):
+            _m = {}
+    except (ValueError, TypeError):
+        _m = {}
+    _m.update(fields)
+    return _json.dumps(_m)
+
+
+def _job_meta_read(item) -> dict:
+    import json as _json
+    try:
+        _m = _json.loads((item or {}).get("ingest_meta") or "{}")
+        return _m if isinstance(_m, dict) else {}
+    except (ValueError, TypeError):
+        return {}
+
+
+def _set_first_frame(item, new_path):
+    """Replace the FIRST reference frame (the one the user re-captured) while
+    keeping the rest of the multi-frame set intact. Ordering carries no special
+    meaning for Seedance — every reference is equal — it only decides which one
+    the single-image endpoints (Kling, image-to-video) get."""
+    if not new_path:
+        return
+    _fs = _item_frames(item)
+    _fs = [new_path] + [f for f in _fs if f != item.get("frame_path")]
+    mm.update_pipeline_item(item["id"], frame_path=new_path,
+                            frame_paths=mm.jdump(_fs))
+
+
+def _item_frames(item) -> list:
+    """Every reference frame of an item — the JSON list, falling back to the
+    legacy single frame_path so pre-upgrade rows keep working."""
+    _fs = [f for f in mm.jlist(item, "frame_paths") if f and os.path.exists(f)]
+    if _fs:
+        return _fs
+    _one = (item or {}).get("frame_path")
+    return [_one] if (_one and os.path.exists(_one)) else []
+
+
+def _item_refs(item) -> list:
+    """Every SWAPPED reference url — all equal references of the same scene.
+    Falls back to the legacy single faceswap_url for rows created before the
+    multi-frame upgrade."""
+    _us = [u for u in mm.jlist(item, "faceswap_urls") if _valid_ref_image(u)]
+    if _us:
+        return _us
+    _one = ((item or {}).get("faceswap_url") or "").strip()
+    return [_one] if _valid_ref_image(_one) else []
+
+
 def _valid_ref_image(url) -> bool:
     """A usable reference image is a non-empty http(s) URL or data: URI."""
     u = (url or "").strip()
     return u.startswith("http") or u.startswith("data:")
 
 
-def _submit_video_edit(video_path: str, ref_img: str, prompt: str) -> str:
+REFS_PREAMBLE = (
+    "All reference images are swapped frames of the SAME person in this SAME "
+    "scene, taken at different moments and angles. Treat them together as one "
+    "consistent character and setting. Do not invent, swap or blend in a "
+    "different face. Keep the face and the scene identical and stable across "
+    "the whole generated clip."
+)
+
+
+def _refs_prompt(prompt: str, n_refs: int) -> str:
+    """Prefix the user's prompt with the reference instruction.
+
+    Every reference is an equal, swapped frame of the same scene — none of them
+    is singled out as "the face". Seedance simply gets told that all of them
+    show one consistent person and setting, and must not drift to another face.
+    """
+    if n_refs <= 1:
+        return prompt
+    return f"{REFS_PREAMBLE}\n\n{prompt}"
+
+
+def _submit_video_edit(video_path: str, ref_imgs, prompt: str) -> str:
     """Submit to bytedance/seedance-2.0/video-edit with the approved
-    faceswap photo as the reference image.
+    faceswap photos as the reference images.
 
     PAYLOAD SCHEMA — per the official WaveSpeed API docs
     (wavespeed.ai/docs/docs-api/bytedance/bytedance-seedance-2.0-video-edit):
       video             (required) source video
       prompt            (required) edit instruction
-      reference_images  (optional) up to 9 images guiding character identity
+      reference_images  (optional) UP TO 9 images guiding character identity
       aspect_ratio      9:16 for reels
       resolution        480p/720p/1080p/4k
       generate_audio    TRUE — ask WaveSpeed to return the video WITH audio
@@ -1057,18 +1437,27 @@ def _submit_video_edit(video_path: str, ref_img: str, prompt: str) -> str:
                         audio came back with the ORIGINAL reel track, so the
                         final sound is always the authentic one.
 
+    `reference_images` was ALWAYS a list — we now fill it with 3-4 swapped
+    frames instead of one. Every entry is an EQUAL reference: swapped frames of
+    the same person in the same scene at different moments. None is singled out
+    as "the face" — frames from a second source video simply join the list as
+    more of the same kind of reference.
+
     The old code sent `images` — the endpoint silently IGNORES unknown
     fields (no 400), so the model never received the faceswap reference and
     returned the video un-edited. `reference_images` is the correct key.
 
-    PRE-FLIGHT (credit protection): if the reference image is missing or
-    malformed, raise BEFORE any network call — zero credits burned.
+    PRE-FLIGHT (credit protection): if no reference image is valid, raise
+    BEFORE any network call — zero credits burned.
     """
-    if not _valid_ref_image(ref_img):
+    _refs = [ref_imgs] if isinstance(ref_imgs, str) else list(ref_imgs or [])
+    _refs = [r for r in _refs if _valid_ref_image(r)][:9]      # API cap
+    if not _refs:
         raise RuntimeError(
             "Error: Missing reference image for video edit — "
             "το approved faceswap δεν έχει έγκυρο URL. Το αίτημα ΔΕΝ στάλθηκε (0 credits)."
         )
+    # όλα τα refs είναι ισότιμα — κανένα δεν δηλώνεται ως «το πρόσωπο»
     if not (video_path and os.path.exists(video_path)):
         raise RuntimeError("Το αρχικό source video λείπει — δεν γίνεται video-edit.")
     # SAFETY NET: a large source (iPhone .MOV, hi-bitrate) blows up the base64
@@ -1082,14 +1471,16 @@ def _submit_video_edit(video_path: str, ref_img: str, prompt: str) -> str:
         "bytedance/seedance-2.0/video-edit",
         {
             "video": _vb64,
-            "prompt": prompt,
-            "reference_images": [ref_img],
+            "prompt": _refs_prompt(prompt, len(_refs)),
+            "reference_images": _refs,
             "aspect_ratio": "9:16",
             "resolution": "720p",
             "generate_audio": True,
         },
     )
-    print(f"[video-edit] submitted — reference_images=[faceswap] ✓ (pred {_pid})")
+    print(f"[video-edit] submitted — reference_images={len(_refs)} "
+          f"ισότιμα swapped refs ✓ (pred {_pid})")
+    _ilog("seedance", f"pred {_pid}", True, f"{len(_refs)} refs")
     return _pid
 
 
@@ -1157,23 +1548,46 @@ def _bg_poller():
         _res = _fsq.get_nowait()
         _iid = _res["item_id"]
         st.session_state["_active_threads"].discard(f"fs_{_iid}")
-        _fs_url = (_res.get("result") or "").strip()
-        # MONEY: the swap was billed at dispatch — swap the estimate for the
-        # real price if WaveSpeed reported one. The ledger row stays either way,
+        _preds  = _res.get("preds") or []
+        _rows   = _res.get("results") or []
+        _errs   = _res.get("errors") or []
+        # MONEY: every swap was billed at dispatch — swap each estimate for the
+        # real price where WaveSpeed reported one. Ledger rows stay either way,
         # even if the photo is rejected or deleted right after.
-        if _res.get("cost") is not None:
-            mm.settle_spend(_res.get("pred"), round(float(_res["cost"]), 4))
-        if _res["error"]:
+        _urls, _failed = [], []
+        for _i, _p in enumerate(_preds):
+            _row = _rows[_i] if _i < len(_rows) else None
+            if _row and _row[1] is not None:
+                mm.settle_spend(_p, round(float(_row[1]), 4))
+            _u = (_row[0] if _row else "") or ""
+            if _valid_ref_image(_u.strip()):
+                _urls.append(_u.strip())
+            else:
+                _failed.append(f"frame {_i + 1}: "
+                               f"{(_errs[_i] if _i < len(_errs) else None) or 'κενό URL'}")
+        if _res.get("error"):
             mm.update_pipeline_item(_iid, status="error", error_msg=_res["error"])
-        elif not _valid_ref_image(_fs_url):
+        elif not _urls:
             # STATE-BRIDGE GUARD: a "completed" swap with an empty/invalid URL
             # must never become a reviewable photo — downstream it would send
             # a blank reference to the video API and waste credits
-            mm.update_pipeline_item(_iid, status="error",
-                                    error_msg="Το faceswap ολοκληρώθηκε αλλά δεν επέστρεψε εικόνα (κενό URL) — κάνε Retry.")
+            mm.update_pipeline_item(
+                _iid, status="error",
+                error_msg="Κανένα faceswap δεν επέστρεψε εικόνα — κάνε Retry. "
+                          + " · ".join(_failed[:3]))
         else:
+            # PARTIAL SUCCESS IS SUCCESS: with ≥1 swapped ref we continue and
+            # log which frames dropped. Below REF_FRAMES_MIN we still continue
+            # but flag the job as degraded so it is visible downstream.
+            _meta = _job_meta(_iid, swaps_ok=len(_urls), swaps_failed=len(_failed),
+                              degraded=len(_urls) < REF_FRAMES_MIN,
+                              swap_errors=_failed[:4])
             mm.update_pipeline_item(_iid, status="pending_photo_review",
-                                    faceswap_url=_fs_url, error_msg=None)
+                                    faceswap_url=_urls[0],           # πρώτο ref (legacy field)
+                                    faceswap_urls=mm.jdump(_urls),
+                                    ingest_meta=_meta, error_msg=None)
+            print(f"[faceswap] item #{_iid}: {len(_urls)}/{len(_preds)} refs ΟΚ"
+                  + (f" · έπεσαν: {_failed}" if _failed else ""))
         _changed = True
 
     # ── Drain generation queue → generated_pending_scrub ─────────────
@@ -1459,26 +1873,53 @@ def _download_all_button(key, label, photos=(), videos=(), filename="whale.zip",
 # Both the per-card buttons and the *All buttons go through these, so the
 # pre-flight checks that protect credits can never drift apart between them.
 
-def _dispatch_swap(item) -> str:
-    """Submit ONE face swap and ledger the charge. The item must already be
-    claimed into 'swapping'. Raises on failure — caller marks it errored."""
+def _dispatch_swap(item) -> list:
+    """Submit a face swap for EVERY reference frame of the item.
+
+    3-4 swapped frames (same identity on all) give Seedance far more to lock
+    onto than a single one. Each submit is billed, so each gets its own ledger
+    row. A frame that fails to submit is logged and skipped — as long as one
+    submit succeeds the item stays alive; the poller then decides whether the
+    result set is full quality or degraded.
+
+    The item must already be claimed into 'swapping'. Returns the pred ids.
+    """
+    _frames = _item_frames(item)
+    if not _frames:
+        raise RuntimeError("δεν υπάρχουν frames για swap")
     _cb = (st.session_state["creator2_bytes"] if item["creator"] == "MELINA"
            else st.session_state["creator_bytes"])
-    with open(item["frame_path"], "rb") as _ffr:
-        _fb = to_b64(_ffr.read())
-    _pid = ws_submit(
-        "wavespeed-ai/qwen-image-2.0-pro/edit",
-        {"images": [to_b64(_cb), _fb],
-         "prompt": st.session_state.get("_fs_prompt", DEFAULT_FACE_SWAP_PROMPT),
-         "seed": -1},
-    )
-    mm.update_pipeline_item(item["id"], faceswap_pred=_pid, faceswap_url=None)
-    # MONEY: WaveSpeed charges the photo edit NOW — ledger it before anything
-    # can be deleted
-    mm.record_spend(_pid, item["id"], kind="photo", model_key="faceswap",
-                    amount=ce.photo_cost())
-    _launch_fs_poll(item["id"], _pid)
-    return _pid
+    _prompt = st.session_state.get("_fs_prompt", DEFAULT_FACE_SWAP_PROMPT)
+    _ref_b64 = to_b64(_cb)                      # identity target — same on all
+    _preds, _errs = [], []
+    for _i, _fp in enumerate(_frames):
+        try:
+            with open(_fp, "rb") as _ffr:
+                _fb = to_b64(_ffr.read())
+            _pid = ws_submit(
+                "wavespeed-ai/qwen-image-2.0-pro/edit",
+                {"images": [_ref_b64, _fb], "prompt": _prompt, "seed": -1},
+            )
+            _preds.append(_pid)
+            # MONEY: WaveSpeed charges each photo edit NOW — ledger before
+            # anything can be deleted
+            mm.record_spend(_pid, item["id"], kind="photo", model_key="faceswap",
+                            amount=ce.photo_cost())
+            _ilog("swap", f"#{item['id']} frame {_i + 1}", True, _pid)
+        except Exception as _se:
+            _errs.append(f"frame {_i + 1}: {_se}")
+            _ilog("swap", f"#{item['id']} frame {_i + 1}", False, str(_se))
+    if not _preds:
+        raise RuntimeError("κανένα frame δεν στάλθηκε για swap — " + " · ".join(_errs[:2]))
+    mm.update_pipeline_item(
+        item["id"], faceswap_pred=_preds[0],            # πρώτο pred (legacy field)
+        faceswap_preds=mm.jdump(_preds), faceswap_url=None,
+        faceswap_urls=mm.jdump([]),
+        ingest_meta=_job_meta(item["id"], frames_extracted=len(_frames),
+                              swaps_submitted=len(_preds),
+                              submit_errors=_errs[:3]))
+    _launch_fs_poll(item["id"], _preds)
+    return _preds
 
 
 def _dispatch_generation(item, model_key, prompt, ref_img=None):
@@ -1487,14 +1928,19 @@ def _dispatch_generation(item, model_key, prompt, ref_img=None):
     PRE-FLIGHT: an invalid reference or a missing source raises BEFORE any
     network call, so a bad item burns 0 credits. The item must already be
     claimed into 'generating'."""
-    _ref = (ref_img if ref_img is not None else (item.get("faceswap_url") or "")).strip()
-    if not _valid_ref_image(_ref):
+    # ALL swapped refs, equal in weight. `ref_img` (single) still works for the
+    # legacy callers; it just becomes a one-element list.
+    _refs = [ref_img] if isinstance(ref_img, str) and ref_img else _item_refs(item)
+    _refs = [r for r in _refs if _valid_ref_image(r)]
+    if not _refs:
         raise RuntimeError(
             "Error: Missing reference image for video edit — "
             "το αίτημα ΔΕΝ στάλθηκε (0 credits).")
+    _ref = _refs[0]        # μόνο για τα endpoints που δέχονται ΜΙΑ εικόνα
     _vp = item.get("video_path")
     _has_vid = bool(_vp and os.path.exists(_vp))
     if model_key == "kling":
+        # Kling motion-control takes ONE image — use the first reference.
         if not _has_vid:
             raise RuntimeError("Το αρχικό video λείπει — δεν γίνεται Kling.")
         _kv = _vp
@@ -1507,19 +1953,29 @@ def _dispatch_generation(item, model_key, prompt, ref_img=None):
                  "prompt": prompt, "duration": 5,
                  "aspect_ratio": "9:16", "cfg_scale": 0.5, "seed": -1})
         _cost = ce.kling_cost(_cached_duration(_vp))
+        _sent = 1
     elif _has_vid:
-        # VIDEO-EDIT (v2v) — helper does its own validation + payload mapping
-        _pid = _submit_video_edit(_vp, _ref, prompt)
+        # VIDEO-EDIT (v2v) — the multi-reference path: every swapped frame goes
+        # in, helper does its own validation + payload mapping
+        _pid = _submit_video_edit(_vp, _refs, prompt)
         _cost = ce.seedance_cost(_cached_duration(_vp))
+        _sent = len(_refs[:9])
     else:
         # no source video (e.g. vault-only photo) → graceful i2v fallback
+        # (image-to-video takes a single image → the first reference)
         _pid = ws_submit(
             "bytedance/seedance-2.0/image-to-video",
             {"image": _ref, "prompt": prompt, "duration": 5,
              "resolution": "720p", "seed": -1})
         _cost = ce.seedance_cost(5)
+        _sent = 1
     mm.record_spend(_pid, item["id"], kind="video", model_key=model_key,
                     amount=_cost)
+    mm.update_pipeline_item(
+        item["id"],
+        ingest_meta=_job_meta(item["id"], refs_sent=_sent,
+                              refs_available=len(_refs),
+                              degraded=_sent < REF_FRAMES_MIN))
     return _pid, _cost
 
 
@@ -1691,6 +2147,34 @@ def _cost_badge(item):
     )
 
 
+def _refs_badge(item):
+    """Job-contract badge: πόσα frames βγήκαν, πόσα swaps πέτυχαν, πόσα refs
+    στάλθηκαν στο Seedance — και αν το job είναι degraded (1 μόνο ref)."""
+    _m = _job_meta_read(item)
+    if not _m:
+        return
+    _bits = []
+    if _m.get("frames_extracted"):
+        _bits.append(f"🖼 {_m['frames_extracted']} frames")
+    if _m.get("swaps_ok") is not None:
+        _bits.append(f"🎭 {_m['swaps_ok']}/{_m.get('swaps_submitted', _m['swaps_ok'])} swaps")
+    if _m.get("refs_sent"):
+        _bits.append(f"📎 {_m['refs_sent']} refs → Seedance")
+    if _m.get("ref_frames_from_second_video"):
+        _bits.append(f"🎬 +{_m['ref_frames_from_second_video']} από 2ο video")
+    if not _bits:
+        return
+    _deg = bool(_m.get("degraded"))
+    _c = "#fbbf24" if _deg else "#4ade80"
+    st.markdown(
+        f"<div style='font-size:10px;color:{_c};margin-bottom:3px'>"
+        f"{' · '.join(_bits)}{' · ⚠ DEGRADED (1 ref)' if _deg else ''}</div>",
+        unsafe_allow_html=True)
+    _errs = _m.get("swap_errors") or []
+    if _errs:
+        st.caption("⚠ " + " · ".join(str(e)[:40] for e in _errs[:2]))
+
+
 def _processing_card(item, label):
     _card_header(item, "#fbbf24")
     st.info(f"⏳ {label} — Please wait.")
@@ -1732,6 +2216,7 @@ def _grid(items):
 # TAB 1 — DISCOVERY
 # ════════════════════════════════════════════════════════
 with _t_disc:
+    _render_ingest_report("disc")
     # ══════════════════════════════════════════════════════
     # AUTO-DISCOVER — find viral solo Reels from the niche
     # ══════════════════════════════════════════════════════
@@ -1867,18 +2352,16 @@ with _t_disc:
                        f"για faceswap → Seedance, όπως τα υπόλοιπα.")
             if st.button(f"➕ Πρόσθεσε {len(_uplist)} στο pipeline",
                          type="primary", use_container_width=True, key="disco_upload_btn"):
-                _upb = st.progress(0, text="⬆ Ανεβάζω…")
-                _uok = 0
+                _ingest_report_reset()
+                _upb = st.progress(0.0, text="⬆ Ανεβάζω…")
                 for _ui, _uf in enumerate(_uplist):
                     _upb.progress((_ui + 1) / len(_uplist),
                                   text=f"⬆ [{_ui+1}/{len(_uplist)}] {_uf.name[:30]}")
                     try:
                         _ingest_upload(_uf, "MELINA")
-                        _uok += 1
                     except Exception as _ue:
-                        st.warning(f"{_uf.name}: {_ue}")
+                        _ilog("ingest", _uf.name, False, str(_ue))
                 _upb.empty()
-                st.success(f"✅ {_uok} βίντεο μπήκαν στο pipeline!")
                 st.rerun()
 
     with st.container(border=True):
@@ -1907,35 +2390,19 @@ with _t_disc:
             if not st.session_state.get("_hk") and not st.session_state.get("_ak"):
                 st.error("Βάλε HikerAPI ή Apify key στο sidebar.")
             else:
-                _prog_d = st.progress(0, text="⏳ Κατεβάζω…")
-                _errs_d = []
-                _creators = ["MELINA"]
+                # ONE ingest path: this used to be a second, drifted copy of
+                # _ingest_reel with no de-dupe and no verified download.
+                _ingest_report_reset()
+                _prog_d = st.progress(0.0, text="⏳ Κατεβάζω…")
                 for _di, _durl in enumerate(_disc_urls):
-                    _prog_d.progress(_di / _n_disc, text=f"[{_di+1}/{_n_disc}] {_durl[-50:]}")
+                    _prog_d.progress((_di + 1) / _n_disc,
+                                     text=f"[{_di+1}/{_n_disc}] {_durl[-50:]}")
                     try:
-                        _dvurl = None
-                        if st.session_state.get("_hk"):
-                            try: _dvurl = hiker_get_video_url(_durl)
-                            except Exception: pass
-                        if not _dvurl and st.session_state.get("_ak"):
-                            _dvurl = apify_get_video_url(_durl)
-                        if not _dvurl:
-                            _errs_d.append(f"❌ {_durl}: δεν βρέθηκε video")
-                            continue
-                        _dvpath = download_video_url(_dvurl)
-                        _ddur   = get_duration(_dvpath)
-                        _dframe = extract_frame(_dvpath, max(0.3, 0.05 * _ddur))
-                        for _cr in _creators:
-                            _new_id = mm.add_pipeline_item(_durl, _cr)
-                            mm.update_pipeline_item(_new_id, video_path=_dvpath, frame_path=_dframe)
+                        _ingest_reel(_durl, "MELINA")
                     except Exception as _de:
-                        _errs_d.append(f"❌ {_durl}: {_de}")
-                _prog_d.progress(1.0, text="✅ Ολοκληρώθηκε!")
-                time.sleep(0.4)
+                        _ilog("ingest", _durl, False, str(_de))
                 _prog_d.empty()
-                for _err in _errs_d:
-                    st.warning(_err)
-                st.rerun()
+                st.rerun()          # το report επιβιώνει στο session_state
 
     # ── Pipeline overview ─────────────────────────────────────────
     _all_items = mm.get_pipeline_items()
@@ -1989,6 +2456,7 @@ with _t_disc:
 # TAB 2 — FACE SWAP  (review lifecycle: Approve / Recreate / Delete)
 # ════════════════════════════════════════════════════════
 with _t_face:
+    _render_ingest_report("face")
     with st.expander("✏️ Face Swap Prompt", expanded=False):
         st.session_state["_fs_prompt"] = st.text_area(
             "Prompt", value=st.session_state.get("_fs_prompt", DEFAULT_FACE_SWAP_PROMPT),
@@ -2010,18 +2478,16 @@ with _t_face:
                        f"(με τη reference + το prompt σου).")
             if st.button(f"➕ Πρόσθεσε {len(_fs_up)} για Swap",
                          type="primary", use_container_width=True, key="fs_upload_btn"):
-                _fpb = st.progress(0, text="⬆ Ανεβάζω…")
-                _fok = 0
+                _ingest_report_reset()
+                _fpb = st.progress(0.0, text="⬆ Ανεβάζω…")
                 for _fui, _fuf in enumerate(_fs_up):
                     _fpb.progress((_fui + 1) / len(_fs_up),
                                   text=f"⬆ [{_fui+1}/{len(_fs_up)}] {_fuf.name[:30]}")
                     try:
                         _ingest_photo_upload(_fuf, "MELINA")
-                        _fok += 1
                     except Exception as _fue:
-                        st.warning(f"{_fuf.name}: {_fue}")
+                        _ilog("ingest", _fuf.name, False, str(_fue))
                 _fpb.empty()
-                st.success(f"✅ {_fok} φωτογραφίες έτοιμες για Swap παρακάτω!")
                 st.rerun()
 
     _render_errors("faceswap")
@@ -2068,6 +2534,7 @@ with _t_face:
                             st.image(_rv["faceswap_url"], use_container_width=True)
                         except Exception:
                             st.caption("(εικόνα μη διαθέσιμη)")
+                    _refs_badge(_rv)
                     _photo_dl_button(_rv, key_prefix="rev")
                     _rc1, _rc2, _rc3 = st.columns([2, 2, 1])
                     with _rc1:
@@ -2136,16 +2603,56 @@ with _t_face:
                             with _fth_cols[_fti]:
                                 if st.button(f"{_ftt:.1f}s", key=f"fth_{_fi['id']}_{_fti}",
                                               use_container_width=True):
-                                    _nfp = extract_frame(_fi["video_path"], _ftt)
-                                    mm.update_pipeline_item(_fi["id"], frame_path=_nfp)
+                                    _set_first_frame(_fi, extract_frame(_fi["video_path"], _ftt))
                                     st.rerun()
                         _fsl = st.slider("frame", 0.0, float(_vdur), 1.0, 0.1,
                                           key=f"fsl_{_fi['id']}", label_visibility="collapsed")
                         if st.button("📸 Capture", key=f"fcap_{_fi['id']}", use_container_width=True):
-                            _nfp2 = extract_frame(_fi["video_path"], _fsl)
-                            mm.update_pipeline_item(_fi["id"], frame_path=_nfp2)
+                            _set_first_frame(_fi, extract_frame(_fi["video_path"], _fsl))
                             st.rerun()
-                    if st.button("🎭 Swap", key=f"fs_btn_{_fi['id']}",
+                    # ── EXTRA REFS ΑΠΟ 2ο VIDEO ───────────────────
+                    # Περισσότερα refs = πιο σταθερή ταυτότητα. Τα frames του
+                    # 2ου video κάνουν swap και μπαίνουν στη λίστα ΙΣΟΤΙΜΑ με
+                    # τα υπόλοιπα — κανένα ref δεν είναι «το πρόσωπο».
+                    _nref = len(_item_frames(_fi))
+                    with st.expander(f"➕ Refs: {_nref} frames", expanded=False):
+                        _rv2 = st.file_uploader(
+                            "2ο video (μόνο για extra refs)", type=["mp4", "mov", "m4v"],
+                            key=f"ref2_{_fi['id']}", label_visibility="collapsed")
+                        if _rv2 and st.button("➕ Πρόσθεσε refs", key=f"ref2b_{_fi['id']}",
+                                              use_container_width=True):
+                            try:
+                                _rdata = _read_upload(_rv2)
+                                _rtmp = tempfile.NamedTemporaryFile(
+                                    delete=False,
+                                    suffix=(os.path.splitext(_rv2.name)[1] or ".mp4"))
+                                _rtmp.write(_rdata); _rtmp.close()
+                                _extra = _select_frames(_rtmp.name, want=2,
+                                                        label=f"ref2:{_rv2.name}")
+                                if not _extra:
+                                    st.error("Δεν βγήκε frame από το 2ο video.")
+                                else:
+                                    _merged = _item_frames(_fi) + _extra
+                                    mm.update_pipeline_item(
+                                        _fi["id"], ref_video_path=_rtmp.name,
+                                        frame_paths=mm.jdump(_merged),
+                                        ingest_meta=_job_meta(
+                                            _fi["id"],
+                                            frames_extracted=len(_merged),
+                                            ref_frames_from_second_video=len(_extra)))
+                                    st.success(f"✅ +{len(_extra)} refs (σύνολο {len(_merged)})")
+                                    st.rerun()
+                            except Exception as _r2e:
+                                st.error(f"2ο video: {_r2e}")
+                        _fr_prev = _item_frames(_fi)
+                        if len(_fr_prev) > 1:
+                            _pc = st.columns(min(4, len(_fr_prev)))
+                            for _pi, _pf in enumerate(_fr_prev[:4]):
+                                with _pc[_pi % len(_pc)]:
+                                    st.image(_pf, use_container_width=True)
+                                    st.caption(f"ref {_pi+1}")
+
+                    if st.button(f"🎭 Swap ({_nref} frames)", key=f"fs_btn_{_fi['id']}",
                                   type="primary", use_container_width=True):
                         if not st.session_state.get("_wk"):
                             st.error("Βάλε Wavespeed key στο sidebar.")
@@ -2299,8 +2806,10 @@ with _t_gen:
                     # ── PRE-FLIGHT LAYER 1 (render): the reference image is
                     # the approved faceswap output — if it's missing, the
                     # button never even becomes clickable
-                    _ref_img = (_gi.get("faceswap_url") or "").strip()
-                    _ref_ok  = _valid_ref_image(_ref_img)
+                    _refs_badge(_gi)
+                    _all_refs = _item_refs(_gi)
+                    _ref_img  = _all_refs[0] if _all_refs else ""
+                    _ref_ok   = bool(_all_refs)
                     if not _ref_ok:
                         st.error("❌ Missing reference image — το approved faceswap δεν έχει "
                                  "έγκυρο URL. Στείλ' το πίσω με ↩ και κάνε 🔄 Recreate.")
@@ -2350,8 +2859,9 @@ with _t_gen:
                                     # LAYER-3 pre-flight + exact price + ledger all
                                     # live in the shared dispatcher, so this card
                                     # and 🎬 Generate All behave identically
-                                    _gpid, _cost_est = _dispatch_generation(
-                                        _gi, _mk, _gp, ref_img=_ref_img)
+                                    # ref_img=None → the dispatcher pulls EVERY
+                                    # swapped reference off the item
+                                    _gpid, _cost_est = _dispatch_generation(_gi, _mk, _gp)
                                     mm.update_pipeline_item(_gi["id"], gen_pred=_gpid,
                                                             model_key=_mk, prompt=_gp,
                                                             gen_cost=_cost_est)
@@ -2391,6 +2901,7 @@ with _t_gen:
 # TAB 4 — AUDIT  (Send to Scrub / Recreate Video / Delete)
 # ════════════════════════════════════════════════════════
 with _t_audit:
+    _render_ingest_report("audit")
     _render_errors("audit")
 
     # ── Upload finished videos straight into Audit (skip generation) ──
@@ -2403,17 +2914,16 @@ with _t_audit:
             st.caption(f"✓ {len(_au_up)} αρχείο(α) — θα μπουν κατευθείαν στο «Pending» για scrub & distribute.")
             if st.button(f"⬆ Πρόσθεσε {len(_au_up)} για Scrub", type="primary",
                          use_container_width=True, key="audit_upload_btn"):
-                _aub = st.progress(0, text="⬆ Ανεβάζω…")
-                _auok = 0
+                _ingest_report_reset()
+                _aub = st.progress(0.0, text="⬆ Ανεβάζω…")
                 for _aui, _auf in enumerate(_au_up):
-                    _aub.progress((_aui + 1) / len(_au_up), text=f"⬆ [{_aui+1}/{len(_au_up)}] {_auf.name[:30]}")
+                    _aub.progress((_aui + 1) / len(_au_up),
+                                  text=f"⬆ [{_aui+1}/{len(_au_up)}] {_auf.name[:30]}")
                     try:
                         _ingest_audit_upload(_auf, "MELINA")
-                        _auok += 1
                     except Exception as _aue:
-                        st.warning(f"{_auf.name}: {_aue}")
+                        _ilog("ingest", _auf.name, False, str(_aue))
                 _aub.empty()
-                st.success(f"✅ {_auok} βίντεο μπήκαν για scrub!")
                 st.rerun()
 
     _au_pending  = mm.get_pipeline_items(status="generated_pending_scrub")
@@ -2475,6 +2985,7 @@ with _t_audit:
             with _ap_cols[_api % _ap_w]:
                 with st.container(border=True):
                     _card_header(_ai, "#34d399")
+                    _refs_badge(_ai)
                     _cost_badge(_ai)
                     _gfp = _ai.get("gen_path")
                     if _gfp and os.path.exists(_gfp):
