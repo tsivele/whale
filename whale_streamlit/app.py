@@ -1879,6 +1879,21 @@ MAX_SWAP_LAYERS     = 4        # πόσα layers το πολύ
 DEFAULT_SWAP_LAYERS = 4        # προεπιλογή για νέο item
 
 
+def _clamp_layers(v, lo: int = 1) -> int:
+    """Κράτα ένα layer count μέσα στα όρια του number_input.
+
+    Παλιά rows (target_layers από εποχή με μεγαλύτερο MAX) ή διπλό Approve
+    μπορεί να δώσουν τιμή πάνω από το MAX_SWAP_LAYERS. Το st.number_input
+    πετάει StreamlitValueAboveMaxError αν το value ή το min ξεπερνά το max,
+    και τότε ΟΛΗ η σελίδα σκάει σε κάθε render.
+    """
+    try:
+        v = int(v or DEFAULT_SWAP_LAYERS)
+    except (TypeError, ValueError):
+        v = DEFAULT_SWAP_LAYERS
+    return max(lo, min(v, MAX_SWAP_LAYERS))
+
+
 def _layer_urls(item) -> list:
     """Το εγκεκριμένο output ΚΑΘΕ layer, με τη σειρά (layer 1 → N)."""
     return [u for u in mm.jlist(item, "layer_urls") if _valid_ref_image(u)]
@@ -1945,12 +1960,19 @@ def _approve_layer(item) -> str:
     εικόνες ως references.
     Επιστρέφει 'next' ή 'done'.
     """
+    _target = _clamp_layers(item.get("target_layers"))
+    _prev = _layer_urls(item)
+    # Διπλό κλικ / stale rerun: το item έχει ήδη όλα τα layers. Μην γράψεις
+    # ΕΠΙΠΛΕΟΝ url — απλά βεβαιώσου ότι έφυγε από το review, αλλιώς η κάρτα
+    # ξαναγράφεται με layer N+1 και το number_input σκάει.
+    if len(_prev) >= _target:
+        mm.claim_pipeline_item(item["id"], "pending_photo_review", "approved_photo")
+        return "done"
     _url = (item.get("faceswap_url") or "").strip()
     if not _valid_ref_image(_url):
         raise RuntimeError("το layer δεν έχει έγκυρη εικόνα")
-    _done = _layer_urls(item) + [_url]
+    _done = _prev + [_url]
     _layer = len(_done)
-    _target = int(item.get("target_layers") or DEFAULT_SWAP_LAYERS)
     mm.update_pipeline_item(
         item["id"], swap_layer=_layer, layer_urls=mm.jdump(_done),
         faceswap_urls=mm.jdump(_done),
@@ -2603,7 +2625,7 @@ with _t_face:
                     # ── LAYER STATE ────────────────────────────────
                     _lay_done = len(_layer_urls(_rv))
                     _lay_now  = _lay_done + 1                    # αυτό που κρίνεις
-                    _lay_tgt  = int(_rv.get("target_layers") or DEFAULT_SWAP_LAYERS)
+                    _lay_tgt  = _clamp_layers(_rv.get("target_layers"))
                     st.markdown(
                         f"<div style='font-size:11px;font-weight:700;color:#c084fc'>"
                         f"🧅 Swap {_lay_now}/{_lay_tgt}"
@@ -2655,9 +2677,10 @@ with _t_face:
                             _finish_layers(_rv)
                             st.rerun()
                     with _le2:
+                        _lay_lo = _clamp_layers(_lay_now)
                         _nt = st.number_input(
-                            "layers", min_value=max(1, _lay_now), max_value=MAX_SWAP_LAYERS,
-                            value=max(_lay_tgt, _lay_now), step=1,
+                            "layers", min_value=_lay_lo, max_value=MAX_SWAP_LAYERS,
+                            value=max(_lay_tgt, _lay_lo), step=1,
                             key=f"rev_tgt_{_rv['id']}", label_visibility="collapsed")
                         if int(_nt) != _lay_tgt:
                             mm.update_pipeline_item(_rv["id"], target_layers=int(_nt))
@@ -2719,7 +2742,7 @@ with _t_face:
                     # τα υπόλοιπα — κανένα ref δεν είναι «το πρόσωπο».
                     # ── ΠΟΙΟΣ ΓΥΡΟΣ ΕΙΝΑΙ ──────────────────────────
                     _got = _layer_urls(_fi)
-                    _tgt = int(_fi.get("target_layers") or DEFAULT_SWAP_LAYERS)
+                    _tgt = _clamp_layers(_fi.get("target_layers"))
                     _round = len(_got) + 1
                     st.markdown(
                         f"<div style='font-size:11px;font-weight:700;color:#c4b5fd'>"
@@ -2735,9 +2758,10 @@ with _t_face:
                                     st.caption(f"#{_gi2 + 1}")
                                 except Exception:
                                     pass
+                    _got_lo = _clamp_layers(len(_got) or 1)
                     _ntg = st.number_input(
-                        "πόσα swaps θέλεις", min_value=max(1, len(_got) or 1),
-                        max_value=MAX_SWAP_LAYERS, value=max(_tgt, len(_got) or 1),
+                        "πόσα swaps θέλεις", min_value=_got_lo,
+                        max_value=MAX_SWAP_LAYERS, value=max(_tgt, _got_lo),
                         step=1, key=f"fs_tgt_{_fi['id']}")
                     if int(_ntg) != _tgt:
                         mm.update_pipeline_item(_fi["id"], target_layers=int(_ntg))
