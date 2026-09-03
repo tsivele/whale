@@ -1383,10 +1383,13 @@ def _item_frames(item) -> list:
 
 
 def _item_refs(item) -> list:
-    """Every SWAPPED reference url — all equal references of the same scene.
-    Falls back to the legacy single faceswap_url for rows created before the
-    multi-frame upgrade."""
-    _us = [u for u in mm.jlist(item, "faceswap_urls") if _valid_ref_image(u)]
+    """Ό,τι στέλνεται στο Seedance ως reference: το output ΚΑΘΕ εγκεκριμένου
+    layer, με σειρά (layer 1 → N). Όλα ισότιμα references της ίδιας σκηνής —
+    το τελευταίο layer είναι απλώς το πιο «δουλεμένο».
+    Fallback στο legacy faceswap_url για items πριν την αναβάθμιση."""
+    _us = [u for u in mm.jlist(item, "layer_urls") if _valid_ref_image(u)]
+    if not _us:
+        _us = [u for u in mm.jlist(item, "faceswap_urls") if _valid_ref_image(u)]
     if _us:
         return _us
     _one = ((item or {}).get("faceswap_url") or "").strip()
@@ -1576,18 +1579,17 @@ def _bg_poller():
                 error_msg="Κανένα faceswap δεν επέστρεψε εικόνα — κάνε Retry. "
                           + " · ".join(_failed[:3]))
         else:
-            # PARTIAL SUCCESS IS SUCCESS: with ≥1 swapped ref we continue and
-            # log which frames dropped. Below REF_FRAMES_MIN we still continue
-            # but flag the job as degraded so it is visible downstream.
-            _meta = _job_meta(_iid, swaps_ok=len(_urls), swaps_failed=len(_failed),
-                              degraded=len(_urls) < REF_FRAMES_MIN,
-                              swap_errors=_failed[:4])
+            # Το layer γύρισε — πάει για έγκριση. Το εγκεκριμένο output θα γίνει
+            # η βάση του επόμενου layer (ή τα refs για το Seedance αν τελείωσε).
+            _it_now = mm.get_pipeline_item(_iid) or {}
+            _lay = int(_it_now.get("swap_layer") or 0) + 1
+            _meta = _job_meta(_iid, layer_ready=_lay,
+                              swaps_failed=len(_failed),
+                              swap_errors=_failed[:3])
             mm.update_pipeline_item(_iid, status="pending_photo_review",
-                                    faceswap_url=_urls[0],           # πρώτο ref (legacy field)
-                                    faceswap_urls=mm.jdump(_urls),
+                                    faceswap_url=_urls[0],
                                     ingest_meta=_meta, error_msg=None)
-            print(f"[faceswap] item #{_iid}: {len(_urls)}/{len(_preds)} refs ΟΚ"
-                  + (f" · έπεσαν: {_failed}" if _failed else ""))
+            print(f"[faceswap] item #{_iid}: layer {_lay} έτοιμο για review")
         _changed = True
 
     # ── Drain generation queue → generated_pending_scrub ─────────────
@@ -1873,53 +1875,110 @@ def _download_all_button(key, label, photos=(), videos=(), filename="whale.zip",
 # Both the per-card buttons and the *All buttons go through these, so the
 # pre-flight checks that protect credits can never drift apart between them.
 
-def _dispatch_swap(item) -> list:
-    """Submit a face swap for EVERY reference frame of the item.
+MAX_SWAP_LAYERS     = 4        # πόσα layers το πολύ
+DEFAULT_SWAP_LAYERS = 4        # προεπιλογή για νέο item
 
-    3-4 swapped frames (same identity on all) give Seedance far more to lock
-    onto than a single one. Each submit is billed, so each gets its own ledger
-    row. A frame that fails to submit is logged and skipped — as long as one
-    submit succeeds the item stays alive; the poller then decides whether the
-    result set is full quality or degraded.
 
-    The item must already be claimed into 'swapping'. Returns the pred ids.
+def _layer_urls(item) -> list:
+    """Το εγκεκριμένο output ΚΑΘΕ layer, με τη σειρά (layer 1 → N)."""
+    return [u for u in mm.jlist(item, "layer_urls") if _valid_ref_image(u)]
+
+
+def _swap_base(item):
+    """Η εικόνα πάνω στην οποία τρέχει το ΕΠΟΜΕΝΟ layer.
+
+    Layer 1 ξεκινά από το επιλεγμένο frame του video (τοπικό αρχείο).
+    Layer 2+ ξεκινά από το ΕΓΚΕΚΡΙΜΕΝΟ output του προηγούμενου layer, γι' αυτό
+    και κάθε πέρασμα δυναμώνει την ταυτότητα αντί να την ξαναρχίζει.
+    Επιστρέφει (bytes, περιγραφή).
     """
+    _done = _layer_urls(item)
+    if _done:
+        _data, _ = _fetch_photo(_done[-1])       # cached download
+        return _data, f"layer {len(_done)} output"
     _frames = _item_frames(item)
     if not _frames:
-        raise RuntimeError("δεν υπάρχουν frames για swap")
+        raise RuntimeError("δεν υπάρχει frame για swap")
+    with open(_frames[0], "rb") as _f:
+        return _f.read(), "αρχικό frame"
+
+
+def _dispatch_swap(item) -> list:
+    """Στέλνει ΕΝΑ face swap — το επόμενο layer του item.
+
+    Δεν είναι 4 παράλληλα frames: είναι 4 ΔΙΑΔΟΧΙΚΑ περάσματα. Κάθε layer
+    παίρνει το εγκεκριμένο αποτέλεσμα του προηγούμενου και ξανακάνει swap πάνω
+    του, με την ίδια reference ταυτότητα, οπότε το πρόσωπο «κλειδώνει» όλο και
+    περισσότερο. Ανάμεσα στα layers ο χρήστης εγκρίνει.
+
+    Το item πρέπει να είναι ήδη claimed σε 'swapping'. Επιστρέφει το pred id.
+    """
+    _layer = int(item.get("swap_layer") or 0) + 1        # αυτό που ξεκινά τώρα
+    _base, _from = _swap_base(item)
     _cb = (st.session_state["creator2_bytes"] if item["creator"] == "MELINA"
            else st.session_state["creator_bytes"])
-    _prompt = st.session_state.get("_fs_prompt", DEFAULT_FACE_SWAP_PROMPT)
-    _ref_b64 = to_b64(_cb)                      # identity target — same on all
-    _preds, _errs = [], []
-    for _i, _fp in enumerate(_frames):
-        try:
-            with open(_fp, "rb") as _ffr:
-                _fb = to_b64(_ffr.read())
-            _pid = ws_submit(
-                "wavespeed-ai/qwen-image-2.0-pro/edit",
-                {"images": [_ref_b64, _fb], "prompt": _prompt, "seed": -1},
-            )
-            _preds.append(_pid)
-            # MONEY: WaveSpeed charges each photo edit NOW — ledger before
-            # anything can be deleted
-            mm.record_spend(_pid, item["id"], kind="photo", model_key="faceswap",
-                            amount=ce.photo_cost())
-            _ilog("swap", f"#{item['id']} frame {_i + 1}", True, _pid)
-        except Exception as _se:
-            _errs.append(f"frame {_i + 1}: {_se}")
-            _ilog("swap", f"#{item['id']} frame {_i + 1}", False, str(_se))
-    if not _preds:
-        raise RuntimeError("κανένα frame δεν στάλθηκε για swap — " + " · ".join(_errs[:2]))
+    _pid = ws_submit(
+        "wavespeed-ai/qwen-image-2.0-pro/edit",
+        {"images": [to_b64(_cb), to_b64(_base)],
+         "prompt": st.session_state.get("_fs_prompt", DEFAULT_FACE_SWAP_PROMPT),
+         "seed": -1},
+    )
+    # MONEY: κάθε layer είναι ξεχωριστή χρέωση — γράψ' την πριν προλάβει
+    # οτιδήποτε να διαγραφεί
+    mm.record_spend(_pid, item["id"], kind="photo", model_key="faceswap",
+                    amount=ce.photo_cost())
     mm.update_pipeline_item(
-        item["id"], faceswap_pred=_preds[0],            # πρώτο pred (legacy field)
-        faceswap_preds=mm.jdump(_preds), faceswap_url=None,
-        faceswap_urls=mm.jdump([]),
-        ingest_meta=_job_meta(item["id"], frames_extracted=len(_frames),
-                              swaps_submitted=len(_preds),
-                              submit_errors=_errs[:3]))
-    _launch_fs_poll(item["id"], _preds)
-    return _preds
+        item["id"], faceswap_pred=_pid, faceswap_preds=mm.jdump([_pid]),
+        faceswap_url=None,
+        ingest_meta=_job_meta(item["id"], layer_running=_layer,
+                              layer_source=_from,
+                              target_layers=int(item.get("target_layers")
+                                                or DEFAULT_SWAP_LAYERS)))
+    _ilog("swap", f"#{item['id']} layer {_layer}", True, f"από {_from} · {_pid}")
+    _launch_fs_poll(item["id"], [_pid])
+    return [_pid]
+
+
+def _approve_layer(item) -> str:
+    """Ο χρήστης ενέκρινε το τρέχον layer.
+
+    Αν απομένουν layers → στέλνει αμέσως το επόμενο (νέα χρέωση).
+    Αν όχι → το item περνά στο Generation με ΟΛΑ τα layer outputs ως refs.
+    Επιστρέφει 'next' ή 'done'.
+    """
+    _url = (item.get("faceswap_url") or "").strip()
+    if not _valid_ref_image(_url):
+        raise RuntimeError("το layer δεν έχει έγκυρη εικόνα")
+    _done = _layer_urls(item) + [_url]
+    _layer = len(_done)
+    _target = int(item.get("target_layers") or DEFAULT_SWAP_LAYERS)
+    mm.update_pipeline_item(
+        item["id"], swap_layer=_layer, layer_urls=mm.jdump(_done),
+        faceswap_urls=mm.jdump(_done),
+        ingest_meta=_job_meta(item["id"], layers_approved=_layer,
+                              target_layers=_target, layer_running=None))
+    _ilog("layer", f"#{item['id']}", True, f"approved {_layer}/{_target}")
+    if _layer >= _target:
+        mm.claim_pipeline_item(item["id"], "pending_photo_review", "approved_photo")
+        return "done"
+    # επόμενο layer — ξαναμπαίνει στο swapping με βάση το output που μόλις εγκρίθηκε
+    if mm.claim_pipeline_item(item["id"], "pending_photo_review", "swapping"):
+        _dispatch_swap(mm.get_pipeline_item(item["id"]))
+    return "next"
+
+
+def _finish_layers(item):
+    """«Αρκετά — στείλ' το στο Generation» πριν φτάσει στο target."""
+    _url = (item.get("faceswap_url") or "").strip()
+    _done = _layer_urls(item)
+    if _valid_ref_image(_url) and _url not in _done:
+        _done = _done + [_url]
+    mm.update_pipeline_item(
+        item["id"], swap_layer=len(_done), layer_urls=mm.jdump(_done),
+        faceswap_urls=mm.jdump(_done),
+        ingest_meta=_job_meta(item["id"], layers_approved=len(_done),
+                              stopped_early=True, layer_running=None))
+    mm.claim_pipeline_item(item["id"], "pending_photo_review", "approved_photo")
 
 
 def _dispatch_generation(item, model_key, prompt, ref_img=None):
@@ -2156,19 +2215,25 @@ def _refs_badge(item):
     _bits = []
     if _m.get("frames_extracted"):
         _bits.append(f"🖼 {_m['frames_extracted']} frames")
-    if _m.get("swaps_ok") is not None:
-        _bits.append(f"🎭 {_m['swaps_ok']}/{_m.get('swaps_submitted', _m['swaps_ok'])} swaps")
+    _appr, _tgt = _m.get("layers_approved"), _m.get("target_layers")
+    if _appr:
+        _bits.append(f"🧅 {_appr}/{_tgt or DEFAULT_SWAP_LAYERS} layers"
+                     + (" (σταμάτησε νωρίτερα)" if _m.get("stopped_early") else ""))
+    elif _m.get("layer_running"):
+        _bits.append(f"🧅 layer {_m['layer_running']} τρέχει")
     if _m.get("refs_sent"):
         _bits.append(f"📎 {_m['refs_sent']} refs → Seedance")
     if _m.get("ref_frames_from_second_video"):
         _bits.append(f"🎬 +{_m['ref_frames_from_second_video']} από 2ο video")
     if not _bits:
         return
-    _deg = bool(_m.get("degraded"))
+    # «degraded» = έφυγε με ΕΝΑ μόνο layer χωρίς να το ζητήσεις. Αν σταμάτησες
+    # εσύ νωρίτερα, είναι επιλογή σου, όχι πρόβλημα.
+    _deg = bool(_m.get("degraded")) and not _m.get("stopped_early")
     _c = "#fbbf24" if _deg else "#4ade80"
     st.markdown(
         f"<div style='font-size:10px;color:{_c};margin-bottom:3px'>"
-        f"{' · '.join(_bits)}{' · ⚠ DEGRADED (1 ref)' if _deg else ''}</div>",
+        f"{' · '.join(_bits)}{' · ⚠ 1 μόνο layer' if _deg else ''}</div>",
         unsafe_allow_html=True)
     _errs = _m.get("swap_errors") or []
     if _errs:
@@ -2536,11 +2601,32 @@ with _t_face:
                             st.caption("(εικόνα μη διαθέσιμη)")
                     _refs_badge(_rv)
                     _photo_dl_button(_rv, key_prefix="rev")
+                    # ── LAYER STATE ────────────────────────────────
+                    _lay_done = len(_layer_urls(_rv))
+                    _lay_now  = _lay_done + 1                    # αυτό που κρίνεις
+                    _lay_tgt  = int(_rv.get("target_layers") or DEFAULT_SWAP_LAYERS)
+                    st.markdown(
+                        f"<div style='font-size:11px;font-weight:700;color:#c084fc'>"
+                        f"🧅 Layer {_lay_now}/{_lay_tgt}"
+                        + (f" · εγκεκριμένα: {_lay_done}" if _lay_done else "")
+                        + "</div>", unsafe_allow_html=True)
                     _rc1, _rc2, _rc3 = st.columns([2, 2, 1])
                     with _rc1:
-                        if st.button("✅ Approve", key=f"rev_ap_{_rv['id']}",
-                                      type="primary", use_container_width=True):
-                            mm.claim_pipeline_item(_rv["id"], "pending_photo_review", "approved_photo")
+                        _more = _lay_now < _lay_tgt
+                        if st.button(
+                                f"✅ Approve → Layer {_lay_now + 1}" if _more else "✅ Approve → Generation",
+                                key=f"rev_ap_{_rv['id']}", type="primary",
+                                use_container_width=True,
+                                help=(f"Εγκρίνει το layer {_lay_now} και ξεκινά ΑΜΕΣΩΣ "
+                                      f"το επόμενο swap πάνω σε αυτό (~{ce.fmt(ce.photo_cost())})"
+                                      if _more else
+                                      "Τελευταίο layer — πάει στο 🎬 Generation")):
+                            try:
+                                _r = _approve_layer(_rv)
+                                st.success("➡ Ξεκίνησε το επόμενο layer!" if _r == "next"
+                                           else "✅ Έτοιμο για Generation!")
+                            except Exception as _ale:
+                                st.error(str(_ale))
                             st.rerun()
                     with _rc2:
                         if st.button("🔄 Recreate", key=f"rev_rc_{_rv['id']}",
@@ -2558,6 +2644,22 @@ with _t_face:
                         if st.button("🗑️", key=f"rev_del_{_rv['id']}",
                                       use_container_width=True, help="Πλήρες purge"):
                             mm.delete_pipeline_item(_rv["id"])
+                            st.rerun()
+                    # σταμάτα νωρίτερα ή άλλαξε πόσα layers θες
+                    _le1, _le2 = st.columns([2, 1])
+                    with _le1:
+                        if _lay_now < _lay_tgt and st.button(
+                                "➡ Αρκετά — στείλ' το στο Generation",
+                                key=f"rev_fin_{_rv['id']}", use_container_width=True):
+                            _finish_layers(_rv)
+                            st.rerun()
+                    with _le2:
+                        _nt = st.number_input(
+                            "layers", min_value=max(1, _lay_now), max_value=MAX_SWAP_LAYERS,
+                            value=max(_lay_tgt, _lay_now), step=1,
+                            key=f"rev_tgt_{_rv['id']}", label_visibility="collapsed")
+                        if int(_nt) != _lay_tgt:
+                            mm.update_pipeline_item(_rv["id"], target_layers=int(_nt))
                             st.rerun()
 
     # ── SWAP QUEUE (downloaded) ───────────────────────────────────
@@ -2615,7 +2717,7 @@ with _t_face:
                     # 2ου video κάνουν swap και μπαίνουν στη λίστα ΙΣΟΤΙΜΑ με
                     # τα υπόλοιπα — κανένα ref δεν είναι «το πρόσωπο».
                     _nref = len(_item_frames(_fi))
-                    with st.expander(f"➕ Refs: {_nref} frames", expanded=False):
+                    with st.expander(f"🖼 Frames: {_nref} (διάλεξε αφετηρία)", expanded=False):
                         _rv2 = st.file_uploader(
                             "2ο video (μόνο για extra refs)", type=["mp4", "mov", "m4v"],
                             key=f"ref2_{_fi['id']}", label_visibility="collapsed")
@@ -2652,7 +2754,7 @@ with _t_face:
                                     st.image(_pf, use_container_width=True)
                                     st.caption(f"ref {_pi+1}")
 
-                    if st.button(f"🎭 Swap ({_nref} frames)", key=f"fs_btn_{_fi['id']}",
+                    if st.button("🎭 Swap — Layer 1", key=f"fs_btn_{_fi['id']}",
                                   type="primary", use_container_width=True):
                         if not st.session_state.get("_wk"):
                             st.error("Βάλε Wavespeed key στο sidebar.")

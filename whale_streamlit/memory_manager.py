@@ -118,11 +118,17 @@ def init_db():
             # the JSON lists; the legacy single-value columns (frame_path,
             # faceswap_url, faceswap_pred) keep holding the ANCHOR, so every
             # existing reader keeps working unchanged.
-            for _c, _t in (("frame_paths",    "TEXT"),   # JSON [paths] extracted
-                           ("faceswap_preds", "TEXT"),   # JSON [pred ids] in flight
-                           ("faceswap_urls",  "TEXT"),   # JSON [swapped image urls]
-                           ("ref_video_path", "TEXT"),   # 2nd source video (scene refs)
-                           ("ingest_meta",    "TEXT")):  # JSON counters for the job report
+            for _c, _t in (("frame_paths",    "TEXT"),      # JSON [paths] extracted
+                           ("faceswap_preds", "TEXT"),      # JSON [pred ids] in flight
+                           ("faceswap_urls",  "TEXT"),      # JSON [swapped image urls]
+                           ("ref_video_path", "TEXT"),      # 2nd source video (extra refs)
+                           ("ingest_meta",    "TEXT"),      # JSON counters for the job report
+                           # LAYERED FACE SWAP — each layer re-swaps the PREVIOUS
+                           # approved output, so the identity gets stronger with
+                           # every pass. swap_layer = how many are approved so far.
+                           ("swap_layer",     "INTEGER DEFAULT 0"),
+                           ("target_layers",  "INTEGER DEFAULT 4"),
+                           ("layer_urls",     "TEXT")):     # JSON [url per approved layer]
                 if _c not in _cols:
                     conn.execute(f"ALTER TABLE pipeline_items ADD COLUMN {_c} {_t}")
             # BACKFILL: older DBs tracked spend only on the pipeline row, so
