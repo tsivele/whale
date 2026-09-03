@@ -1885,22 +1885,18 @@ def _layer_urls(item) -> list:
 
 
 def _swap_base(item):
-    """Η εικόνα πάνω στην οποία τρέχει το ΕΠΟΜΕΝΟ layer.
+    """Η εικόνα πάνω στην οποία τρέχει ο ΕΠΟΜΕΝΟΣ γύρος swap.
 
-    Layer 1 ξεκινά από το επιλεγμένο frame του video (τοπικό αρχείο).
-    Layer 2+ ξεκινά από το ΕΓΚΕΚΡΙΜΕΝΟ output του προηγούμενου layer, γι' αυτό
-    και κάθε πέρασμα δυναμώνει την ταυτότητα αντί να την ξαναρχίζει.
+    ΠΑΝΤΑ το frame που έχεις διαλέξει αυτή τη στιγμή (frame_path) — κάθε γύρος
+    ξεκινά από ΝΕΟ frame του video, όχι από το αποτέλεσμα του προηγούμενου.
+    Έτσι μαζεύεις 4 swapped εικόνες από 4 διαφορετικές στιγμές.
     Επιστρέφει (bytes, περιγραφή).
     """
-    _done = _layer_urls(item)
-    if _done:
-        _data, _ = _fetch_photo(_done[-1])       # cached download
-        return _data, f"layer {len(_done)} output"
     _frames = _item_frames(item)
     if not _frames:
-        raise RuntimeError("δεν υπάρχει frame για swap")
+        raise RuntimeError("δεν υπάρχει frame για swap — διάλεξε ένα")
     with open(_frames[0], "rb") as _f:
-        return _f.read(), "αρχικό frame"
+        return _f.read(), os.path.basename(_frames[0])
 
 
 def _dispatch_swap(item) -> list:
@@ -1940,10 +1936,13 @@ def _dispatch_swap(item) -> list:
 
 
 def _approve_layer(item) -> str:
-    """Ο χρήστης ενέκρινε το τρέχον layer.
+    """Ο χρήστης ενέκρινε το τρέχον swap.
 
-    Αν απομένουν layers → στέλνει αμέσως το επόμενο (νέα χρέωση).
-    Αν όχι → το item περνά στο Generation με ΟΛΑ τα layer outputs ως refs.
+    Αν λείπουν γύροι → το item γυρίζει στο «Ready to Swap» ώστε να ΔΙΑΛΕΞΕΙΣ
+    ΝΕΟ FRAME για τον επόμενο. Δεν στέλνεται τίποτα αυτόματα, δεν χρεώνεται
+    τίποτα μέχρι να πατήσεις ξανά Swap.
+    Αν συμπληρώθηκαν → το item περνά στο Generation με ΟΛΕΣ τις swapped
+    εικόνες ως references.
     Επιστρέφει 'next' ή 'done'.
     """
     _url = (item.get("faceswap_url") or "").strip()
@@ -1961,9 +1960,9 @@ def _approve_layer(item) -> str:
     if _layer >= _target:
         mm.claim_pipeline_item(item["id"], "pending_photo_review", "approved_photo")
         return "done"
-    # επόμενο layer — ξαναμπαίνει στο swapping με βάση το output που μόλις εγκρίθηκε
-    if mm.claim_pipeline_item(item["id"], "pending_photo_review", "swapping"):
-        _dispatch_swap(mm.get_pipeline_item(item["id"]))
+    # πίσω στην επιλογή frame — ο επόμενος γύρος ξεκινά όταν διαλέξεις και
+    # πατήσεις εσύ Swap
+    mm.claim_pipeline_item(item["id"], "pending_photo_review", "downloaded")
     return "next"
 
 
@@ -2607,23 +2606,25 @@ with _t_face:
                     _lay_tgt  = int(_rv.get("target_layers") or DEFAULT_SWAP_LAYERS)
                     st.markdown(
                         f"<div style='font-size:11px;font-weight:700;color:#c084fc'>"
-                        f"🧅 Layer {_lay_now}/{_lay_tgt}"
+                        f"🧅 Swap {_lay_now}/{_lay_tgt}"
                         + (f" · εγκεκριμένα: {_lay_done}" if _lay_done else "")
                         + "</div>", unsafe_allow_html=True)
                     _rc1, _rc2, _rc3 = st.columns([2, 2, 1])
                     with _rc1:
                         _more = _lay_now < _lay_tgt
                         if st.button(
-                                f"✅ Approve → Layer {_lay_now + 1}" if _more else "✅ Approve → Generation",
+                                f"✅ Approve → διάλεξε frame {_lay_now + 1}" if _more
+                                else "✅ Approve → Generation",
                                 key=f"rev_ap_{_rv['id']}", type="primary",
                                 use_container_width=True,
-                                help=(f"Εγκρίνει το layer {_lay_now} και ξεκινά ΑΜΕΣΩΣ "
-                                      f"το επόμενο swap πάνω σε αυτό (~{ce.fmt(ce.photo_cost())})"
+                                help=(f"Κρατάει το swap {_lay_now} και γυρνάει στο "
+                                      f"«Ready to Swap» για να διαλέξεις ΝΕΟ frame "
+                                      f"— δεν χρεώνεται τίποτα μέχρι να πατήσεις Swap"
                                       if _more else
-                                      "Τελευταίο layer — πάει στο 🎬 Generation")):
+                                      "Τελευταίο swap — πάει στο 🎬 Generation")):
                             try:
                                 _r = _approve_layer(_rv)
-                                st.success("➡ Ξεκίνησε το επόμενο layer!" if _r == "next"
+                                st.success("➡ Διάλεξε το επόμενο frame παρακάτω!" if _r == "next"
                                            else "✅ Έτοιμο για Generation!")
                             except Exception as _ale:
                                 st.error(str(_ale))
@@ -2716,8 +2717,33 @@ with _t_face:
                     # Περισσότερα refs = πιο σταθερή ταυτότητα. Τα frames του
                     # 2ου video κάνουν swap και μπαίνουν στη λίστα ΙΣΟΤΙΜΑ με
                     # τα υπόλοιπα — κανένα ref δεν είναι «το πρόσωπο».
+                    # ── ΠΟΙΟΣ ΓΥΡΟΣ ΕΙΝΑΙ ──────────────────────────
+                    _got = _layer_urls(_fi)
+                    _tgt = int(_fi.get("target_layers") or DEFAULT_SWAP_LAYERS)
+                    _round = len(_got) + 1
+                    st.markdown(
+                        f"<div style='font-size:11px;font-weight:700;color:#c4b5fd'>"
+                        f"🧅 Swap {_round}/{_tgt} — διάλεξε frame</div>",
+                        unsafe_allow_html=True)
+                    if _got:
+                        st.caption(f"✅ έτοιμα: {len(_got)} swapped")
+                        _gc = st.columns(min(4, len(_got)))
+                        for _gi2, _gu in enumerate(_got[:4]):
+                            with _gc[_gi2 % len(_gc)]:
+                                try:
+                                    st.image(_gu, use_container_width=True)
+                                    st.caption(f"#{_gi2 + 1}")
+                                except Exception:
+                                    pass
+                    _ntg = st.number_input(
+                        "πόσα swaps θέλεις", min_value=max(1, len(_got) or 1),
+                        max_value=MAX_SWAP_LAYERS, value=max(_tgt, len(_got) or 1),
+                        step=1, key=f"fs_tgt_{_fi['id']}")
+                    if int(_ntg) != _tgt:
+                        mm.update_pipeline_item(_fi["id"], target_layers=int(_ntg))
+                        st.rerun()
                     _nref = len(_item_frames(_fi))
-                    with st.expander(f"🖼 Frames: {_nref} (διάλεξε αφετηρία)", expanded=False):
+                    with st.expander(f"🖼 Frames: {_nref}", expanded=False):
                         _rv2 = st.file_uploader(
                             "2ο video (μόνο για extra refs)", type=["mp4", "mov", "m4v"],
                             key=f"ref2_{_fi['id']}", label_visibility="collapsed")
@@ -2754,7 +2780,7 @@ with _t_face:
                                     st.image(_pf, use_container_width=True)
                                     st.caption(f"ref {_pi+1}")
 
-                    if st.button("🎭 Swap — Layer 1", key=f"fs_btn_{_fi['id']}",
+                    if st.button(f"🎭 Swap #{_round}", key=f"fs_btn_{_fi['id']}",
                                   type="primary", use_container_width=True):
                         if not st.session_state.get("_wk"):
                             st.error("Βάλε Wavespeed key στο sidebar.")
