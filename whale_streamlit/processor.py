@@ -17,6 +17,36 @@ import tempfile
 from typing import List, Union
 
 
+# ── ΟΡΙΑ ΧΡΟΝΟΥ ──────────────────────────────────────────────────────────────
+# Χωρίς αυτά, ΕΝΑ χαλασμένο αρχείο κρεμάει για πάντα το worker thread του
+# Scrub All: το app.py τρέχει τα βίντεο σειριακά σε ΕΝΑ thread, οπότε ένα
+# κολλημένο ffmpeg σταματά και όλα τα υπόλοιπα — χωρίς σφάλμα, χωρίς μήνυμα,
+# η ουρά απλώς παγώνει. Με timeout το αρχείο βγάζει καθαρό error, ο worker
+# προχωράει στο επόμενο. Γενναιόδωρα για shared 1-vCPU: ένα reel 10-20s που
+# θέλει πάνω από 5 λεπτά re-encode είναι χαλασμένο, όχι αργό.
+ENCODE_TIMEOUT = 300     # pass 1 — libx264, το μόνο CPU-βαρύ βήμα
+SCRUB_TIMEOUT  = 120     # pass 2 — stream copy, δεν ξανακωδικοποιεί
+PROBE_TIMEOUT  = 60      # ffprobe — μόνο διάβασμα metadata
+
+
+def _run_bounded(cmd, timeout, what, src):
+    """subprocess.run με όριο χρόνου· το timeout γίνεται RuntimeError.
+
+    Το subprocess.run σκοτώνει τη διεργασία πριν σηκώσει TimeoutExpired, οπότε
+    δεν μένει ορφανό ffmpeg να τρώει CPU στο παρασκήνιο — αυτό ακριβώς ήταν που
+    έριχνε τον container. Το RuntimeError το πιάνει το per-item try/except στο
+    app.py, άρα το κακό βίντεο σημειώνεται και η παρτίδα συνεχίζει.
+    """
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"FFmpeg {what} ξεπέρασε το όριο χρόνου ({timeout}s) — "
+            f"το αρχείο παραλείπεται: {os.path.basename(src)!r}"
+        ) from None
+
+
 # Tags that ffprobe surfaces but are STRUCTURAL / neutral defaults present in
 # every normal video — NOT injected tracking metadata, so they must not fail
 # verification (flagging them was a false positive that quarantined clean clips):
@@ -224,7 +254,7 @@ class VideoProcessor:
         tmp_enc = tempfile.mktemp(suffix="_enc.mp4")
         try:
             # ── Pass 1: encode ───────────────────────────────────────────────
-            r1 = subprocess.run(
+            r1 = _run_bounded(
                 [
                     ffmpeg, "-y", "-i", src,
                     # -preset ultrafast: same libx264 re-encode (anti-detection
@@ -236,7 +266,7 @@ class VideoProcessor:
                     "-c:a", "aac",
                     tmp_enc,
                 ],
-                capture_output=True, text=True,
+                ENCODE_TIMEOUT, "encode", src,
             )
             if r1.returncode != 0:
                 raise RuntimeError(
@@ -248,7 +278,7 @@ class VideoProcessor:
             # Reason: some FFmpeg builds treat "" as "unset" and fall back to
             # the default "VideoHandler"/"SoundHandler". A literal space is
             # written verbatim into the hdlr box and is not a known fingerprint.
-            r2 = subprocess.run(
+            r2 = _run_bounded(
                 [
                     ffmpeg, "-y", "-i", tmp_enc,
                     "-c", "copy",
@@ -269,7 +299,7 @@ class VideoProcessor:
                     "-metadata:s:a:0", "handler_name= ",
                     dst,
                 ],
-                capture_output=True, text=True,
+                SCRUB_TIMEOUT, "scrub", src,
             )
             if r2.returncode != 0:
                 raise RuntimeError(
@@ -296,7 +326,14 @@ class VideoProcessor:
             "-show_format", "-show_streams",
             path,
         ]
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=PROBE_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            # Αδύνατη η επαλήθευση → ΑΠΟΤΥΧΙΑ, ποτέ σιωπηλό πέρασμα: αλλιώς ένα
+            # αρχείο με metadata θα έβγαινε στο Drive επειδή άργησε το ffprobe.
+            print(f"[processor] ffprobe timeout — {os.path.basename(path)!r}")
+            return {"_probe_timeout": f">{PROBE_TIMEOUT}s"}
         if r.returncode != 0:
             raise RuntimeError(
                 f"ffprobe failed on {path!r} (exit {r.returncode}):\n{r.stderr}"
