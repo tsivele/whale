@@ -1503,6 +1503,12 @@ _STATUS_META = {
 }
 
 
+# Πόσες φορές επιτρέπεται να ξαναξεκινήσει μόνο του ένα scrub που διακόπηκε.
+# Πάνω από αυτό το item θεωρείται δηλητήριο: αν ρίχνει τον container, κάθε
+# restart το ξαναρίχνει και το app δεν ξανασηκώνεται ποτέ.
+MAX_SCRUB_RESUMES = 3
+
+
 # ──────────────────────────────────────────────────────────
 # BACKGROUND POLLING FRAGMENT
 # ──────────────────────────────────────────────────────────
@@ -1536,12 +1542,28 @@ def _bg_poller():
     for _sc in mm.get_pipeline_items(status="scrubbing"):
         if f"scrub_{_sc['id']}" not in _threads and _age_seconds(_sc["updated_at"]) > 20:
             _src = _sc.get("gen_path")
-            if _src and os.path.exists(_src):
-                _resume_scrubs.append((_sc["id"], _src))
-            else:
+            if not (_src and os.path.exists(_src)):
                 mm.update_pipeline_item(_sc["id"], status="error",
                                         error_msg="Το αρχείο χάθηκε κατά το scrub — κάνε Recreate Video.")
                 _changed = True
+                continue
+            # ΦΡΕΝΟ ΒΡΟΧΟΥ ΚΑΤΑΡΡΕΥΣΗΣ: αν το ίδιο βίντεο ρίχνει τον container
+            # (χαλασμένο αρχείο ή OOM), χωρίς μετρητή κάθε restart το ξαναρίχνει
+            # αυτόματα μετά από 20s — και το app μένει μόνιμα στο «Oh no».
+            # Μετά από MAX_SCRUB_RESUMES βγαίνει σε error και περιμένει Retry.
+            _tries = int(_job_meta_read(_sc).get("scrub_resumes") or 0)
+            if _tries >= MAX_SCRUB_RESUMES:
+                mm.update_pipeline_item(
+                    _sc["id"], status="error",
+                    error_msg=(f"Το scrub διακόπηκε {_tries} φορές στη σειρά — "
+                               "πιθανώς χαλασμένο αρχείο ή έλλειψη μνήμης "
+                               "στον container. Πάτα Retry χειροκίνητα."))
+                _changed = True
+                continue
+            mm.update_pipeline_item(
+                _sc["id"],
+                ingest_meta=_job_meta(_sc["id"], scrub_resumes=_tries + 1))
+            _resume_scrubs.append((_sc["id"], _src))
     if _resume_scrubs:
         _launch_batch_scrub(_resume_scrubs)
 
@@ -1620,8 +1642,11 @@ def _bg_poller():
         if _res["error"]:
             mm.update_pipeline_item(_iid, status="error", error_msg=_res["error"])
         else:
-            mm.update_pipeline_item(_iid, status="scrubbed",
-                                    scrubbed_path=_res["out_path"], error_msg=None)
+            mm.update_pipeline_item(
+                _iid, status="scrubbed", scrubbed_path=_res["out_path"],
+                error_msg=None,
+                # καθάρισε τον μετρητή: ένα μελλοντικό Retry ξεκινά από το μηδέν
+                ingest_meta=_job_meta(_iid, scrub_resumes=0))
         _changed = True
 
     # Live activity pulse
