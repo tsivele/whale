@@ -263,6 +263,11 @@ class VideoProcessor:
                     # container health-check timeout that restarts ("crashes") the app
                     # during a multi-video Scrub All.
                     "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                    # -threads 1: ο container έχει 1 vCPU, οπότε τα πολλά νήματα
+                    # δεν δίνουν ταχύτητα — δίνουν όμως ένα σύνολο frame buffers
+                    # ανά νήμα. Με ένα νήμα η κορυφή μνήμης του ffmpeg πέφτει
+                    # αισθητά, που είναι ακριβώς αυτό που σκότωνε τον container.
+                    "-threads", "1",
                     "-c:a", "aac",
                     tmp_enc,
                 ],

@@ -1850,7 +1850,14 @@ def _delete_all_button(items, key, what="items"):
 # the session's media store on every render, so a 100 MB+ archive would sit in
 # RAM on a 1 GB container. Under the cap → real one-click button. Over it →
 # pack once, then download (the two-step keeps the container alive).
-_ONE_CLICK_MAX = 60 * 1024 * 1024
+#
+# 12 MB, όχι 60: με 60 ένα set από ~10 generated videos έμπαινε ΜΕΣΑ στο όριο,
+# οπότε το ZIP ξαναχτιζόταν και κρατιόταν στη μνήμη σε ΚΑΘΕ render — κι ας μην
+# το πατούσε ποτέ κανείς. Μαζί με το ffmpeg του scrub, ο container έτρωγε SIGKILL
+# (στα logs: κανένα traceback, το log απλά κόβεται — υπογραφή OOM, όχι σφάλματος).
+# Στα 12 MB τα φωτογραφικά sets μένουν one-click· κάθε set με βίντεο περνάει στο
+# pack-then-download, που δεν αγγίζει RAM μέχρι να το ζητήσεις.
+_ONE_CLICK_MAX = 12 * 1024 * 1024
 _PHOTO_EST     = 300_000          # rough bytes per face-swap photo
 
 
