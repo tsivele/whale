@@ -1269,6 +1269,35 @@ def _launch_gen_poll(item_id: int, pred_id: str, src_video=None) -> None:
     threading.Thread(target=_w, daemon=True).start()
 
 
+def _mem_probe(tag: str) -> None:
+    """Γράψε στα cloud logs RSS + μέγεθος του προσωρινού φακέλου.
+
+    Ο container πέθαινε με SIGKILL — καμία traceback, το log κοβόταν στη μέση
+    γραμμής. Αυτό δεν λέει ΤΙ μεγάλωνε. Με αυτή τη γραμμή μετά από κάθε βίντεο
+    τα logs δείχνουν αν ανεβαίνει η μνήμη της Python ή αν γεμίζει το /tmp —
+    που σε tmpfs ΕΙΝΑΙ μνήμη, άρα μετράει το ίδιο.
+
+    Δεν σηκώνει ποτέ: ένα diagnostic δεν επιτρέπεται να ρίξει το scrub.
+    """
+    try:
+        import resource, tempfile as _tfm
+        _rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+        _td = _tfm.gettempdir()
+        _n = _bytes = 0
+        with os.scandir(_td) as _it:
+            for _e in _it:
+                try:
+                    if _e.is_file(follow_symlinks=False):
+                        _n += 1
+                        _bytes += _e.stat(follow_symlinks=False).st_size
+                except OSError:
+                    pass
+        print(f"[mem] {tag} · RSS {_rss_mb:.0f} MB · {_td} {_bytes/1e6:.0f} MB "
+              f"σε {_n} αρχεία", flush=True)
+    except Exception as _me:
+        print(f"[mem] {tag} · probe failed: {_me}", flush=True)
+
+
 def _launch_batch_scrub(batch: list) -> None:
     """Scrub MANY items with ONE worker thread, strictly SEQUENTIALLY.
 
@@ -1284,12 +1313,14 @@ def _launch_batch_scrub(batch: list) -> None:
     def _w(q=_q, items=tuple(batch)):
         from processor import VideoProcessor
         from safety_filter import verify_batch
+        _mem_probe(f"batch start · {len(items)} videos")
         for _n, (iid, src) in enumerate(items):
             # Yield the CPU to the main Streamlit thread BETWEEN videos so the
             # container health-check keeps getting answered → app doesn't restart
             # ("crash") mid-batch. First item runs immediately.
             if _n:
                 time.sleep(3)
+            _mem_probe(f"before {_n + 1}/{len(items)}")
             try:
                 results = VideoProcessor.process(src)
                 out = results[0] if isinstance(results, list) else results
@@ -1302,6 +1333,7 @@ def _launch_batch_scrub(batch: list) -> None:
                     q.put({"item_id": iid, "out_path": approved[0], "error": None})
             except Exception as e:
                 q.put({"item_id": iid, "out_path": None, "error": str(e)})
+            _mem_probe(f"after  {_n + 1}/{len(items)}")
     # Register ALL tags upfront so the poller's resume logic never
     # double-launches items still waiting their turn in this worker
     for _iid, _src in batch:
