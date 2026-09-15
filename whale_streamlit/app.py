@@ -1298,6 +1298,18 @@ def _mem_probe(tag: str) -> None:
         print(f"[mem] {tag} · probe failed: {_me}", flush=True)
 
 
+# ── ΠΟΙΑ ITEMS ΕΧΟΥΝ ΗΔΗ WORKER ─────────────────────────────────────────────
+# Σε επίπεδο ΔΙΕΡΓΑΣΙΑΣ, όχι session. Το st.session_state είναι ανά καρτέλα:
+# ένα refresh έφτιαχνε καινούρια συνεδρία με άδειο "_active_threads", ο poller
+# έβλεπε τα items ακόμα σε 'scrubbing' με updated_at > 20s και ξεκινούσε ΔΕΥΤΕΡΟ
+# worker για τα ΙΔΙΑ αρχεία — πάνω στον πρώτο που ακόμα έτρεχε.
+# Στα logs φάνηκε καθαρά: τέσσερα batch ταυτόχρονα σε 1 vCPU, και ο container
+# δέχτηκε SIGKILL. Αυτό το σύνολο είναι ΕΝΑ για όλη τη διεργασία, οπότε καμία
+# καρτέλα δεν μπορεί να ξεκινήσει διπλό scrub.
+_SCRUB_LOCK = threading.Lock()
+_SCRUB_RUNNING: set = set()
+
+
 def _launch_batch_scrub(batch: list) -> None:
     """Scrub MANY items with ONE worker thread, strictly SEQUENTIALLY.
 
@@ -1309,6 +1321,13 @@ def _launch_batch_scrub(batch: list) -> None:
     and OOM kill (the 'glitch/crash'). One worker, one ffmpeg at a time:
     constant memory, stable UI, results stream in one-by-one via the queue.
     """
+    # ΚΡΑΤΑ μόνο όσα δεν τρέχουν ήδη κάπου αλλού. Αν δεν μείνει τίποτα, δεν
+    # ξεκινάει thread — το διπλό scrub σταματά εδώ, πριν ανοίξει δεύτερο ffmpeg.
+    with _SCRUB_LOCK:
+        batch = [(i, p) for i, p in batch if i not in _SCRUB_RUNNING]
+        _SCRUB_RUNNING.update(i for i, _ in batch)
+    if not batch:
+        return
     _q = st.session_state["_audit_queue"]    # captured in main thread
     def _w(q=_q, items=tuple(batch)):
         from processor import VideoProcessor
@@ -1333,6 +1352,9 @@ def _launch_batch_scrub(batch: list) -> None:
                     q.put({"item_id": iid, "out_path": approved[0], "error": None})
             except Exception as e:
                 q.put({"item_id": iid, "out_path": None, "error": str(e)})
+            finally:
+                with _SCRUB_LOCK:
+                    _SCRUB_RUNNING.discard(iid)
             _mem_probe(f"after  {_n + 1}/{len(items)}")
     # Register ALL tags upfront so the poller's resume logic never
     # double-launches items still waiting their turn in this worker
@@ -1572,6 +1594,8 @@ def _bg_poller():
     # collected into ONE sequential batch, never parallel relaunches
     _resume_scrubs = []
     for _sc in mm.get_pipeline_items(status="scrubbing"):
+        if _sc["id"] in _SCRUB_RUNNING:      # τρέχει ήδη — μην το ξαναπιάσεις
+            continue
         if f"scrub_{_sc['id']}" not in _threads and _age_seconds(_sc["updated_at"]) > 20:
             _src = _sc.get("gen_path")
             if not (_src and os.path.exists(_src)):
