@@ -1,13 +1,21 @@
 """
 Video post-processing pipeline — 2-stage: re-encode+scrub → verify.
 
-  Stage 1 (FFmpeg):  libx264/aac re-encode with all metadata stripped inline
-                     (-map_metadata -1, -fflags +bitexact, -flags:v/a +bitexact)
-  Stage 2 (ffprobe): strict JSON parse — any non-structural tag raises ValueError
+  Stage 1 (FFmpeg, two passes):
+    pass 1  libx264 (veryfast, crf 23, High profile) + aac 192k re-encode with
+            +bitexact on both encoders and the muxer, so no "Lavc"/"Lavf" string
+            is written.
+    pass 2  -c copy remux that removes the x264 SEI user-data NAL
+            (filter_units remove_types=6 — the "x264 - core … options: …" string),
+            drops every container/stream tag, blanks encoder/handler_name and
+            moves moov to the front.
+  Stage 2 (ffprobe): strict JSON tag check. ffprobe is mandatory — if it cannot
+            be found, process() raises instead of skipping verification.
 
 process() accepts a single path OR a list of paths.
 When given a list, it encodes+scrubs all files first, then verifies every one of
 them and aggregates failures into a single comprehensive error before raising.
+Any failure at any stage deletes every output produced so far (fail closed).
 """
 
 import json
@@ -47,30 +55,47 @@ def _run_bounded(cmd, timeout, what, src):
         ) from None
 
 
-# Tags that ffprobe surfaces but are STRUCTURAL / neutral defaults present in
-# every normal video — NOT injected tracking metadata, so they must not fail
-# verification (flagging them was a false positive that quarantined clean clips):
-#   major_brand/minor_version/compatible_brands → ftyp box (removing corrupts it)
-#   language=und → "undetermined", the neutral default ffmpeg writes on streams
-#   handler_name → generic "VideoHandler"/"SoundHandler" (real phone videos have it)
-#   vendor_id    → generic muxer field
+# Tags that come from the ftyp box and are required structure (removing them
+# corrupts the file) — allowed by KEY, whatever their value.
 _STRUCTURAL_TAGS = frozenset({
     "major_brand",
     "minor_version",
     "compatible_brands",
-    "language",
-    "handler_name",
-    "vendor_id",
 })
+
+# Tags that ffmpeg always writes on streams. They are allowed ONLY with a
+# neutral value (empty/whitespace, or the listed defaults). Any other value —
+# e.g. a custom handler_name or a real vendor code — is a fingerprint and fails
+# verification. Pass 2 sets handler_name to a single space.
+_NEUTRAL_ONLY_TAGS = {
+    "language":     frozenset({"und"}),
+    "handler_name": frozenset(),
+    "vendor_id":    frozenset({"[0][0][0][0]"}),
+}
+
+
+def _tag_violation(key: str, value) -> bool:
+    """True when a container/stream tag must fail verification."""
+    k = key.lower()
+    if k in _STRUCTURAL_TAGS:
+        return False
+    v = ("" if value is None else str(value)).strip()
+    if not v:
+        return False
+    if k in _NEUTRAL_ONLY_TAGS:
+        return v not in _NEUTRAL_ONLY_TAGS[k]
+    return True
 
 
 def _find_bin(name: str) -> str:
     """
-    Locate ffmpeg/ffprobe with four fallbacks (most reliable first):
-      1. imageio_ffmpeg bundled binary  (ffmpeg only — most reliable on Streamlit Cloud)
+    Locate ffmpeg with four fallbacks (most reliable first):
+      1. imageio_ffmpeg bundled binary  (most reliable on Streamlit Cloud)
       2. PATH search                    (works if packages.txt installed system ffmpeg)
       3. Known fixed paths              (/usr/bin, /usr/local/bin, /bin)
       4. Bare name                      (last resort — subprocess will raise FileNotFoundError)
+    ffprobe has its own resolver (_find_ffprobe) because it must never fall
+    back to a bare name: a missing ffprobe has to stop the pipeline.
     static_ffmpeg is intentionally skipped — it writes a lock file to the venv
     which is read-only on Streamlit Cloud, causing a Permission denied crash.
     """
@@ -96,15 +121,47 @@ def _find_bin(name: str) -> str:
     return name
 
 
+def _find_ffprobe():
+    """
+    Locate ffprobe, or return None when it is not installed. Order:
+      1. PATH
+      2. next to the imageio_ffmpeg binary (imageio bundles ffmpeg only, but a
+         deployment may place ffprobe beside it)
+      3. /usr/bin, /usr/local/bin, /bin
+    """
+    import shutil as _sh
+
+    p = _sh.which("ffprobe")
+    if p:
+        return p
+
+    try:
+        import imageio_ffmpeg
+        candidate = os.path.join(os.path.dirname(imageio_ffmpeg.get_ffmpeg_exe()), "ffprobe")
+        if os.path.isfile(candidate):
+            return candidate
+    except Exception:
+        pass
+
+    for candidate in ("/usr/bin/ffprobe", "/usr/local/bin/ffprobe", "/bin/ffprobe"):
+        if os.path.isfile(candidate):
+            return candidate
+
+    return None
+
+
 def _ffbin():
-    """Return (ffmpeg_path, ffprobe_path | None)."""
+    """Return (ffmpeg_path, ffprobe_path). Raises when ffprobe is missing."""
     ffmpeg = _find_bin("ffmpeg")
-    ffprobe = _find_bin("ffprobe")
-    # If ffprobe resolved to bare "ffprobe" and doesn't exist, signal unavailable
-    if ffprobe == "ffprobe" and not os.path.exists(ffprobe):
-        import shutil as _sh
-        if _sh.which("ffprobe") is None:
-            ffprobe = None
+    ffprobe = _find_ffprobe()
+    if ffprobe is None:
+        # Fail closed: without ffprobe the tag check cannot run, and a scrub
+        # that cannot be verified must not be reported as clean.
+        raise RuntimeError(
+            "ffprobe not found (checked PATH, next to the imageio_ffmpeg binary, "
+            "/usr/bin, /usr/local/bin, /bin) — cannot verify the scrub, refusing to "
+            "process. Install ffmpeg via packages.txt so ffprobe is available."
+        )
     return ffmpeg, ffprobe
 
 
@@ -123,8 +180,9 @@ class VideoProcessor:
             str | Path            → process one file, return one str path
             list[str | Path]      → process all files, verify all, return list[str]
 
-        On verification failure all output files are deleted before raising,
-        so nothing dirty ever escapes the pipeline.
+        Raises if ffprobe is unavailable (verification is mandatory). On any
+        encode, scrub or verification failure every output file is deleted
+        before raising, so nothing dirty or unverified escapes the pipeline.
         """
         ffmpeg, ffprobe = _ffbin()
 
@@ -184,13 +242,13 @@ class VideoProcessor:
                 raise
 
         # ── Stage 2: verify ALL outputs — never stop on first failure ────────
-        if ffprobe is None:
-            print("[processor] ffprobe not available — skipping tag verification (scrub still applied)")
-        else:
-            if progress_cb:
-                progress_cb(0.95, "🔍 Επαλήθευση metadata...")
+        # ffprobe is guaranteed here (_ffbin raised otherwise). Any exception
+        # while verifying (ffprobe error, bad JSON…) also destroys every output.
+        if progress_cb:
+            progress_cb(0.95, "🔍 Επαλήθευση metadata...")
 
-            failures: dict = {}          # {clean_path: {tag_key: tag_value, …}}
+        failures: dict = {}          # {clean_path: {tag_key: tag_value, …}}
+        try:
             for path in outputs:
                 found = cls._check_tags(path, ffprobe)
                 if found:
@@ -198,25 +256,30 @@ class VideoProcessor:
                     print(f"[processor] verify FAIL — {os.path.basename(path)!r}: {found}")
                 else:
                     print(f"[processor] verify ✓  — {os.path.basename(path)!r} is clean")
+        except Exception:
+            for o in outputs:
+                if os.path.exists(o):
+                    os.remove(o)
+            raise
 
-            if failures:
-                # Fail-fast: destroy ALL outputs before raising
-                for o in outputs:
-                    if os.path.exists(o):
-                        os.remove(o)
+        if failures:
+            # Fail-fast: destroy ALL outputs before raising
+            for o in outputs:
+                if os.path.exists(o):
+                    os.remove(o)
 
-                # Build comprehensive, per-file error report
-                lines = []
-                for idx, (path, tags) in enumerate(failures.items()):
-                    tag_str = "; ".join(f"{k}={v!r}" for k, v in tags.items())
-                    lines.append(f"  [{idx + 1}] {os.path.basename(path)}: {tag_str}")
+            # Build comprehensive, per-file error report
+            lines = []
+            for idx, (path, tags) in enumerate(failures.items()):
+                tag_str = "; ".join(f"{k}={v!r}" for k, v in tags.items())
+                lines.append(f"  [{idx + 1}] {os.path.basename(path)}: {tag_str}")
 
-                raise ValueError(
-                    f"[processor] SCRUB VERIFICATION FAILED — "
-                    f"{len(failures)}/{n} file(s) contain forbidden metadata:\n"
-                    + "\n".join(lines)
-                    + "\nPipeline halted. No files were delivered."
-                )
+            raise ValueError(
+                f"[processor] SCRUB VERIFICATION FAILED — "
+                f"{len(failures)}/{n} file(s) contain forbidden metadata:\n"
+                + "\n".join(lines)
+                + "\nPipeline halted. No files were delivered."
+            )
 
         if progress_cb:
             progress_cb(1.0, "✅ Ολοκληρώθηκε!")
@@ -232,24 +295,32 @@ class VideoProcessor:
         Two-pass pipeline — encode then stream-copy-scrub:
 
           Pass 1 (encode): re-encode to libx264/aac into a temp file.
-            No metadata flags here — let the encoder run freely.
+              -preset veryfast -crf 23  High profile, ~same quality, smaller
+                                        than the source (ultrafast without crf
+                                        gave Constrained Baseline, ~2.3x larger)
+              -threads 1                one frame-buffer set → lower peak RAM
+              -flags:v/a +bitexact      the encoders do not write "Lavc…"
+              -b:a 192k                 keeps audio rate (bare aac halved it)
+              -fflags +bitexact         the muxer does not write "Lavf…"
+            The x264 encoder still embeds its settings string ("x264 - core …
+            options: …") as an SEI user-data NAL inside mdat; pass 2 removes it.
 
           Pass 2 (stream-copy scrub): remux the encoded temp file into dst
-            using -c copy.  Because NO encoder runs in this pass, libavcodec
-            physically cannot inject 'encoder=Lavc libx264'.  Combined with
-            explicit metadata overrides, the output is provably clean:
-
+            with -c copy — no encoder runs, so nothing new is written:
+              -bsf:v filter_units=remove_types=6   drop SEI NALs (the x264
+                                                   settings string); decodes fine
               -map_metadata -1          drop all container-level input tags
               -map_metadata:s:v -1      drop ALL video-stream input tags
               -map_metadata:s:a -1      drop ALL audio-stream input tags
               -fflags +bitexact         suppress Lavf muxer signature
-              -flags:v +bitexact        suppress per-video-stream annotation
-              -flags:a +bitexact        suppress per-audio-stream annotation
-              -metadata:s:v:0 encoder=          wipe encoder tag, video
-              -metadata:s:v:0 handler_name=     wipe VideoHandler, video
-              -metadata:s:a:0 encoder=          wipe encoder tag, audio
-              -metadata:s:a:0 handler_name=     wipe SoundHandler, audio
               -brand mp42               remap ftyp from isom → mp42
+              -movflags +faststart      moov before mdat
+              -metadata:s:v:0 encoder=          wipe encoder tag, video
+              -metadata:s:v:0 handler_name=" "  replace VideoHandler, video
+              -metadata:s:a:0 encoder=          wipe encoder tag, audio
+              -metadata:s:a:0 handler_name=" "  replace SoundHandler, audio
+            (-flags:v/-flags:a +bitexact are not used here: with -c copy no
+            encoder runs, so they had no effect.)
         """
         tmp_enc = tempfile.mktemp(suffix="_enc.mp4")
         try:
@@ -257,18 +328,21 @@ class VideoProcessor:
             r1 = _run_bounded(
                 [
                     ffmpeg, "-y", "-i", src,
-                    # -preset ultrafast: same libx264 re-encode (anti-detection
-                    # preserved) but ~5-10x faster, so on Streamlit Cloud's shared
-                    # 1-vCPU the CPU-pegged window per video is short — prevents the
-                    # container health-check timeout that restarts ("crashes") the app
-                    # during a multi-video Scrub All.
-                    "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                    # veryfast + crf 23: High profile and ~63% smaller than
+                    # ultrafast-without-crf at near-identical quality (SSIM
+                    # 0.974 vs 0.977), still fast enough for the 1-vCPU host.
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                    "-pix_fmt", "yuv420p",
                     # -threads 1: ο container έχει 1 vCPU, οπότε τα πολλά νήματα
                     # δεν δίνουν ταχύτητα — δίνουν όμως ένα σύνολο frame buffers
                     # ανά νήμα. Με ένα νήμα η κορυφή μνήμης του ffmpeg πέφτει
                     # αισθητά, που είναι ακριβώς αυτό που σκότωνε τον container.
                     "-threads", "1",
-                    "-c:a", "aac",
+                    # bitexact on the encoder itself: this is the pass where an
+                    # encoder runs, so this is where "Lavc…" is (not) written.
+                    "-flags:v", "+bitexact",
+                    "-c:a", "aac", "-b:a", "192k", "-flags:a", "+bitexact",
+                    "-fflags", "+bitexact",
                     tmp_enc,
                 ],
                 ENCODE_TIMEOUT, "encode", src,
@@ -287,16 +361,18 @@ class VideoProcessor:
                 [
                     ffmpeg, "-y", "-i", tmp_enc,
                     "-c", "copy",
+                    # remove SEI NAL units (type 6) — the x264 settings string
+                    # "x264 - core … options: …" lives in one of them
+                    "-bsf:v", "filter_units=remove_types=6",
                     # strip all input tags at container and stream level
                     "-map_metadata",     "-1",
                     "-map_metadata:s:v", "-1",
                     "-map_metadata:s:a", "-1",
-                    # prevent muxer writing its own signatures
+                    # prevent the muxer writing its own "Lavf…" signature
                     "-fflags",  "+bitexact",
-                    "-flags:v", "+bitexact",
-                    "-flags:a", "+bitexact",
                     # remap ftyp brand
                     "-brand", "mp42",
+                    "-movflags", "+faststart",
                     # explicit stream-level wipes (last, so they win)
                     "-metadata:s:v:0", "encoder=",
                     "-metadata:s:v:0", "handler_name= ",
@@ -323,7 +399,10 @@ class VideoProcessor:
         """
         Run ffprobe on one file.
         Returns a dict of forbidden tags found — empty dict means clean.
-        Never raises on metadata findings (caller decides what to do).
+        ftyp tags pass by key; language/handler_name/vendor_id pass only with
+        neutral values (see _NEUTRAL_ONLY_TAGS); every other non-empty tag fails.
+        Never raises on metadata findings (caller decides what to do); raises
+        if ffprobe itself fails, and a timeout is reported as a finding.
         """
         cmd = [
             ffprobe, "-v", "quiet",
@@ -349,13 +428,13 @@ class VideoProcessor:
 
         # Container-level tags
         for k, v in data.get("format", {}).get("tags", {}).items():
-            if k.lower() not in _STRUCTURAL_TAGS and v.strip():
+            if _tag_violation(k, v):
                 forbidden[f"container:{k}"] = v
 
         # Per-stream tags (video, audio, subtitles, …)
         for i, stream in enumerate(data.get("streams", [])):
             for k, v in stream.get("tags", {}).items():
-                if k.lower() not in _STRUCTURAL_TAGS and v.strip():
+                if _tag_violation(k, v):
                     forbidden[f"stream[{i}]:{k}"] = v
 
         return forbidden

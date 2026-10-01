@@ -158,7 +158,6 @@ DEFAULT_VIDEO_PROMPT = (
 MODELS = {
     "Kling v3 Pro (motion control)": "kling",
     "Seedance 2.0 Video-Edit (v2v)": "seedance",
-    "Wan 3.0 Reference-to-Video (refs)": "wan3_r2v",
 }
 
 _ss_defaults = {
@@ -302,30 +301,6 @@ def ws_submit(endpoint, payload):
     if not pred_id:
         raise RuntimeError(f"Wavespeed: {data}")
     return pred_id
-
-
-def ws_upload(path, mime="video/mp4"):
-    """Upload a local file to WaveSpeed media storage (FREE — not a generation)
-    and return its hosted `download_url`. Needed for endpoints whose media
-    fields only take URLs, e.g. Wan 3.0 `reference_videos`.
-    Uses the single-request /media/upload/binary endpoint (multipart `file`)."""
-    _base = WS_API if WS_API.startswith("http") else "https://api.wavespeed.ai/api/v3"
-    with open(path, "rb") as _f:
-        r = requests.post(
-            f"{_base}/media/upload/binary",
-            headers={"Authorization": f"Bearer {WS_KEY}"},
-            files={"file": (os.path.basename(path), _f, mime)},
-            timeout=(30, 300),
-        )
-    if r.status_code == 401:
-        raise RuntimeError(f"Wavespeed 401 Unauthorized (upload) — έλεγξε το key στο sidebar.\nResponse: {r.text[:300]}")
-    if not r.ok:
-        raise RuntimeError(f"Wavespeed upload {r.status_code}: {r.text[:300]}")
-    data = r.json()
-    url = (data.get("data") or {}).get("download_url")
-    if not url:
-        raise RuntimeError(f"Wavespeed upload: {data}")
-    return url
 
 
 def ws_poll(pred_id, progress_bar):
@@ -1573,82 +1548,6 @@ def _submit_video_edit(video_path: str, ref_imgs, prompt: str) -> str:
     return _pid
 
 
-WAN3_ENDPOINT = "alibaba/wan-3.0/reference-to-video"
-WAN3_MAX_REFS = 10                   # API cap on reference_images
-
-
-def _wan3_prompt(prompt: str, n_refs: int, with_video: bool) -> str:
-    """Wan 3.0 addresses references as Image 1..N / Video 1 (per type, in array
-    order). Tell it which reference carries what: the swapped frames carry the
-    identity + scene, the source reel (if sent) only the motion/timing."""
-    _imgs = "Image 1" if n_refs <= 1 else f"Images 1-{n_refs}"
-    _bits = [f"{_imgs}: swapped frames of the SAME person in the SAME scene — "
-             f"this is the ONLY identity to use. Keep the face and setting "
-             f"identical and stable across the whole clip."]
-    if with_video:
-        _bits.append("Video 1: the original reel — copy its body motion, gestures, "
-                     "lip movement, timing and camera framing exactly, but NEVER "
-                     f"take the face or identity of the person in Video 1; "
-                     f"the person must always be the one from {_imgs}.")
-    return " ".join(_bits) + "\n\n" + prompt
-
-
-def _submit_wan3_r2v(video_path, ref_imgs, prompt: str):
-    """Submit to alibaba/wan-3.0/reference-to-video → (pred_id, refs_sent, cost).
-
-    PAYLOAD SCHEMA — per the official WaveSpeed API docs
-    (wavespeed.ai/docs/docs-api/alibaba/alibaba-wan-3.0-reference-to-video):
-      prompt            (required) — refs are addressed as Image N / Video N
-      reference_images  up to 10 image URLs  ← ALL approved swapped layers
-      reference_videos  up to 5 video URLs, 1–15 s total ← the source reel
-                        (uploaded to WaveSpeed storage first: URL-only field),
-                        sent only when it fits the 15 s cap
-      reference_audios  (unused)
-      resolution        480p/720p/1080p → 720p
-      aspect_ratio      16:9/9:16/1:1/4:3/3:4 → 9:16 for reels
-      duration          2–30 s; ref-video input + output ≤ 30 s
-                        → follows the reel length (ce.wan3_plan)
-      generate_audio    True (then _ensure_audio swaps in the original track)
-      enable_prompt_expansion False
-
-    PRE-FLIGHT (credit protection): no valid reference → raise BEFORE any
-    network call, 0 credits."""
-    _refs = [ref_imgs] if isinstance(ref_imgs, str) else list(ref_imgs or [])
-    _refs = [r for r in _refs if _valid_ref_image(r)][:WAN3_MAX_REFS]
-    if not _refs:
-        raise RuntimeError(
-            "Error: Missing reference image for Wan 3.0 — "
-            "το approved faceswap δεν έχει έγκυρο URL. Το αίτημα ΔΕΝ στάλθηκε (0 credits)."
-        )
-    _has_vid = bool(video_path and os.path.exists(video_path))
-    _dur = _cached_duration(video_path) if _has_vid else 5.0
-    _use_vid, _ref_s, _out = ce.wan3_plan(_dur, _has_vid)
-    _payload = {
-        "prompt": _wan3_prompt(prompt, len(_refs), _use_vid),
-        "reference_images": _refs,
-        "resolution": ce.WAN3_RES,
-        "aspect_ratio": "9:16",
-        "duration": _out,
-        "enable_prompt_expansion": False,
-        "generate_audio": True,
-    }
-    if _use_vid:
-        # reference_videos only takes URLs → push the reel to WaveSpeed storage
-        # (free upload). Big/.MOV sources get the same compact 720p mp4 pass.
-        _vsrc = video_path
-        if (os.path.getsize(video_path) > 8 * 1024 * 1024
-                or not video_path.lower().endswith(".mp4")):
-            _vsrc = _transcode_720(video_path)
-        _payload["reference_videos"] = [ws_upload(_vsrc, mime="video/mp4")]
-    _pid = ws_submit(WAN3_ENDPOINT, _payload)
-    _cost = ce.wan3_cost(_dur, _has_vid)
-    print(f"[wan3-r2v] submitted — reference_images={len(_refs)} · "
-          f"reference_video={'yes' if _use_vid else 'no'} · {_out}s out (pred {_pid})")
-    _ilog("wan3", f"pred {_pid}", True,
-          f"{len(_refs)} refs" + (" + reel" if _use_vid else "") + f" · {_out}s")
-    return _pid, len(_refs), _cost
-
-
 # ──────────────────────────────────────────────────────────
 # STATUS METADATA (single source of truth for colors/icons)
 # ──────────────────────────────────────────────────────────
@@ -2230,11 +2129,6 @@ def _dispatch_generation(item, model_key, prompt, ref_img=None):
                  "aspect_ratio": "9:16", "cfg_scale": 0.5, "seed": -1})
         _cost = ce.kling_cost(_cached_duration(_vp))
         _sent = 1
-    elif model_key == "wan3_r2v":
-        # WAN 3.0 REFERENCE-TO-VIDEO — every swapped layer goes in as
-        # reference_images (≤10); the source reel rides along as Video 1 when
-        # it fits the 15 s cap. Works without a source video too.
-        _pid, _sent, _cost = _submit_wan3_r2v(_vp if _has_vid else None, _refs, prompt)
     elif _has_vid:
         # VIDEO-EDIT (v2v) — the multi-reference path: every swapped frame goes
         # in, helper does its own validation + payload mapping
@@ -3059,9 +2953,6 @@ with _t_gen:
             if _mk_sel == "kling":
                 _price_txt = (f"{ce.fmt(ce.kling_cost(3))}–{ce.fmt(ce.kling_cost(30))} "
                               f"ανάλογα με τη διάρκεια (max 30s)")
-            elif _mk_sel == "wan3_r2v":
-                _price_txt = (f"{ce.fmt(ce.wan3_cost(2))}–{ce.fmt(ce.wan3_cost(30))} "
-                              f"ανάλογα με τη διάρκεια (720p)")
             else:
                 _price_txt = (f"{ce.fmt(ce.seedance_cost(2))}–{ce.fmt(ce.seedance_cost(15))} "
                               f"ανάλογα με τη διάρκεια (720p)")
@@ -3100,8 +2991,6 @@ with _t_gen:
             _gxv = _gx.get("video_path")
             _gxd = _cached_duration(_gxv) if (_gxv and os.path.exists(_gxv)) else 5
             _gen_total += (ce.kling_cost(_gxd) if _mk_all == "kling"
-                           else ce.wan3_cost(_gxd, bool(_gxv and os.path.exists(_gxv)))
-                           if _mk_all == "wan3_r2v"
                            else ce.seedance_cost(_gxd))
         _gnh1, _gnh2, _gnh3, _gnh4 = st.columns([3, 2, 2, 2])
         with _gnh1:
@@ -3179,21 +3068,11 @@ with _t_gen:
                         st.caption("🎞 Video-Edit mode — πηγή: αρχικό reel + faceswap ως reference"
                                    if _has_vid else
                                    "🖼 Image-to-Video fallback — δεν υπάρχει source video")
-                    if _mk == "wan3_r2v":
-                        _w_uv, _, _w_out = ce.wan3_plan(
-                            _cached_duration(_gi["video_path"]) if _has_vid else 5, _has_vid)
-                        st.caption(f"🌀 Wan 3.0 Ref-to-Video — {min(len(_all_refs), 10)} refs"
-                                   + (" + αρχικό reel ως Video 1" if _w_uv else
-                                      " (χωρίς reel: λείπει ή >15s)")
-                                   + f" · {_w_out}s output")
                     # COST ENGINE: show what THIS video will cost BEFORE generating.
                     # BOTH models scale with the reel duration.
                     if _mk == "kling":
                         _pre_dur = _cached_duration(_gi["video_path"]) if _has_vid else 5
                         _pre_cost = ce.kling_cost(_pre_dur)
-                    elif _mk == "wan3_r2v":
-                        _pre_dur = _cached_duration(_gi["video_path"]) if _has_vid else 5
-                        _pre_cost = ce.wan3_cost(_pre_dur, _has_vid)
                     elif _has_vid:
                         _pre_dur = _cached_duration(_gi["video_path"])
                         _pre_cost = ce.seedance_cost(_pre_dur)
@@ -3206,7 +3085,7 @@ with _t_gen:
                         f"<span style='color:{_pc_col};font-weight:700;font-size:13px'>"
                         f"💸 Θα κοστίσει ~{ce.fmt(_pre_cost)}</span>"
                         f"<span style='color:#8b81b8;font-size:10px'> · "
-                        f"{ce.breakdown(_mk, _pre_dur, _has_vid)}</span></div>",
+                        f"{ce.breakdown(_mk, _pre_dur)}</span></div>",
                         unsafe_allow_html=True,
                     )
                     _gb1, _gb2, _gb3 = st.columns([3, 1, 1])
@@ -3366,7 +3245,7 @@ with _t_audit:
                             st.caption(f"🎬 video έτοιμο ({_mb:.1f} MB) — άνοιξε το Preview για να το δεις")
                     elif _ai.get("gen_url"):
                         st.caption("(τοπικό αρχείο λείπει — υπάρχει μόνο URL)")
-                    # choose which model to recreate with (Kling / Seedance / Wan 3.0)
+                    # choose which model to recreate with (Kling / Seedance)
                     _re_lbl = st.selectbox(
                         "🔄 Recreate με μοντέλο:", list(MODELS.keys()),
                         index=(list(MODELS.values()).index(_ai.get("model_key"))

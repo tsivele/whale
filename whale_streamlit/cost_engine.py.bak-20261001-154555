@@ -12,11 +12,6 @@ SEEDANCE 2.0 video-edit — billed per second on (input + output) duration,
       1080p $0.375/s, 480p $0.075/s, 4k $0.75/s
 KLING v3 motion-control — tiered by OUTPUT seconds ($0.168/s, min 3 s, 5-s
   blocks): 5 s → $0.84, 10 s → $1.68, 20 s → $3.36.
-WAN 3.0 reference-to-video (alibaba/wan-3.0/reference-to-video, confirmed
-  2026-10-01 from the model page) — billed per second on (normalized
-  reference-video input + output): 480p $0.05/s, 720p $0.10/s, 1080p $0.20/s.
-  Reference video input is capped at 15 s and rounded UP to whole seconds;
-  output is 2–30 s and input + output must stay ≤ 30 s.
 """
 
 import math
@@ -27,19 +22,10 @@ SEEDANCE_RES  = "720p"           # the app locks Seedance to 720p
 _DUR_MIN, _DUR_MAX = 2.0, 15.0   # WaveSpeed clamps input duration to this range
 KLING_OUT_SECONDS = 5            # the app requests 5-s Kling outputs
 
-# Wan 3.0 reference-to-video — per-second rate on (ref-video input + output).
-WAN3_RATE = {"480p": 0.05, "720p": 0.10, "1080p": 0.20}
-WAN3_RES  = "720p"               # the app locks Wan 3.0 to 720p (like Seedance)
-WAN3_REF_VIDEO_MAX = 15.0        # API cap on total reference-video duration
-WAN3_OUT_MIN, WAN3_OUT_MAX = 2, 30
-WAN3_TOTAL_MAX = 30              # ref-video input + output ≤ 30 s
-WAN3_USE_SOURCE_VIDEO = True     # send the source reel as Video 1 (motion/scene ref)
-
 # Rough per-video reference (used only when duration is unknown).
 MODEL_COST = {
     "kling":    0.84,    # 5-s Kling output
     "seedance": 1.50,    # ~5-s 720p video-edit
-    "wan3_r2v": 1.00,    # ~5-s ref reel + 5-s 720p output
 }
 
 # Face-swap photo (qwen-image-2.0-pro/edit) — flat per image. WaveSpeed charges
@@ -90,55 +76,19 @@ def kling_cost(duration_sec=5) -> float:
     return round(0.168 * (math.ceil(d / 5) * 5), 2)
 
 
-def wan3_plan(duration_sec=None, has_video=True):
-    """Single source of truth for how a Wan 3.0 job is shaped → (use_ref_video,
-    ref_seconds_billed, output_seconds).
-
-    The source reel is sent as reference Video 1 only if it exists and fits the
-    API's 15 s reference-video cap; otherwise the job is images-only. Output
-    length follows the reel (so the recreation keeps the original timing),
-    clamped to 2–30 s and to (30 − ref input)."""
-    try:
-        d = float(duration_sec)
-    except (TypeError, ValueError):
-        d = 5.0
-    if d <= 0:
-        d = 5.0
-    use_vid = bool(WAN3_USE_SOURCE_VIDEO and has_video
-                   and 1.0 <= d <= WAN3_REF_VIDEO_MAX)
-    ref_s = int(math.ceil(d)) if use_vid else 0
-    out = int(round(d))
-    out = max(WAN3_OUT_MIN, min(WAN3_OUT_MAX, WAN3_TOTAL_MAX - ref_s, out))
-    return use_vid, ref_s, out
-
-
-def wan3_cost(duration_sec=5, has_video=True, resolution=WAN3_RES) -> float:
-    """Wan 3.0 reference-to-video price: rate × (ref-video input + output)."""
-    _, ref_s, out = wan3_plan(duration_sec, has_video)
-    return round(WAN3_RATE.get(resolution, 0.10) * (ref_s + out), 2)
-
-
 def estimate_cost(model_key, duration_sec=None) -> float:
     """Accurate per-video cost for a model given the source video duration.
-    ALL models scale with duration (Seedance on 2×dur, Kling on output length,
-    Wan 3.0 on ref-video input + output)."""
+    BOTH models scale with duration (Seedance on 2×dur, Kling on output length)."""
     if model_key == "kling":
         return kling_cost(duration_sec)
-    if model_key == "wan3_r2v":
-        return wan3_cost(duration_sec)
     return seedance_cost(duration_sec)
 
 
-def breakdown(model_key, duration_sec=None, has_video=True) -> str:
+def breakdown(model_key, duration_sec=None) -> str:
     """Short 'analytical' breakdown shown on the card so you see WHY it costs that."""
     if model_key == "kling":
         d = _clamp_kling(duration_sec)
         return f"~{d:.0f}s output (Kling, max 30s)"
-    if model_key == "wan3_r2v":
-        _uv, _ref_s, _out = wan3_plan(duration_sec, has_video)
-        if _uv:
-            return f"{_ref_s}s ref reel + {_out}s out @ {WAN3_RES}"
-        return f"{_out}s out (μόνο refs) @ {WAN3_RES}"
     d = _clamp(duration_sec)
     return f"{d:.0f}s ×2 (in+out) @ {SEEDANCE_RES}"
 
@@ -146,14 +96,12 @@ def breakdown(model_key, duration_sec=None, has_video=True) -> str:
 MODEL_LABEL = {
     "kling":    "Kling v3 Pro (motion control)",
     "seedance": "Seedance 2.0 Video-Edit (v2v)",
-    "wan3_r2v": "Wan 3.0 Reference-to-Video (refs)",
 }
 
 # Quality-vs-Cost advisor: (headline, hex color) per model.
 MODEL_ADVICE = {
     "kling":    ("Ultra Quality · Ακριβότερο",       "#f87171"),
     "seedance": ("Άριστη ποιότητα · ~20% φθηνότερο", "#4ade80"),
-    "wan3_r2v": ("Multi-reference · φθηνότερο ανά δευτ.", "#38bdf8"),
 }
 
 DEFAULT_MODEL = "seedance"

@@ -3,10 +3,14 @@ safety_filter.py — T-WHALES Post-Scrub Verification & Fail-Fast Safety Filter
 
 Acts as the final checkpoint before any video is downloaded or uploaded.
 Scans scrubbed MP4 files for leftover metadata using two independent methods:
-  1. ffprobe JSON scan  — surfaces named tags in format + stream blocks
-  2. Raw binary scan    — detects C2PA/XMP/EXIF signatures that ffprobe
-                          does not surface as named tags (hidden atoms,
-                          JUMBF boxes, XMP packets embedded in the bytestream)
+  1. ffprobe JSON scan  — surfaces named tags in format + stream blocks.
+                          Mandatory: if ffprobe is missing or fails, the file
+                          is rejected (quarantined), never approved.
+  2. Raw binary scan    — reads the WHOLE file in ~4 MB overlapping chunks and
+                          looks for long signatures ffprobe does not surface as
+                          tags: C2PA/XMP/EXIF blocks and encoder fingerprints
+                          ("x264 - core", "LavcNN.N.N", "LavfNN.N.N") that can
+                          sit inside mdat. A scan error is a violation.
 
 Usage
 -----
@@ -26,6 +30,7 @@ Usage
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -95,7 +100,31 @@ _BINARY_SIGNATURES: Dict[str, bytes] = {
     "EXIF header":           b"exif\x00\x00",
     "Content Credentials":   b"contentcredentials",
     "Adobe XMP namespace":   b"adobe:ns.adobe.com/xap",
+    # x264 writes its full settings string as an SEI user-data NAL in mdat
+    "x264 encoder settings": b"x264 - core",
 }
+
+# Encoder/muxer version fingerprints. Matched as full version strings
+# (e.g. "Lavc61.19.100") — a bare b"Lavc"/b"Lavf" would hit random mdat bytes.
+_BINARY_REGEXES: Dict[str, bytes] = {
+    "Lavc encoder version":  rb"Lavc\d{2}\.\d{1,3}\.\d{1,3}",
+    "Lavf muxer version":    rb"Lavf\d{2}\.\d{1,3}\.\d{1,3}",
+}
+
+# Literal signatures stay case-insensitive (as before); the version regexes
+# are case-sensitive, exactly as libavcodec/libavformat write them.
+_BINARY_PATTERNS = (
+    [(label, re.compile(re.escape(sig), re.IGNORECASE)) for label, sig in _BINARY_SIGNATURES.items()]
+    + [(label, re.compile(rx)) for label, rx in _BINARY_REGEXES.items()]
+)
+
+# Whole-file scan in chunks. Consecutive chunks overlap by more than the
+# longest possible match (22 bytes literal, 14 bytes regex), so a signature
+# split across a chunk boundary is still found.
+_SCAN_CHUNK   = 4 * 1024 * 1024
+_SCAN_OVERLAP = 64
+assert _SCAN_OVERLAP > max(len(s) for s in _BINARY_SIGNATURES.values())
+assert _SCAN_OVERLAP > len("Lavc00.000.000")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -110,10 +139,11 @@ log = logging.getLogger("safety_filter")
 # Internal helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _find_ffprobe() -> str:
+def _find_ffprobe() -> Optional[str]:
     """
-    Locate ffprobe binary.
-    Priority: PATH → imageio_ffmpeg sibling → hardcoded Debian paths → bare name.
+    Locate ffprobe binary, or None when it is not installed.
+    Priority: PATH → imageio_ffmpeg sibling → hardcoded Debian paths.
+    (No bare-name fallback: a missing ffprobe must be visible to the caller.)
     """
     import shutil as _sh
     p = _sh.which("ffprobe")
@@ -131,13 +161,13 @@ def _find_ffprobe() -> str:
     for candidate in ("/usr/bin/ffprobe", "/usr/local/bin/ffprobe", "/bin/ffprobe"):
         if os.path.exists(candidate):
             return candidate
-    return "ffprobe"
+    return None
 
 
 def _run_ffprobe(path: str, ffprobe: str) -> Optional[dict]:
     """
     Execute ffprobe and return parsed JSON (format + streams).
-    Returns None on failure so the caller can fall back to binary-only mode.
+    Returns None on failure; verify_batch then rejects the file.
     """
     cmd = [
         ffprobe,
@@ -220,32 +250,40 @@ def _inspect_tags(ffprobe_data: dict) -> Dict[str, str]:
 def _scan_binary(path: str) -> Dict[str, str]:
     """
     Read the raw MP4 bytes and search for known metadata signatures that
-    ffprobe does not surface as named tags (e.g. C2PA JUMBF boxes, XMP
-    packets written directly into the bytestream by recording software).
+    ffprobe does not surface as named tags (C2PA/XMP/EXIF blocks, and encoder
+    fingerprints such as the x264 settings SEI that live inside mdat).
 
-    Returns {label: description} for each signature found.
+    The WHOLE file is scanned in _SCAN_CHUNK pieces; each piece is searched
+    together with the last _SCAN_OVERLAP bytes of the previous one, so a
+    signature split across a boundary is not missed. Memory stays at about
+    one chunk regardless of file size.
+
+    Returns {label: description} for each signature found. If the scan itself
+    fails, returns {"_scan_error": "..."} — never {} — so the caller rejects
+    the file instead of reading an unscanned file as clean.
     """
     found: Dict[str, str] = {}
-    _EDGE = 1_048_576   # 1 MB
     try:
-        size = os.path.getsize(path)
+        scanned = 0
+        tail = b""
         with open(path, "rb") as f:
-            if size <= 2 * _EDGE:
-                data = f.read()                    # small file → scan all
-            else:
-                # Real metadata lives in the mp4 BOXES (ftyp/moov/udta/uuid/XMP)
-                # at the start or end — NOT in the compressed mdat middle. Scan
-                # only the two edges so random bytes in mdat can't false-trigger.
-                head = f.read(_EDGE)
-                f.seek(size - _EDGE)
-                data = head + f.read(_EDGE)
-        data_lower = data.lower()
-        for label, sig in _BINARY_SIGNATURES.items():
-            if sig.lower() in data_lower:
-                found[label] = "binary signature found in raw file bytes"
-                log.debug("  Binary hit: %s in %r", label, path)
+            while True:
+                chunk = f.read(_SCAN_CHUNK)
+                if not chunk:
+                    break
+                scanned += len(chunk)
+                window = tail + chunk
+                for label, rx in _BINARY_PATTERNS:
+                    if label not in found and rx.search(window):
+                        found[label] = "binary signature found in raw file bytes"
+                        log.debug("  Binary hit: %s in %r", label, path)
+                tail = window[-_SCAN_OVERLAP:]
+        size = os.path.getsize(path)
+        if scanned != size:
+            return {"_scan_error": f"scanned {scanned} of {size} bytes"}
     except Exception as e:
-        log.warning("Binary scan failed for %r: %s", path, e)
+        log.error("Binary scan failed for %r: %s", path, e)
+        return {"_scan_error": f"{type(e).__name__}: {e}"}
     return found
 
 
@@ -324,29 +362,35 @@ def verify_batch(
             continue
 
         all_violations: Dict[str, str] = {}
+        tag_scan_ran = False
 
-        # ── Layer 1: ffprobe named-tag scan ──────────────────────────
-        ffprobe_data = _run_ffprobe(path, ffprobe)
-        if ffprobe_data is not None:
-            tag_violations = _inspect_tags(ffprobe_data)
-            all_violations.update(tag_violations)
+        # ── Layer 1: ffprobe named-tag scan (mandatory) ──────────────
+        # A file whose tags could not be read is REJECTED, not approved on
+        # the binary scan alone.
+        if ffprobe is None:
+            all_violations["ffprobe:unavailable"] = "ffprobe not found — tag scan could not run"
         else:
-            log.warning("   ffprobe unavailable — relying on binary scan only")
+            ffprobe_data = _run_ffprobe(path, ffprobe)
+            if ffprobe_data is None:
+                all_violations["ffprobe:failed"] = "ffprobe failed on this file — tag scan could not run"
+            else:
+                tag_scan_ran = True
+                all_violations.update(_inspect_tags(ffprobe_data))
 
-        # ── Layer 2: raw binary signature scan ───────────────────────
+        # ── Layer 2: raw binary signature scan (whole file) ──────────
         binary_violations = _scan_binary(path)
+        binary_scan_ran = "_scan_error" not in binary_violations
         for label, desc in binary_violations.items():
             all_violations[f"binary:{label}"] = desc
 
         # ── Verdict ──────────────────────────────────────────────────
-        if not all_violations:
+        # Approval requires BOTH layers to have run cleanly, so every ✓
+        # printed below describes a check that actually happened.
+        if not all_violations and tag_scan_ran and binary_scan_ran:
             log.info("   ✅ APPROVED — %s", path)
-            log.info("      C2PA/Content Credentials : NOT FOUND ✓")
-            log.info("      EXIF / GPS / Location    : NOT FOUND ✓")
-            log.info("      Encoder tags (Lavf/Lavc) : NOT FOUND ✓")
-            log.info("      Handler names            : NOT FOUND ✓")
-            log.info("      XMP / IPTC metadata      : NOT FOUND ✓")
-            log.info("      Binary signatures        : NOT FOUND ✓")
+            log.info("      ffprobe tag scan (container + streams) : 0 violations ✓")
+            log.info("      Binary scan, whole file, %d signatures  : 0 hits ✓",
+                     len(_BINARY_PATTERNS))
             approved.append(path)
         else:
             _log_violations(path, all_violations)
